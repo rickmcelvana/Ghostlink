@@ -10,6 +10,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::{Arc, Mutex};
+
+use arc_swap::ArcSwap;
 use std::time::{Duration, Instant};
 
 use crate::cluster::{ClusterState, NodeStatus};
@@ -122,8 +124,8 @@ pub struct HealthCheckResult {
 pub struct NetworkHealthMonitor {
     /// Cluster state
     cluster: Arc<ClusterState>,
-    /// Configuration (behind Mutex for atomic re-tune from watcher)
-    config: Arc<Mutex<HealthConfig>>,
+    /// Configuration (ArcSwap for lock-free read access on hot health monitoring paths)
+    config: Arc<ArcSwap<HealthConfig>>,
     /// Last check timestamp
     last_check: Arc<Mutex<Option<Instant>>>,
     /// Recent check results per node
@@ -137,7 +139,7 @@ impl NetworkHealthMonitor {
     pub fn new(cluster: Arc<ClusterState>, config: HealthConfig) -> Self {
         Self {
             cluster,
-            config: Arc::new(Mutex::new(config)),
+            config: Arc::new(ArcSwap::from_pointee(config)),
             last_check: Arc::new(Mutex::new(None)),
             recent_checks: Arc::new(Mutex::new(HashMap::new())),
             tcp_probe_targets: Arc::new(Mutex::new(HashMap::new())),
@@ -149,14 +151,9 @@ impl NetworkHealthMonitor {
         Self::new(cluster, HealthConfig::autotuned(profile))
     }
 
-    /// Read the current configuration.
+    /// Read the current configuration lock-free.
     pub fn config(&self) -> HealthConfig {
-        self.config
-            .lock()
-            .ok()
-            .as_deref()
-            .copied()
-            .unwrap_or_default()
+        **self.config.load()
     }
 
     /// Register a node-specific TCP probe target.
@@ -182,20 +179,26 @@ impl NetworkHealthMonitor {
         let now = Instant::now();
         let nodes_snapshot = self.cluster.nodes_snapshot();
 
-        // Phase 1: Collect probe target addresses under a brief lock read (borrowing &str)
+        // Phase 1: Collect probe target addresses under a brief lock read (borrowing &str).
+        // OPTIMIZATION: Check if tcp_probe_targets is empty early to avoid nodes_snapshot
+        // iteration and target vector allocation when no TCP probe targets are registered.
         let targets: Vec<(&str, SocketAddr)> = {
             let probe_targets = self
                 .tcp_probe_targets
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
-            nodes_snapshot
-                .iter()
-                .filter_map(|node| {
-                    probe_targets
-                        .get(&node.id)
-                        .map(|addr| (node.id.as_str(), *addr))
-                })
-                .collect()
+            if probe_targets.is_empty() {
+                Vec::new()
+            } else {
+                nodes_snapshot
+                    .iter()
+                    .filter_map(|node| {
+                        probe_targets
+                            .get(&node.id)
+                            .map(|addr| (node.id.as_str(), *addr))
+                    })
+                    .collect()
+            }
         };
 
         // Phase 2: Execute active TCP probes OUTSIDE of any state locks
@@ -217,8 +220,15 @@ impl NetworkHealthMonitor {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
 
+        // OPTIMIZATION: Skip hash table lookups when no probe targets are registered.
+        let has_probe_results = !probe_results.is_empty();
+
         for node in nodes_snapshot.iter() {
-            let tcp_probe_ok = probe_results.get(node.id.as_str()).copied();
+            let tcp_probe_ok = if has_probe_results {
+                probe_results.get(node.id.as_str()).copied()
+            } else {
+                None
+            };
 
             let result = if let Some(m) = metrics_guard.get_mut(&node.id) {
                 let timeout =
@@ -459,9 +469,7 @@ impl NetworkHealthMonitor {
     /// health monitor's expectations aligned with reality.
     pub fn reconfigure_from_system_profile(&self, profile: &SystemProfile) {
         let rp: RuntimeProfile = profile.into();
-        if let Ok(mut guard) = self.config.lock() {
-            *guard = HealthConfig::autotuned(&rp);
-        }
+        self.config.store(Arc::new(HealthConfig::autotuned(&rp)));
     }
 
     /// Subscribe to a `SystemProfileWatcher`'s broadcast channel and
