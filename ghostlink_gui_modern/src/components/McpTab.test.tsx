@@ -99,4 +99,31 @@ describe('McpTab', () => {
       expect(document.activeElement).toBe(addButton);
     });
   });
+
+  it('disables Refresh button and sets aria-busy while refreshing MCP servers', async () => {
+    let resolveRefresh: (val: any) => void;
+    const pendingRefresh = new Promise((resolve) => {
+      resolveRefresh = resolve;
+    });
+
+    const api = createMockApi();
+    api.listMcpServers.mockImplementationOnce(() => pendingRefresh);
+
+    render(<McpTab api={api} />);
+
+    const refreshBtn = screen.getByRole('button', { name: 'Refreshing MCP servers...' });
+    expect(refreshBtn).toBeDisabled();
+    expect(refreshBtn).toHaveAttribute('aria-busy', 'true');
+    expect(refreshBtn).toHaveAttribute('title', 'Refreshing MCP servers...');
+
+    resolveRefresh!({ servers: [] });
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Refresh MCP servers' })).not.toBeDisabled();
+    });
+
+    const idleRefreshBtn = screen.getByRole('button', { name: 'Refresh MCP servers' });
+    expect(idleRefreshBtn).toHaveAttribute('aria-busy', 'false');
+    expect(idleRefreshBtn).toHaveAttribute('title', 'Refresh MCP servers');
+  });
 });
