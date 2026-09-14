@@ -74,8 +74,26 @@ describe('StatusViews', () => {
     );
     const buttonEl = screen.getByRole('button', { name: 'Add Worker' });
     expect(buttonEl).toBeInTheDocument();
+    expect(buttonEl).toHaveAttribute('aria-label', 'Add Worker');
     expect(buttonEl).toHaveClass('focus-visible:ring-2');
     fireEvent.click(buttonEl);
     expect(handleClick).toHaveBeenCalledTimes(1);
+  });
+
+  it('renders EmptyState with action button custom ariaLabel when provided', () => {
+    render(
+      <EmptyState
+        icon={Inbox}
+        title="No servers"
+        action={{
+          label: 'Enable Calculator',
+          ariaLabel: 'Enable calculator MCP server',
+          onClick: vi.fn(),
+        }}
+      />
+    );
+    const buttonEl = screen.getByRole('button', { name: 'Enable calculator MCP server' });
+    expect(buttonEl).toBeInTheDocument();
+    expect(buttonEl).toHaveAttribute('aria-label', 'Enable calculator MCP server');
   });
 });
