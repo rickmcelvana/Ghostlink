@@ -241,17 +241,31 @@ pub fn resolve_env_value(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_CONFIG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn temp_config_path() -> PathBuf {
+        let unique = TEMP_CONFIG_COUNTER.fetch_add(1, Ordering::Relaxed);
         let suffix = format!(
-            "ghostlink-mcp-{}-{}.toml",
+            "ghostlink-mcp-{}-{}-{}.toml",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            unique
         );
         std::env::temp_dir().join(suffix)
+    }
+
+    #[test]
+    fn temp_config_path_is_unique_across_quick_calls() {
+        let mut seen = HashSet::new();
+        for _ in 0..128 {
+            assert!(seen.insert(temp_config_path()));
+        }
     }
 
     #[test]
