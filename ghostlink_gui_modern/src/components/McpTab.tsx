@@ -256,8 +256,11 @@ export const McpTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
           </button>
           <button
             onClick={refresh}
-            aria-label="Refresh MCP servers"
-            className="p-2 rounded-lg hover:bg-slate-900 text-slate-400 hover:text-white transition focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
+            disabled={loading}
+            aria-busy={loading}
+            aria-label={loading ? 'Refreshing MCP servers...' : 'Refresh MCP servers'}
+            title={loading ? 'Refreshing MCP servers...' : 'Refresh MCP servers'}
+            className="p-2 rounded-lg hover:bg-slate-900 text-slate-400 hover:text-white transition disabled:opacity-50 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
           >
             <RefreshCw size={18} className={loading ? 'animate-spin' : ''} aria-hidden="true" />
           </button>
