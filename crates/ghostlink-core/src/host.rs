@@ -5,14 +5,18 @@
 //!
 //! Most detection logic now delegates to [`crate::system_profile::SystemProfile`].
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+
+use arc_swap::ArcSwapOption;
 
 use crate::protocol::NodeResources;
 
 const FAST_PROFILE_CACHE_TTL: Duration = Duration::from_secs(5);
 
-static FAST_PROFILE_CACHE: OnceLock<Mutex<Option<CachedRuntimeProfileEntry>>> = OnceLock::new();
+// OPTIMIZATION: Uses ArcSwapOption instead of Mutex<Option<..>> for lock-free atomic reads
+// on the fast-path runtime profile cache lookup.
+static FAST_PROFILE_CACHE: OnceLock<ArcSwapOption<CachedRuntimeProfileEntry>> = OnceLock::new();
 
 /// Selected acceleration path for the current host.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -208,8 +212,8 @@ fn load_cached_runtime_profile(probe_mode: ProbeMode) -> Option<RuntimeProfile> 
         return None;
     }
 
-    let cache = FAST_PROFILE_CACHE.get_or_init(|| Mutex::new(None));
-    let guard = cache.lock().ok()?;
+    let cache = FAST_PROFILE_CACHE.get_or_init(|| ArcSwapOption::from(None));
+    let guard = cache.load();
     let entry = guard.as_ref()?;
     if entry.captured_at.elapsed() > FAST_PROFILE_CACHE_TTL {
         return None;
@@ -223,13 +227,11 @@ fn store_cached_runtime_profile(profile: &RuntimeProfile) {
         return;
     }
 
-    let cache = FAST_PROFILE_CACHE.get_or_init(|| Mutex::new(None));
-    if let Ok(mut guard) = cache.lock() {
-        *guard = Some(CachedRuntimeProfileEntry {
-            captured_at: Instant::now(),
-            profile: profile.clone(),
-        });
-    }
+    let cache = FAST_PROFILE_CACHE.get_or_init(|| ArcSwapOption::from(None));
+    cache.store(Some(Arc::new(CachedRuntimeProfileEntry {
+        captured_at: Instant::now(),
+        profile: profile.clone(),
+    })));
 }
 
 /// Infer GPU compute capability from its marketing name.
