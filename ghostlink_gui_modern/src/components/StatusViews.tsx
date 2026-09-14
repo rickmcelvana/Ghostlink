@@ -7,6 +7,7 @@ export interface EmptyStateAction {
   label: string;
   onClick: () => void;
   icon?: IconType;
+  ariaLabel?: string;
 }
 
 interface EmptyStateProps {
@@ -44,6 +45,7 @@ export const EmptyState: React.FC<EmptyStateProps> = ({
       {action && (
         <button
           onClick={action.onClick}
+          aria-label={action.ariaLabel || action.label}
           className="mt-4 inline-flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold rounded-xl transition focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
         >
           {ActionIcon && <ActionIcon size={14} aria-hidden="true" />}
