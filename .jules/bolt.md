@@ -1,3 +1,7 @@
+## 2026-09-15 - [Precomputed Inverse Norm Product for Cosine Similarity]
+**Learning:** In pairwise vector similarity calculations (`cosine_similarity_precomputed`), performing floating-point division `dot / (norm_a * norm_b)` inside comparison loops executes costly CPU floating-point division instructions (~10-15 cycles). Pre-computing `let inv_norm_product = 1.0 / (norm_a * norm_b)` prior to accumulation and multiplying `dot * inv_norm_product` at the end converts the per-vector normalisation to a single division followed by a single-cycle float multiplication.
+**Action:** When normalizing dot products by vector norms in vector retrieval or similarity calculations, compute the reciprocal product (`1.0 / (norm_a * norm_b)`) once upfront and multiply the result.
+
 ## 2026-09-14 - [Lock-Free Fast Runtime Profile Cache]
 **Learning:** In local host resource auto-detection (`detect_runtime_profile_with_mode`), checking `FAST_PROFILE_CACHE` previously acquired a `Mutex` lock on every call to `load_cached_runtime_profile`. Replacing `static FAST_PROFILE_CACHE: OnceLock<Mutex<Option<CachedRuntimeProfileEntry>>>` with `OnceLock<ArcSwapOption<CachedRuntimeProfileEntry>>` enabled zero-lock atomic reads (`cache.load()`) on hot runtime detection paths, eliminating lock acquisition churn across threads.
 **Action:** Prefer `ArcSwapOption` over `Mutex<Option<T>>` for global process-wide caches that are read frequently but updated infrequently.
