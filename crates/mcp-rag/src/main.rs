@@ -189,13 +189,15 @@ fn cosine_similarity_precomputed(a: &[f32], b: &[f32], norm_a: f32, norm_b: f32)
         dot7 += ca[7] * cb[7];
     }
 
+    let inv_norm_product = 1.0 / (norm_a * norm_b);
+
     let mut dot = dot0 + dot1 + dot2 + dot3 + dot4 + dot5 + dot6 + dot7;
 
     for (&x, &y) in remainder_a.iter().zip(remainder_b) {
         dot += x * y;
     }
 
-    dot / (norm_a * norm_b)
+    dot * inv_norm_product
 }
 
 #[allow(dead_code)]
