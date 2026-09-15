@@ -129,6 +129,40 @@ describe('EditorTab', () => {
     });
   });
 
+  it('provides accessible aria-label, aria-busy, and title tooltips on header action buttons', async () => {
+    const api = createMockApi();
+    render(<EditorTab api={api} />);
+    await waitFor(() => expect(screen.getByText('README.md')).toBeInTheDocument());
+
+    // When no file is open:
+    const explainBtnDisabled = screen.getByRole('button', { name: 'Cannot explain code: no file open' });
+    expect(explainBtnDisabled).toBeDisabled();
+    expect(explainBtnDisabled).toHaveAttribute('title', 'Open a file to use Explain');
+
+    const saveBtnDisabled = screen.getByRole('button', { name: 'Cannot save: no file open' });
+    expect(saveBtnDisabled).toBeDisabled();
+    expect(saveBtnDisabled).toHaveAttribute('title', 'Open a file to save');
+
+    // Open file
+    fireEvent.click(screen.getByText('README.md'));
+    await waitFor(() => expect(screen.getByTestId('mock-editor')).toHaveValue('# Hello'));
+
+    const explainBtnEnabled = screen.getByRole('button', { name: 'Explain code using AI' });
+    expect(explainBtnEnabled).not.toBeDisabled();
+    expect(explainBtnEnabled).toHaveAttribute('title', 'Explain code using AI');
+    expect(explainBtnEnabled).toHaveAttribute('aria-busy', 'false');
+
+    const saveBtnClean = screen.getByRole('button', { name: 'No unsaved changes in README.md' });
+    expect(saveBtnClean).toBeDisabled();
+    expect(saveBtnClean).toHaveAttribute('title', 'No unsaved changes');
+
+    // Edit file
+    fireEvent.change(screen.getByTestId('mock-editor'), { target: { value: '# Hello, edited' } });
+    const saveBtnDirty = screen.getByRole('button', { name: 'Save changes to README.md' });
+    expect(saveBtnDirty).not.toBeDisabled();
+    expect(saveBtnDirty).toHaveAttribute('title', 'Save changes to README.md');
+  });
+
   it('enables Save once the buffer is edited, and writes on click', async () => {
     const api = createMockApi();
     render(<EditorTab api={api} />);
@@ -136,14 +170,15 @@ describe('EditorTab', () => {
     fireEvent.click(screen.getByText('README.md'));
     await waitFor(() => expect(screen.getByTestId('mock-editor')).toHaveValue('# Hello'));
 
-    const saveButton = screen.getByRole('button', { name: 'Save' });
+    const saveButton = screen.getByRole('button', { name: 'No unsaved changes in README.md' });
     expect(saveButton).toBeDisabled();
 
     fireEvent.change(screen.getByTestId('mock-editor'), { target: { value: '# Hello, edited' } });
-    expect(saveButton).not.toBeDisabled();
+    const saveButtonDirty = screen.getByRole('button', { name: 'Save changes to README.md' });
+    expect(saveButtonDirty).not.toBeDisabled();
     expect(screen.getByText('(unsaved)')).toBeInTheDocument();
 
-    fireEvent.click(saveButton);
+    fireEvent.click(saveButtonDirty);
     await waitFor(() => {
       expect(api.writeWorkspaceFile).toHaveBeenCalledWith('README.md', '# Hello, edited');
     });
@@ -156,7 +191,7 @@ describe('EditorTab', () => {
     fireEvent.click(screen.getByText('README.md'));
     await waitFor(() => expect(screen.getByTestId('mock-editor')).toBeInTheDocument());
 
-    fireEvent.click(screen.getByRole('button', { name: 'Explain' }));
+    fireEvent.click(screen.getByRole('button', { name: /Explain/ }));
 
     await waitFor(() => {
       expect(api.sendMessage).toHaveBeenCalled();
@@ -177,7 +212,7 @@ describe('EditorTab', () => {
     fireEvent.click(screen.getByText('README.md'));
     await waitFor(() => expect(screen.getByTestId('mock-editor')).toBeInTheDocument());
 
-    fireEvent.click(screen.getByRole('button', { name: 'Fix' }));
+    fireEvent.click(screen.getByRole('button', { name: /Fix/ }));
 
     await waitFor(() => {
       expect(screen.getByTestId('mock-diff-editor')).toBeInTheDocument();
@@ -203,7 +238,7 @@ describe('EditorTab', () => {
     fireEvent.click(screen.getByText('README.md'));
     await waitFor(() => expect(screen.getByTestId('mock-editor')).toBeInTheDocument());
 
-    fireEvent.click(screen.getByRole('button', { name: 'Refactor' }));
+    fireEvent.click(screen.getByRole('button', { name: /Refactor/ }));
     await waitFor(() => expect(screen.getByTestId('mock-diff-editor')).toBeInTheDocument());
 
     fireEvent.click(screen.getByRole('button', { name: 'Reject' }));

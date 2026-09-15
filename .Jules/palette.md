@@ -9,3 +9,7 @@
 ## 2026-09-06 - Explicit ARIA Labels on EmptyState Action Primitives
 **Learning:** Shared EmptyState action buttons often use brief visible labels for visual layout neatness (e.g. "Add Server"), which may lack full context for screen reader users when announced in isolation. Providing `aria-label={action.ariaLabel || action.label}` in shared status components allows views to supply descriptive screen reader context (e.g. "Enable calculator MCP server") while preserving concise visual layout.
 **Action:** In shared UI primitives with action buttons, accept an optional `ariaLabel` property and default `aria-label` to `action.ariaLabel || action.label`.
+
+## 2026-09-15 - Context-Aware Disabled Reasons and Busy States on Toolbar Action Buttons
+**Learning:** Action buttons in toolbars or editor headers disabled based on contextual state (e.g. no open document, no unsaved edits) leave users and screen readers guessing why an action cannot be triggered.
+**Action:** Pair disabled toolbar buttons with dynamic `aria-label`, `aria-busy`, and native `title` tooltips that explicitly state the reason for being disabled (e.g. "Cannot save: no file open" or "No unsaved changes in [filename]") and update to active/busy states during async operations.
