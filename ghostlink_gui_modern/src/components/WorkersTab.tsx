@@ -180,13 +180,13 @@ export const WorkersTab: React.FC<{ api: any }> = ({ api }) => {
 
   const handleDiscoverPeers = async () => {
     setLoading(true);
-    const res = await api.discoverWorkers ? await api.discoverWorkers() : { count: 0 };
+    const res = api.discoverWorkers ? await api.discoverWorkers() : api.discoverPeers ? await api.discoverPeers() : { count: 0 };
     if (res.error) {
       addToast({ type: 'error', message: res.error });
     } else {
       addToast({
         type: 'success',
-        message: `Peer discovery complete. Found ${res.discovered ?? res.count ?? 0} active peers on LAN.`,
+        message: `Peer discovery complete. Found ${res.count ?? res.discovered ?? 0} active peers on LAN.`,
       });
       refreshWorkersAndTopology();
     }
@@ -219,11 +219,11 @@ export const WorkersTab: React.FC<{ api: any }> = ({ api }) => {
   };
 
   const handleDisconnectWorker = async (nodeId: string, hostLabel: string) => {
-    if (
-      !window.confirm(
-        `Are you sure you want to disconnect ${hostLabel}? This will remove it from the active cluster pool.`
-      )
-    ) {
+    const isLocalCoordinator = thisMachineNode && thisMachineNode.id === nodeId;
+    const confirmMsg = isLocalCoordinator
+      ? `WARNING: ${hostLabel} is the local coordinator! Disconnecting it may disable cluster coordination for this Studio session. Are you strictly sure you want to proceed?`
+      : `Are you sure you want to disconnect ${hostLabel}? This will remove it from the active cluster pool.`;
+    if (!window.confirm(confirmMsg)) {
       return;
     }
     const res = await api.disconnectWorker ? await api.disconnectWorker(nodeId) : { success: true };
@@ -235,14 +235,16 @@ export const WorkersTab: React.FC<{ api: any }> = ({ api }) => {
     }
   };
 
-  const peers = useMemo(() => {
-    if (!topology?.nodes) return [];
-    return topology.nodes.slice(1); // 0 is this machine
+  const thisMachineNode = useMemo(() => {
+    if (!topology?.nodes?.length) return null;
+    return topology.nodes.find((n) => n.role?.toLowerCase() === "coordinator") || topology.nodes[0];
   }, [topology]);
 
-  const thisMachineNode = useMemo(() => {
-    return topology?.nodes?.[0] || null;
-  }, [topology]);
+  const peers = useMemo(() => {
+    if (!topology?.nodes) return [];
+    if (!thisMachineNode) return topology.nodes;
+    return topology.nodes.filter((n) => n.id !== thisMachineNode.id);
+  }, [topology, thisMachineNode]);
 
   return (
     <div className="p-8 max-w-7xl mx-auto space-y-8">
@@ -285,6 +287,80 @@ export const WorkersTab: React.FC<{ api: any }> = ({ api }) => {
           >
             <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
           </button>
+        </div>
+      </div>
+
+      {/* Cluster Setup Wizard */}
+      <div className="bg-slate-900/80 border border-slate-800 rounded-3xl p-6 space-y-4 shadow-xl">
+        <div className="flex items-center justify-between pb-3 border-b border-slate-800/80">
+          <h2 className="text-sm font-bold text-slate-100 flex items-center gap-2">
+            <Network className="text-blue-400" size={18} />
+            Cluster Setup & Node Role
+          </h2>
+          <button
+            onClick={() => setShowHowToJoin(true)}
+            className="text-xs text-blue-400 hover:text-blue-300 flex items-center gap-1 font-bold"
+          >
+            <HelpCircle size={14} />
+            Setup Guide
+          </button>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          {/* Step 1: Role */}
+          <div className="p-4 bg-slate-950/60 border border-slate-800/80 rounded-2xl space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-bold text-slate-300 uppercase tracking-wider">1. Local Machine Role</span>
+              <span className="text-[10px] font-mono text-cyan-400 font-bold">
+                {settings?.contribute_compute ? "Coordinator + Worker" : "Coordinator Only"}
+              </span>
+            </div>
+            <p className="text-[11px] text-slate-400">
+              Control whether this machine orchestrates, contributes GPU/CPU, or both.
+            </p>
+          </div>
+
+          {/* Step 2: Distributed */}
+          <div className="p-4 bg-slate-950/60 border border-slate-800/80 rounded-2xl space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-bold text-slate-300 uppercase tracking-wider">2. Use LAN Workers</span>
+              <label className="relative inline-flex items-center cursor-pointer select-none" aria-label="Toggle distributed inference">
+                <input
+                  type="checkbox"
+                  checked={!!settings?.distributed_inference}
+                  onChange={(e) => handleToggleDistributed(e.target.checked)}
+                  className="sr-only peer"
+                />
+                <div className="w-9 h-5 bg-slate-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[\x27\x27] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-blue-600"></div>
+              </label>
+            </div>
+            <p className="text-[11px] text-slate-400">
+              {settings?.distributed_inference
+                ? "Active: splits models across available LAN workers."
+                : "Single Machine mode (local execution only)."}
+            </p>
+          </div>
+
+          {/* Step 3: Contribute */}
+          <div className="p-4 bg-slate-950/60 border border-slate-800/80 rounded-2xl space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-bold text-slate-300 uppercase tracking-wider">3. Contribute Compute</span>
+              <label className="relative inline-flex items-center cursor-pointer select-none" aria-label="Toggle contribute compute">
+                <input
+                  type="checkbox"
+                  checked={!!settings?.contribute_compute}
+                  onChange={(e) => handleToggleContribute(e.target.checked)}
+                  className="sr-only peer"
+                />
+                <div className="w-9 h-5 bg-slate-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[\x27\x27] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-green-600"></div>
+              </label>
+            </div>
+            <p className="text-[11px] text-slate-400">
+              {settings?.contribute_compute
+                ? "RPC endpoint exposed to LAN peers."
+                : "Off: this machine will not accept worker tasks."}
+            </p>
+          </div>
         </div>
       </div>
 

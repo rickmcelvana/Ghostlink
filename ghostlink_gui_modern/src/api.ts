@@ -316,6 +316,10 @@ export class GhostlinkAPI {
     }
   }
 
+  async discoverWorkers() {
+    return this.discoverPeers();
+  }
+
   async disconnectWorker(workerId: string) {
     try {
       const response = await this.http.post(`/api/workers/${workerId}/disconnect`);
@@ -634,13 +638,8 @@ export class GhostlinkAPI {
     }
 }
 
-  async listSessions(): Promise<{ sessions: any[]; error?: string }> {
-    try {
-      const response = await this.http.get('/api/sessions');
-      return { sessions: response.data.sessions || [] };
-    } catch (error: any) {
-      return { sessions: [], error: error.message };
-    }
+  async listSessions(): Promise<{ sessions: Session[]; error?: string }> {
+    return this.getSessions();
   }
 
   async deleteSession(sessionId: string): Promise<{ success: boolean; error?: string }> {

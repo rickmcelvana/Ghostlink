@@ -220,6 +220,7 @@ export const MetricsTab: React.FC<{ api: any }> = React.memo(({ api }) => {
               progress={throughputScale}
               history={throughputHistory}
               sparkColor="#22d3ee"
+              hasSamples={(metrics?.samples ?? 0) > 0}
             />
             <StatCard
               label="Latency p50"
@@ -232,6 +233,7 @@ export const MetricsTab: React.FC<{ api: any }> = React.memo(({ api }) => {
               inverse
               history={latP50History}
               sparkColor="#fb923c"
+              hasSamples={(metrics?.samples ?? 0) > 0}
             />
             <StatCard
               label="Latency p95"
@@ -244,6 +246,7 @@ export const MetricsTab: React.FC<{ api: any }> = React.memo(({ api }) => {
               inverse
               history={latP95History}
               sparkColor="#f87171"
+              hasSamples={(metrics?.samples ?? 0) > 0}
             />
           </div>
 
@@ -582,6 +585,7 @@ const StatCard = ({
   inverse = false,
   history,
   sparkColor,
+  hasSamples = true,
 }: any) => (
   <div className="bg-slate-900/50 border border-slate-800 rounded-3xl p-6 hover:border-slate-700 transition-all group">
     <div className="flex items-center justify-between mb-4">
@@ -591,8 +595,8 @@ const StatCard = ({
       <div className="text-right">
         <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">{label}</p>
         <p className={`text-2xl font-black ${color}`}>
-          {Number(value).toFixed(1)}{' '}
-          <span className="text-xs font-medium opacity-50">{unit}</span>
+          {hasSamples ? Number(value).toFixed(1) : "—"}{' '}
+          <span className="text-xs font-medium opacity-50">{hasSamples ? unit : "no samples yet"}</span>
         </p>
       </div>
     </div>

@@ -199,6 +199,12 @@ function App() {
       if (!result.error) {
         setMetrics(result.metrics);
       }
+      if (api.getMetricsHistory) {
+        const historyResult = await api.getMetricsHistory();
+        if (!historyResult.error && historyResult.history) {
+          useAppStore.getState().setMetricsHistory(historyResult.history);
+        }
+      }
     };
 
     const fetchWorkers = async () => {
