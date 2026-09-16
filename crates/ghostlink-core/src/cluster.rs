@@ -317,22 +317,10 @@ impl ClusterState {
         let mut system_memory_delta = system_memory_gb;
         let mut resources_changed = true;
 
-        if let Some(existing) = nodes.get_mut(&node.id) {
-            vram_delta = vram_gb - existing.vram_gb;
-            system_memory_delta = system_memory_gb - existing.system_memory_gb;
-
-            // Check if node resource fields actually changed to avoid snapshot invalidation churn
-            if existing.vram_gb == node.vram_gb
-                && existing.system_memory_gb == node.system_memory_gb
-                && existing.compute_capability == node.compute_capability
-                && existing.gpu_name == node.gpu_name
-                && existing.rpc_port == node.rpc_port
-                && existing.rpc_build_id == node.rpc_build_id
-            {
-                resources_changed = false;
-            }
-        }
-
+        // Optimization: Zero-allocation, single-pass node registration path.
+        // Updates metrics and resources in-place using zero-cost ownership moves (no node.clone()),
+        // eliminating secondary HashMap lookups while avoiding atomic cache invalidations
+        // when resource capabilities remain unchanged.
         if let Some(existing_metrics) = metrics.get_mut(&node.id) {
             existing_metrics.vram_gb = vram_gb;
             existing_metrics.total_vram_gb = vram_gb;
@@ -349,12 +337,6 @@ impl ClusterState {
             if addr.is_some() {
                 existing_metrics.ip_address = addr;
             }
-
-            if resources_changed {
-                if let Some(existing) = nodes.get_mut(&node.id) {
-                    *existing = node;
-                }
-            }
         } else {
             let node_id = node.id.clone();
             let mut node_metrics = NodeMetrics::new(
@@ -366,8 +348,28 @@ impl ClusterState {
             node_metrics.name = node_id.clone();
             node_metrics.gpu_name = node.gpu_name.clone();
             node_metrics.ip_address = addr;
-            metrics.insert(node_id.clone(), node_metrics);
-            nodes.insert(node_id, node);
+            metrics.insert(node_id, node_metrics);
+        }
+
+        if let Some(existing) = nodes.get_mut(&node.id) {
+            vram_delta = vram_gb - existing.vram_gb;
+            system_memory_delta = system_memory_gb - existing.system_memory_gb;
+
+            // Check if node resource fields actually changed to avoid snapshot invalidation churn
+            if existing.vram_gb == node.vram_gb
+                && existing.system_memory_gb == node.system_memory_gb
+                && existing.compute_capability == node.compute_capability
+                && existing.gpu_name == node.gpu_name
+                && existing.rpc_port == node.rpc_port
+                && existing.rpc_build_id == node.rpc_build_id
+            {
+                resources_changed = false;
+            } else {
+                *existing = node; // Zero-cost ownership move into existing entry
+            }
+        } else {
+            let node_id = node.id.clone();
+            nodes.insert(node_id, node); // Zero-cost ownership move into new map entry
         }
 
         if resources_changed {
