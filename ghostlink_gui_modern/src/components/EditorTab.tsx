@@ -641,6 +641,21 @@ export const EditorTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
                 key={kind}
                 onClick={() => runAction(kind)}
                 disabled={!editorOpenPath || running !== null}
+                aria-busy={running === kind}
+                aria-label={
+                  running === kind
+                    ? `${label}ing code...`
+                    : !editorOpenPath
+                    ? `Cannot ${label.toLowerCase()} code: no file open`
+                    : `${label} code using AI`
+                }
+                title={
+                  running === kind
+                    ? `${label}ing code...`
+                    : !editorOpenPath
+                    ? `Open a file to use ${label}`
+                    : `${label} code using AI`
+                }
                 className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium text-slate-400 hover:text-white hover:bg-slate-800 disabled:opacity-40 transition focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
               >
                 {running === kind ? <Loader size={13} className="animate-spin" aria-hidden="true" /> : <Icon size={13} aria-hidden="true" />}
@@ -650,6 +665,25 @@ export const EditorTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
             <button
               onClick={handleSave}
               disabled={!editorOpenPath || !dirty || saving}
+              aria-busy={saving}
+              aria-label={
+                saving
+                  ? 'Saving file...'
+                  : !editorOpenPath
+                  ? 'Cannot save: no file open'
+                  : !dirty
+                  ? `No unsaved changes in ${editorOpenPath}`
+                  : `Save changes to ${editorOpenPath}`
+              }
+              title={
+                saving
+                  ? 'Saving file...'
+                  : !editorOpenPath
+                  ? 'Open a file to save'
+                  : !dirty
+                  ? 'No unsaved changes'
+                  : `Save changes to ${editorOpenPath}`
+              }
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold bg-blue-600 text-white hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed transition focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
             >
               {saving ? <Loader size={13} className="animate-spin" aria-hidden="true" /> : <Save size={13} aria-hidden="true" />}
