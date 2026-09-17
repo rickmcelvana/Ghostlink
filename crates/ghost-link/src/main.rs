@@ -4397,19 +4397,28 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             return Err(bad_request_json("messages must not be empty".to_string()));
         }
 
-        let prompt = req
-            .messages
-            .iter()
-            .map(|msg| {
-                let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
-                let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                format!("{}: {}", role, content)
-            })
-            .collect::<Vec<_>>()
-            .join(
-                "
-",
-            );
+        // OPTIMIZATION: Pre-calculate estimated prompt capacity and construct prompt in a single
+        // pass with zero intermediate String/Vec allocations on hot inference paths.
+        let mut prompt = String::with_capacity(
+            req.messages
+                .iter()
+                .map(|m| {
+                    m.get("role").and_then(|r| r.as_str()).map_or(4, |s| s.len())
+                        + m.get("content").and_then(|c| c.as_str()).map_or(0, |s| s.len())
+                        + 3
+                })
+                .sum(),
+        );
+        for (i, msg) in req.messages.iter().enumerate() {
+            if i > 0 {
+                prompt.push('\n');
+            }
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+            let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            prompt.push_str(role);
+            prompt.push_str(": ");
+            prompt.push_str(content);
+        }
 
         validate_prompt_text(&prompt).map_err(bad_request_json)?;
 
