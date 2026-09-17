@@ -4403,8 +4403,12 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             req.messages
                 .iter()
                 .map(|m| {
-                    m.get("role").and_then(|r| r.as_str()).map_or(4, |s| s.len())
-                        + m.get("content").and_then(|c| c.as_str()).map_or(0, |s| s.len())
+                    m.get("role")
+                        .and_then(|r| r.as_str())
+                        .map_or(4, |s| s.len())
+                        + m.get("content")
+                            .and_then(|c| c.as_str())
+                            .map_or(0, |s| s.len())
                         + 3
                 })
                 .sum(),
