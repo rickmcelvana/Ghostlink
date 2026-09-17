@@ -191,8 +191,16 @@ export const MetricsTab: React.FC<{ api: any }> = React.memo(({ api }) => {
             onClick={exportMetricsCsv}
             disabled={metricsHistory.length === 0}
             className="p-2 rounded-lg hover:bg-slate-900 text-slate-400 hover:text-white transition disabled:opacity-30 disabled:hover:bg-transparent focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
-            title="Export metrics history as CSV"
-            aria-label="Export metrics history as CSV"
+            title={
+              metricsHistory.length === 0
+                ? 'Export metrics history as CSV (no metrics history available)'
+                : 'Export metrics history as CSV'
+            }
+            aria-label={
+              metricsHistory.length === 0
+                ? 'Export metrics history as CSV (no metrics history available)'
+                : 'Export metrics history as CSV'
+            }
           >
             <Download size={18} aria-hidden="true" />
           </button>

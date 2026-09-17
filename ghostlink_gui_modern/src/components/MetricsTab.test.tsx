@@ -148,13 +148,17 @@ describe('MetricsTab', () => {
   it('disables CSV export with no history and enables it once samples exist', () => {
     const api = createMockApi();
     const { rerender } = render(<MetricsTab api={api} />);
-    expect(screen.getByLabelText('Export metrics history as CSV')).not.toBeDisabled();
+    const enabledBtn = screen.getByLabelText('Export metrics history as CSV');
+    expect(enabledBtn).not.toBeDisabled();
+    expect(enabledBtn).toHaveAttribute('title', 'Export metrics history as CSV');
 
     useAppStore.setState({
       metricsHistory: [],
     });
     rerender(<MetricsTab api={api} />);
-    expect(screen.getByLabelText('Export metrics history as CSV')).toBeDisabled();
+    const disabledBtn = screen.getByLabelText('Export metrics history as CSV (no metrics history available)');
+    expect(disabledBtn).toBeDisabled();
+    expect(disabledBtn).toHaveAttribute('title', 'Export metrics history as CSV (no metrics history available)');
   });
 
   it('triggers a toast notification upon CSV export', () => {
