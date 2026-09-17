@@ -177,15 +177,23 @@ export const SessionsTab: React.FC<{ api: any }> = ({ api }) => {
                   <div className="grid grid-cols-3 gap-4">
                     <div className="bg-slate-950/50 p-4 rounded-xl border border-slate-800/50">
                         <p className="text-[10px] text-slate-500 uppercase font-bold tracking-tighter mb-1">Throughput</p>
-                        <p className="text-xl font-bold text-blue-400">{session.throughput} <span className="text-xs font-normal text-slate-600">t/s</span></p>
+                        <p className="text-xl font-bold text-blue-400">
+                          {typeof session.throughput === "number" && session.throughput > 0 ? session.throughput : "—"}{" "}
+                          <span className="text-xs font-normal text-slate-600">t/s</span>
+                        </p>
                     </div>
                     <div className="bg-slate-950/50 p-4 rounded-xl border border-slate-800/50">
                         <p className="text-[10px] text-slate-500 uppercase font-bold tracking-tighter mb-1">Latency</p>
-                        <p className="text-xl font-bold text-orange-400">{session.latency} <span className="text-xs font-normal text-slate-600">ms</span></p>
+                        <p className="text-xl font-bold text-orange-400">
+                          {typeof session.latency === "number" && session.latency > 0 ? session.latency : "—"}{" "}
+                          <span className="text-xs font-normal text-slate-600">ms</span>
+                        </p>
                     </div>
                     <div className="bg-slate-950/50 p-4 rounded-xl border border-slate-800/50">
                         <p className="text-[10px] text-slate-500 uppercase font-bold tracking-tighter mb-1">Tokens</p>
-                        <p className="text-xl font-bold text-purple-400">{session.tokens}</p>
+                        <p className="text-xl font-bold text-purple-400">
+                          {typeof session.tokens === "number" && session.tokens > 0 ? session.tokens : "—"}
+                        </p>
                     </div>
                   </div>
                 </div>

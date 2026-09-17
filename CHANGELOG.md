@@ -6,6 +6,14 @@ All notable changes to Ghostlink Studio are documented here.
 
 ## [Unreleased]
 
+- **Ops Tabs Fixes (Metrics, Sessions, Workers)**:
+  - **Metrics Tab & Streaming Metrics Recording** (`crates/ghost-link/src/main.rs`, `ghostlink_gui_modern/src/api.ts`, `ghostlink_gui_modern/src/store.ts`, `ghostlink_gui_modern/src/components/MetricsTab.tsx`):
+    Recorded generation latency and emitted tokens for native streaming SSE chat completions in `crates/ghost-link/src/main.rs` upon stream completion, ensuring real throughput (tok/s) and latency (ms) metrics are calculated. Mapped `timestamp_ms` to `t` in `api.ts` `getMetricsHistory()` and synchronized Zustand store history state with backend `/api/metrics/history` polling in `App.tsx`. Updated `MetricsTab.tsx` to render "no samples yet" and "Waiting for samples" when `samples == 0` rather than plotting false zero states.
+  - **Sessions Tab & Live Session Tracking** (`crates/ghost-link/src/main.rs`, `ghostlink_gui_modern/src/api.ts`, `ghostlink_gui_modern/src/components/SessionsTab.tsx`):
+    Updated `handle_gui_chat` in `crates/ghost-link/src/main.rs` to track active inference sessions and record token counts, throughput (tok/s), latency (ms), model name, and status (`Running`/`Degraded`). Unified `getSessions()` and `listSessions()` client methods in `api.ts`. Formatted session stats in `SessionsTab.tsx` to display "—" for missing/unmeasured metrics and verified saved session thread hydration with `user` and `assistant` message roles.
+  - **Workers Tab & Cluster Setup Wizard** (`ghostlink_gui_modern/src/api.ts`, `ghostlink_gui_modern/src/components/WorkersTab.tsx`):
+    Wired peer discovery in `api.ts` (`discoverWorkers` / `discoverPeers`) and updated discovery toast feedback to report peer count. Defaulted Add Worker port to `8003` with 1–65535 validation. Identified local coordinator dynamically by `role`/local ID rather than assuming index 0. Added peer status details (`build_id_status`, `secret_status`, `allowlist_status`) and `excluded_reason` banners to peer cards. Built a Cluster Setup Wizard section and added a hard confirmation prompt before disconnecting the local coordinator node.
+
 ## [2.2.1] - 2026-09-06
 
 - **Metrics History, Saved Sessions, and GUI Dependency Lock Repair**:

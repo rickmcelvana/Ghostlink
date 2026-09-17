@@ -8220,15 +8220,40 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                     .await;
 
                 match stream_res {
-                    Ok(stream) => {
+                    Ok(mut stream) => {
                         use futures::StreamExt;
                         let request_id_str = format!("req-{}", uuid::Uuid::new_v4());
-                        let sse_stream = stream.map(move |item| {
-                            let text_chunk = item.unwrap_or_else(|e| format!(" [stream error: {e}]"));
-                            let escaped_token = serde_json::to_string(&text_chunk).unwrap_or_else(|_| "\"\"".to_string());
-                            let data_str = format!(r#"{{"token":{},"request_id":"{}"}}"#, escaped_token, request_id_str);
-                            Ok::<Event, Infallible>(Event::default().data(data_str))
+                        let state_clone = Arc::clone(&state);
+                        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(100);
+
+                        tokio::spawn(async move {
+                            let stream_started = Instant::now();
+                            let mut accumulated_tokens: u32 = 0;
+                            while let Some(item) = stream.next().await {
+                                let text_chunk = item.unwrap_or_else(|e| format!(" [stream error: {e}]"));
+                                accumulated_tokens = accumulated_tokens.saturating_add(1);
+                                let escaped_token = serde_json::to_string(&text_chunk).unwrap_or_else(|_| String::from("\"\""));
+                                let data_str = format!(r#"{{"token":{},"request_id":"{}"}}"#, escaped_token, request_id_str);
+                                if tx.send(Ok(Event::default().data(data_str))).await.is_err() {
+                                    break;
+                                }
+                            }
+                            let elapsed_ms = (stream_started.elapsed().as_secs_f32() * 1000.0).max(0.1);
+                            if accumulated_tokens > 0 {
+                                let tps = (accumulated_tokens as f32) / (elapsed_ms / 1000.0);
+                                let mut backend = lock_state(&state_clone);
+                                backend.last_latency_ms = elapsed_ms;
+                                backend.last_tokens_per_sec = tps;
+                                backend.inference_metrics.record(
+                                    elapsed_ms,
+                                    accumulated_tokens,
+                                    Some(tps),
+                                    true,
+                                );
+                            }
                         });
+
+                        let sse_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
 
                         request_tracker.decrement().await;
                         return Sse::new(sse_stream).into_response();
@@ -12355,6 +12380,28 @@ mod tests {
 
         std::env::remove_var("GHOSTLINK_API_KEYS_PATH");
         let _ = std::fs::remove_file(&api_keys_path);
+    }
+
+    #[tokio::test]
+    async fn test_session_record_persistence() {
+        let rec = SessionRecord {
+            id: "sess_test_1".to_string(),
+            name: "Test Session".to_string(),
+            model: "llama3".to_string(),
+            status: "saved".to_string(),
+            throughput: 42,
+            latency: 120,
+            tokens: 250,
+            messages: vec![
+                serde_json::json!({"role": "user", "content": "Hello"}),
+                serde_json::json!({"role": "assistant", "content": "Hi"}),
+            ],
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        let decoded: SessionRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.id, "sess_test_1");
+        assert_eq!(decoded.throughput, 42);
+        assert_eq!(decoded.messages.len(), 2);
     }
 
     #[tokio::test]

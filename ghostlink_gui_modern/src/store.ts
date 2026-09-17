@@ -309,6 +309,7 @@ interface AppState {
   setUptime: (uptime: number) => void;
   setModels: (models: Model[]) => void;
   setMetrics: (metrics: Metric) => void;
+  setMetricsHistory: (history: MetricSample[]) => void;
   setSessions: (sessions: Session[]) => void;
   setWorkers: (workers: Worker[]) => void;
   setBackends: (backends: BackendInfo[]) => void;
@@ -468,11 +469,8 @@ export const useAppStore = create<AppState>((set) => ({
   setCurrentModel: (model) => set({ currentModel: model }),
   setUptime: (uptime) => set({ uptime }),
   setModels: (models) => set({ models }),
-  setMetrics: (metrics) =>
-    set((state) => ({
-      metrics,
-      metricsHistory: [...state.metricsHistory, { ...metrics, t: Date.now() }].slice(-120),
-    })),
+  setMetrics: (metrics) => set({ metrics }),
+  setMetricsHistory: (metricsHistory) => set({ metricsHistory }),
   setSessions: (sessions) => set({ sessions }),
   setWorkers: (workers) => set({ workers }),
   setBackends: (backends) => set({ backends }),
