@@ -12382,7 +12382,6 @@ mod tests {
         let _ = std::fs::remove_file(&api_keys_path);
     }
 
-
     #[tokio::test]
     async fn test_session_record_persistence() {
         let rec = SessionRecord {
