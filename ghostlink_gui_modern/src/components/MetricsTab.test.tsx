@@ -177,4 +177,36 @@ describe('MetricsTab', () => {
       message: 'Exported 3 metrics samples to CSV.',
     });
   });
+
+  it('updates refresh button state with aria-busy, disabled, and dynamic aria-label during refresh', async () => {
+    let resolveGetMetrics: (value: any) => void;
+    const pendingMetricsPromise = new Promise((resolve) => {
+      resolveGetMetrics = resolve;
+    });
+
+    const api = createMockApi({
+      getMetrics: vi.fn().mockImplementation(() => pendingMetricsPromise),
+    });
+
+    render(<MetricsTab api={api} />);
+
+    const refreshBtn = screen.getByLabelText('Refresh metrics');
+    expect(refreshBtn).not.toBeDisabled();
+    expect(refreshBtn).toHaveAttribute('aria-busy', 'false');
+
+    fireEvent.click(refreshBtn);
+
+    const refreshingBtn = screen.getByLabelText('Refreshing metrics...');
+    expect(refreshingBtn).toBeDisabled();
+    expect(refreshingBtn).toHaveAttribute('aria-busy', 'true');
+
+    resolveGetMetrics!({
+      metrics: { throughput: 130, cpu: 40, memory: 50, gpu: 70 },
+    });
+
+    await waitFor(() => {
+      expect(screen.getByLabelText('Refresh metrics')).not.toBeDisabled();
+      expect(screen.getByLabelText('Refresh metrics')).toHaveAttribute('aria-busy', 'false');
+    });
+  });
 });

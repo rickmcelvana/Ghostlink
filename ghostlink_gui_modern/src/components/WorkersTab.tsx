@@ -281,11 +281,12 @@ export const WorkersTab: React.FC<{ api: any }> = ({ api }) => {
           <button
             onClick={refreshWorkersAndTopology}
             disabled={loading}
-            className="flex items-center gap-2 px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl text-xs font-bold transition border border-slate-700 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
+            aria-busy={loading}
+            aria-label={loading ? 'Refreshing cluster state...' : 'Refresh Cluster State'}
             title="Refresh Cluster State"
-            aria-label="Refresh Cluster State"
+            className="flex items-center gap-2 px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl text-xs font-bold transition border border-slate-700 disabled:opacity-50 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
           >
-            <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
+            <RefreshCw size={16} className={loading ? 'animate-spin' : ''} aria-hidden="true" />
           </button>
         </div>
       </div>

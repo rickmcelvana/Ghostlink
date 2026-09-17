@@ -467,10 +467,12 @@ export const SettingsTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
                         <button
                           onClick={loadBackends}
                           disabled={backendLoading}
+                          aria-busy={backendLoading}
+                          aria-label={backendLoading ? 'Re-detecting compute backends...' : 'Re-detect compute backends'}
                           title="Re-detect compute backends"
                           className="flex items-center gap-2 px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm transition disabled:opacity-50 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
                         >
-                          <RefreshCw size={14} className={backendLoading ? 'animate-spin' : ''} />
+                          <RefreshCw size={14} className={backendLoading ? 'animate-spin' : ''} aria-hidden="true" />
                           Re-detect
                         </button>
                       </div>

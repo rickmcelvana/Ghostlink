@@ -198,9 +198,11 @@ export const MetricsTab: React.FC<{ api: any }> = React.memo(({ api }) => {
           </button>
           <button
             onClick={refreshMetrics}
-            className="p-2 rounded-lg hover:bg-slate-900 text-slate-400 hover:text-white transition focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
+            disabled={loading}
+            aria-busy={loading}
+            aria-label={loading ? 'Refreshing metrics...' : 'Refresh metrics'}
             title="Refresh metrics"
-            aria-label="Refresh metrics"
+            className="p-2 rounded-lg hover:bg-slate-900 text-slate-400 hover:text-white transition disabled:opacity-50 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
           >
             <RefreshCw size={18} className={loading ? 'animate-spin' : ''} aria-hidden="true" />
           </button>
