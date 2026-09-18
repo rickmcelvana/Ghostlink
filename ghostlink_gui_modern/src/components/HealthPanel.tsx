@@ -213,29 +213,45 @@ export const HealthPanel: React.FC<HealthPanelProps> = ({ api, onNavigateToTab }
       {/* Actionable Recovery Options */}
       {(controlPlaneStatus === 'unauthorized' || internalApiStatus === 'unauthorized') && (
         <form onSubmit={handleApplyApiKey} className="p-4 bg-amber-500/5 border border-amber-500/20 rounded-xl space-y-3">
-          <div className="flex items-center gap-2 text-amber-400 text-sm font-bold">
+          <div className="flex items-center gap-2 text-amber-400 text-sm font-bold" id="recovery-auth-title">
             <Key size={16} /> Authentication Recovery (HTTP 401)
           </div>
-          <p className="text-xs text-slate-400">
+          <p className="text-xs text-slate-400" id="recovery-auth-desc">
             The backend rejected requests with 401 Unauthorized. Provide a valid Admin or Operator API key:
           </p>
           <div className="flex gap-2">
             <input
+              id="recovery-api-key"
               type="password"
               placeholder="Paste Bearer API key..."
               value={inputApiKey}
               onChange={(e) => setInputApiKey(e.target.value)}
+              disabled={probing}
+              aria-describedby="recovery-auth-desc"
               aria-label="Recovery API key input"
               title="Enter Bearer API key for HTTP 401 recovery"
-              className="flex-1 px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-200 font-mono focus:outline-none focus:border-amber-500 focus-visible:ring-2 focus-visible:ring-amber-500"
+              className="flex-1 px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-200 font-mono focus:outline-none focus:border-amber-500 focus-visible:ring-2 focus-visible:ring-amber-500 disabled:opacity-50"
             />
             <button
               type="submit"
-              aria-label="Apply recovery API key"
-              title="Apply recovery API key"
-              className="px-4 py-2 bg-amber-600 hover:bg-amber-500 text-white rounded-lg text-xs font-bold transition focus-visible:ring-2 focus-visible:ring-amber-500 focus-visible:outline-none"
+              disabled={!inputApiKey.trim() || probing}
+              aria-label={
+                probing
+                  ? 'Applying API key...'
+                  : !inputApiKey.trim()
+                  ? 'Apply recovery API key (disabled: enter key first)'
+                  : 'Apply recovery API key'
+              }
+              title={
+                probing
+                  ? 'Applying API key...'
+                  : !inputApiKey.trim()
+                  ? 'Enter an API key to apply'
+                  : 'Apply recovery API key'
+              }
+              className="px-4 py-2 bg-amber-600 hover:bg-amber-500 text-white rounded-lg text-xs font-bold transition disabled:opacity-50 focus-visible:ring-2 focus-visible:ring-amber-500 focus-visible:outline-none"
             >
-              Apply Key
+              {probing ? 'Applying...' : 'Apply Key'}
             </button>
           </div>
         </form>
@@ -247,6 +263,8 @@ export const HealthPanel: React.FC<HealthPanelProps> = ({ api, onNavigateToTab }
           {onNavigateToTab && (
             <button
               onClick={() => onNavigateToTab('models')}
+              aria-label="Navigate to Models tab"
+              title="Navigate to Models tab"
               className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-xs font-bold transition focus-visible:ring-2 focus-visible:ring-blue-500"
             >
               Go to Models Tab
@@ -255,6 +273,8 @@ export const HealthPanel: React.FC<HealthPanelProps> = ({ api, onNavigateToTab }
           {onNavigateToTab && (
             <button
               onClick={() => onNavigateToTab('settings')}
+              aria-label="Navigate to System Settings tab"
+              title="Navigate to System Settings tab"
               className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-bold transition focus-visible:ring-2 focus-visible:ring-blue-500"
             >
               System Settings

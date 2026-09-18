@@ -112,7 +112,7 @@ describe('SecurityTab', () => {
     expect(await screen.findByRole('button', { name: /copied token/i })).toBeInTheDocument();
   });
 
-  it('renders recovery API key form with proper ARIA labels when health check returns 401', async () => {
+  it('renders recovery API key form with proper ARIA labels and disabled state when health check returns 401', async () => {
     const api = createMockApi({
       getHealth: vi.fn().mockResolvedValue({ success: false, error: '401' }),
       getModels: vi.fn().mockResolvedValue({ error: '401' }),
@@ -127,6 +127,11 @@ describe('SecurityTab', () => {
     expect(recoveryInput).toBeInTheDocument();
     expect(recoveryInput).toHaveAttribute('title', 'Enter Bearer API key for HTTP 401 recovery');
     expect(applyButton).toBeInTheDocument();
+    expect(applyButton).toBeDisabled();
+    expect(applyButton).toHaveAttribute('title', 'Enter an API key to apply');
+
+    fireEvent.change(recoveryInput, { target: { value: 'recovery-key-123' } });
+    expect(applyButton).not.toBeDisabled();
     expect(applyButton).toHaveAttribute('title', 'Apply recovery API key');
   });
 });
