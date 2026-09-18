@@ -327,7 +327,11 @@ impl LoadBalancer {
         false
     }
 
-    /// Shed load from overloaded nodes to underloaded ones
+    /// Shed load from overloaded nodes to underloaded ones.
+    ///
+    /// OPTIMIZATION: Collects overloaded and underloaded node candidates in a single-pass loop
+    /// over cluster metrics under lock, completely eliminating intermediate `active_nodes` vector
+    /// allocations and inlining best target lookup.
     pub fn shed_load(&self) -> Vec<(String, String)> {
         let cfg = self.config();
         let mut transfers: Vec<(String, String)> = Vec::new();
@@ -338,64 +342,40 @@ impl LoadBalancer {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
 
-        // Extract required fields from active nodes to avoid cloning NodeMetrics
-        let active_nodes: Vec<(&String, f32, f32)> = metrics
-            .values()
-            .filter(|m| m.status == crate::cluster::NodeStatus::Active)
-            .map(|m| (&m.name, m.available_vram_gb, m.total_vram_gb))
-            .collect();
+        let mut overloaded_nodes: Vec<&String> = Vec::new();
+        let mut underloaded_nodes: Vec<(&String, f32)> = Vec::new();
 
-        // Overloaded nodes are close to exhausted VRAM (low available headroom).
-        let overloaded_nodes: Vec<_> = active_nodes
-            .iter()
-            .copied()
-            .filter(|&(_, available, total)| available < total * 0.2)
-            .collect();
+        for m in metrics.values() {
+            if m.status == crate::cluster::NodeStatus::Active {
+                if m.available_vram_gb < m.total_vram_gb * 0.2 {
+                    overloaded_nodes.push(&m.name);
+                } else if m.available_vram_gb > m.total_vram_gb * 0.5 {
+                    underloaded_nodes.push((&m.name, m.available_vram_gb));
+                }
+            }
+        }
 
-        // Underloaded nodes have enough available headroom to receive load.
-        let underloaded_nodes: Vec<_> = active_nodes
-            .iter()
-            .copied()
-            .filter(|&(_, available, total)| available > total * 0.5)
-            .collect();
-
-        // For each overloaded node, find a suitable underloaded target
-        for &(overloaded_name, _, _) in &overloaded_nodes {
+        for &overloaded_name in &overloaded_nodes {
             if transfers.len() >= cfg.max_concurrent_rebalances {
                 break;
             }
-            if let Some(target_name) =
-                self.find_best_target_name(&underloaded_nodes, overloaded_name)
-            {
+
+            let mut best_target: Option<&String> = None;
+            let mut max_available = 0.0f32;
+
+            for &(name, available) in &underloaded_nodes {
+                if name != overloaded_name && available > max_available {
+                    max_available = available;
+                    best_target = Some(name);
+                }
+            }
+
+            if let Some(target_name) = best_target {
                 transfers.push((overloaded_name.clone(), target_name.clone()));
             }
         }
 
         transfers
-    }
-
-    /// Find best target node name for load transfer
-    fn find_best_target_name<'a>(
-        &self,
-        targets: &[(&'a String, f32, f32)],
-        source_name: &str,
-    ) -> Option<&'a String> {
-        // Find node with most available VRAM that's different from source
-        let mut best_target: Option<&'a String> = None;
-        let mut max_available = 0.0f32;
-
-        for &(name, available, _) in targets {
-            if name == source_name {
-                continue;
-            }
-
-            if available > max_available {
-                max_available = available;
-                best_target = Some(name);
-            }
-        }
-
-        best_target
     }
 
     // ------------------------------------------------------------------
