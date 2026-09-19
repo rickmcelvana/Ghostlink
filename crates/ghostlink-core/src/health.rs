@@ -230,7 +230,29 @@ impl NetworkHealthMonitor {
                 None
             };
 
-            let result = if let Some(m) = metrics_guard.get_mut(&node.id) {
+            // OPTIMIZATION: Store recent check results in O(1) ring buffer (keep last 10).
+            // Look up or initialize ring buffer for this node first so we can pop and reuse
+            // an existing HealthCheckResult's heap-allocated node_id String buffer when full.
+            let node_checks = if let Some(node_checks) = checks.get_mut(&node.id) {
+                node_checks
+            } else {
+                checks.entry(node.id.clone()).or_default()
+            };
+
+            // Recycle existing allocated HealthCheckResult if ring buffer is at capacity
+            let mut result = if node_checks.len() >= 10 {
+                node_checks.pop_front().unwrap()
+            } else {
+                HealthCheckResult {
+                    node_id: node.id.clone(),
+                    latency_us: 0.0,
+                    delivery_ratio: 1.0,
+                    status: HealthStatus::Unknown,
+                    timestamp: now,
+                }
+            };
+
+            if let Some(m) = metrics_guard.get_mut(&node.id) {
                 let timeout =
                     now.saturating_duration_since(m.last_heartbeat) >= m.heartbeat_timeout;
                 let latency_us = if m.latency_samples > 0 {
@@ -251,7 +273,7 @@ impl NetworkHealthMonitor {
                     } else if m.latency_samples == 0 && !m.delivery_ratio_initialized {
                         HealthStatus::Unknown
                     } else {
-                        self.get_health_status(latency_us, delivery_ratio)
+                        get_health_status_with_config(&cfg, latency_us, delivery_ratio)
                     };
 
                 let measured_latency_us = if tcp_probe_ok == Some(false) {
@@ -268,35 +290,18 @@ impl NetworkHealthMonitor {
                     HealthStatus::Unknown => m.status,
                 };
 
-                HealthCheckResult {
-                    node_id: node.id.clone(),
-                    latency_us: measured_latency_us,
-                    delivery_ratio,
-                    status,
-                    timestamp: now,
-                }
+                result.latency_us = measured_latency_us;
+                result.delivery_ratio = delivery_ratio;
+                result.status = status;
+                result.timestamp = now;
             } else {
-                HealthCheckResult {
-                    node_id: node.id.clone(),
-                    latency_us: 0.0,
-                    delivery_ratio: 1.0,
-                    status: HealthStatus::Unknown,
-                    timestamp: now,
-                }
-            };
-
-            // Store recent check results in O(1) ring buffer (keep last 10).
-            // OPTIMIZATION: Use get_mut to avoid cloning node.id on every periodic check
-            // when the node is already present in recent_checks.
-            let node_checks = if let Some(node_checks) = checks.get_mut(&node.id) {
-                node_checks
-            } else {
-                checks.entry(node.id.clone()).or_default()
-            };
-            node_checks.push_back(result);
-            if node_checks.len() > 10 {
-                node_checks.pop_front();
+                result.latency_us = 0.0;
+                result.delivery_ratio = 1.0;
+                result.status = HealthStatus::Unknown;
+                result.timestamp = now;
             }
+
+            node_checks.push_back(result);
         }
 
         *self
@@ -314,17 +319,10 @@ impl NetworkHealthMonitor {
     /// OR. A node with fine delivery but catastrophic latency (or vice versa)
     /// could never reach Failed. Either metric crossing its floor should be
     /// enough to fail the node.
-    fn get_health_status(&self, latency_us: f32, delivery_ratio: f32) -> HealthStatus {
+    #[allow(dead_code)]
+    pub(crate) fn get_health_status(&self, latency_us: f32, delivery_ratio: f32) -> HealthStatus {
         let cfg = self.config();
-        if delivery_ratio >= cfg.healthy_delivery_ratio && latency_us <= cfg.healthy_latency_us {
-            HealthStatus::Healthy
-        } else if delivery_ratio >= cfg.degraded_delivery_ratio
-            && latency_us <= cfg.degraded_latency_us
-        {
-            HealthStatus::Degraded
-        } else {
-            HealthStatus::Failed
-        }
+        get_health_status_with_config(&cfg, latency_us, delivery_ratio)
     }
 
     /// Get health report for a specific node
@@ -494,6 +492,23 @@ impl NetworkHealthMonitor {
                 }
             }
         })
+    }
+}
+
+/// Helper function to calculate health status given a reference to HealthConfig.
+#[inline]
+fn get_health_status_with_config(
+    cfg: &HealthConfig,
+    latency_us: f32,
+    delivery_ratio: f32,
+) -> HealthStatus {
+    if delivery_ratio >= cfg.healthy_delivery_ratio && latency_us <= cfg.healthy_latency_us {
+        HealthStatus::Healthy
+    } else if delivery_ratio >= cfg.degraded_delivery_ratio && latency_us <= cfg.degraded_latency_us
+    {
+        HealthStatus::Degraded
+    } else {
+        HealthStatus::Failed
     }
 }
 
