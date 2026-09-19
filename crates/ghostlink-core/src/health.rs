@@ -497,11 +497,14 @@ impl NetworkHealthMonitor {
 
 /// Helper function to calculate health status given a reference to HealthConfig.
 #[inline]
-fn get_health_status_with_config(cfg: &HealthConfig, latency_us: f32, delivery_ratio: f32) -> HealthStatus {
+fn get_health_status_with_config(
+    cfg: &HealthConfig,
+    latency_us: f32,
+    delivery_ratio: f32,
+) -> HealthStatus {
     if delivery_ratio >= cfg.healthy_delivery_ratio && latency_us <= cfg.healthy_latency_us {
         HealthStatus::Healthy
-    } else if delivery_ratio >= cfg.degraded_delivery_ratio
-        && latency_us <= cfg.degraded_latency_us
+    } else if delivery_ratio >= cfg.degraded_delivery_ratio && latency_us <= cfg.degraded_latency_us
     {
         HealthStatus::Degraded
     } else {
