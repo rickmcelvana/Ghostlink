@@ -220,4 +220,46 @@ describe('WorkersTab', () => {
       expect(screen.getByText('How to join a second machine')).toBeInTheDocument();
     });
   });
+
+  it('renders accessible discover peers and add worker buttons with proper ARIA attributes', async () => {
+    let resolveDiscover: (val: any) => void = () => {};
+    const discoverPromise = new Promise((resolve) => {
+      resolveDiscover = resolve;
+    });
+
+    const api = createMockApi({
+      discoverWorkers: vi.fn().mockImplementation(() => discoverPromise),
+    });
+
+    render(<WorkersTab api={api} />);
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Discover LAN peers' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Add worker manually' })).toBeInTheDocument();
+    });
+
+    const discoverBtn = screen.getByRole('button', { name: 'Discover LAN peers' });
+    expect(discoverBtn).toHaveAttribute('title', 'Discover LAN peers');
+    expect(discoverBtn).toHaveAttribute('aria-busy', 'false');
+
+    const addBtn = screen.getByRole('button', { name: 'Add worker manually' });
+    expect(addBtn).toHaveAttribute('title', 'Add worker manually');
+
+    fireEvent.click(discoverBtn);
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Discovering peers...' })).toBeInTheDocument();
+      const busyBtn = screen.getByRole('button', { name: 'Discovering peers...' });
+      expect(busyBtn).toHaveAttribute('aria-busy', 'true');
+      expect(busyBtn).toHaveAttribute('title', 'Discovering peers...');
+      expect(busyBtn).toBeDisabled();
+    });
+
+    resolveDiscover({ success: true, count: 1, discovered: 1 });
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Discover LAN peers' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Discover LAN peers' })).not.toBeDisabled();
+    });
+  });
 });

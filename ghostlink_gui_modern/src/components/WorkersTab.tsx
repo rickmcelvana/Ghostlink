@@ -264,17 +264,22 @@ export const WorkersTab: React.FC<{ api: any }> = ({ api }) => {
           <button
             onClick={handleDiscoverPeers}
             disabled={loading}
-            className="flex items-center gap-2 px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl text-xs font-bold transition border border-slate-700 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
+            aria-busy={loading}
+            aria-label={loading ? 'Discovering peers...' : 'Discover LAN peers'}
+            title={loading ? 'Discovering peers...' : 'Discover LAN peers'}
+            className="flex items-center gap-2 px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl text-xs font-bold transition border border-slate-700 disabled:opacity-50 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
           >
-            <Network size={16} />
-            Discover Peers
+            <Network size={16} className={loading ? 'animate-spin' : ''} aria-hidden="true" />
+            {loading ? 'Discovering...' : 'Discover Peers'}
           </button>
 
           <button
             onClick={() => setShowAddForm(true)}
+            aria-label="Add worker manually"
+            title="Add worker manually"
             className="flex items-center gap-2 px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl text-xs font-bold transition border border-slate-700 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
           >
-            <Plus size={16} />
+            <Plus size={16} aria-hidden="true" />
             Add Worker
           </button>
 
