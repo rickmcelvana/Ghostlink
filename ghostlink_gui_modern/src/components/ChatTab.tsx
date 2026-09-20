@@ -152,6 +152,7 @@ export const ChatTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
   // Knobs & presets
   const [showKnobs, setShowKnobs] = useState(false);
   const [showPromptLibrary, setShowPromptLibrary] = useState(false);
+  const [showToolSelector, setShowToolSelector] = useState(false);
   const [selectedPresetId, setSelectedPresetId] = useState("default");
 
   // Thread specific settings or fallbacks
@@ -1152,6 +1153,56 @@ export const ChatTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
           )}
         </div>
 
+        {/* Tool Selector Overlay */}
+        {showToolSelector && (
+          <div className="absolute bottom-20 left-6 right-6 max-w-xl mx-auto bg-slate-900 border border-slate-800 rounded-2xl p-4 shadow-2xl z-30 animate-in fade-in zoom-in-95 duration-100">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+              <span className="font-bold text-xs text-slate-200 flex items-center gap-2">
+                <Wrench size={14} className="text-blue-400" />
+                Select MCP Tools
+              </span>
+              <button
+                onClick={() => setShowToolSelector(false)}
+                className="text-slate-400 hover:text-white focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none rounded"
+                aria-label="Close tool selector"
+                title="Close"
+              >
+                <X size={14} aria-hidden="true" />
+              </button>
+            </div>
+            <div className="mt-3 max-h-48 overflow-y-auto space-y-2">
+              {tools.length === 0 ? (
+                <p className="text-xs text-slate-500 p-2 text-center">
+                  No MCP tools configured. Add or enable MCP servers in the MCP tab.
+                </p>
+              ) : (
+                tools.map((t) => (
+                  <label
+                    key={t.name}
+                    className="flex items-center justify-between p-2.5 rounded-xl bg-slate-950/60 hover:bg-slate-800/80 border border-slate-800/80 cursor-pointer text-xs transition"
+                  >
+                    <div className="flex flex-col min-w-0 pr-2">
+                      <span className="font-bold text-slate-200 truncate">{t.name}</span>
+                      <span className="text-[10px] text-slate-400 truncate">{t.description}</span>
+                    </div>
+                    <input
+                      type="checkbox"
+                      checked={t.enabled}
+                      onChange={(e) => {
+                        const checked = e.target.checked;
+                        setTools((prev) =>
+                          prev.map((item) => (item.name === t.name ? { ...item, enabled: checked } : item))
+                        );
+                      }}
+                      className="accent-blue-600 h-4 w-4 rounded focus-visible:ring-2 focus-visible:ring-blue-500"
+                    />
+                  </label>
+                ))
+              )}
+            </div>
+          </div>
+        )}
+
         {/* Prompt Library Overlay */}
         {showPromptLibrary && (
           <div className="absolute bottom-20 left-6 right-6 max-w-xl mx-auto bg-slate-900 border border-slate-800 rounded-2xl p-4 shadow-2xl z-30 animate-in fade-in zoom-in-95 duration-100">
@@ -1272,8 +1323,14 @@ export const ChatTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
                 <button
                   type="button"
                   disabled={!toolCallsSupported}
-                  onClick={() => setShowPromptLibrary(!showPromptLibrary)}
-                  className="p-2 text-slate-400 hover:text-white rounded-xl hover:bg-slate-800 transition focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none disabled:opacity-40 disabled:cursor-not-allowed"
+                  onClick={() => {
+                    setShowToolSelector(!showToolSelector);
+                    setShowPromptLibrary(false);
+                  }}
+                  aria-expanded={showToolSelector}
+                  className={`p-2 rounded-xl transition focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none disabled:opacity-40 disabled:cursor-not-allowed ${
+                    showToolSelector ? "bg-slate-800 text-white" : "text-slate-400 hover:text-white hover:bg-slate-800"
+                  }`}
                   title={toolCallsSupported ? "Select tools" : "Tool calling is unavailable for this engine"}
                   aria-label={toolCallsSupported ? "Select tools" : "Tool calling unavailable"}
                 >
@@ -1281,8 +1338,14 @@ export const ChatTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
                 </button>
                 <button
                   type="button"
-                  onClick={() => setShowPromptLibrary(!showPromptLibrary)}
-                  className="p-2 text-slate-400 hover:text-white rounded-xl hover:bg-slate-800 transition focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
+                  onClick={() => {
+                    setShowPromptLibrary(!showPromptLibrary);
+                    setShowToolSelector(false);
+                  }}
+                  aria-expanded={showPromptLibrary}
+                  className={`p-2 rounded-xl transition focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none ${
+                    showPromptLibrary ? "bg-slate-800 text-white" : "text-slate-400 hover:text-white hover:bg-slate-800"
+                  }`}
                   title="Prompt Templates (/)"
                   aria-label="Prompt Templates"
                 >
