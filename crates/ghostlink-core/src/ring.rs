@@ -194,7 +194,8 @@ impl<T> SpscRingBuffer<T> {
             let val = buf.get_unchecked(head).assume_init_read();
 
             // Release store to make read visible to producer
-            self.head.store((head + 1) & (Self::CAPACITY - 1), Ordering::Release);
+            self.head
+                .store((head + 1) & (Self::CAPACITY - 1), Ordering::Release);
 
             val
         };
