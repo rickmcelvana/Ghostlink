@@ -132,7 +132,9 @@ impl<T> SpscRingBuffer<T> {
     /// When full, the producer should wait/backpressure until space is available.
     pub fn push(&self, value: T) -> Result<(), T> {
         // Producer loads its own tail with Relaxed.
-        let tail = self.tail.load(Ordering::Relaxed);
+        // OPTIMIZATION: Mask loaded tail with CAPACITY - 1 to guarantee tail < RING_CAPACITY,
+        // allowing unsafe unchecked buffer indexing and eliminating bounds checks.
+        let tail = self.tail.load(Ordering::Relaxed) & (Self::CAPACITY - 1);
 
         // First check against cached head to avoid atomic contention.
         let mut head = self.cached_head.load(Ordering::Relaxed);
@@ -150,12 +152,12 @@ impl<T> SpscRingBuffer<T> {
             }
         }
 
-        let next_tail = Self::increment(tail);
+        let next_tail = (tail + 1) & (Self::CAPACITY - 1);
 
         // Write the value at tail position
         unsafe {
             let buf = &mut *self.buffer.get();
-            buf[tail].write(value);
+            buf.get_unchecked_mut(tail).write(value);
 
             // Release store to make write visible to consumer
             self.tail.store(next_tail, Ordering::Release);
@@ -169,7 +171,9 @@ impl<T> SpscRingBuffer<T> {
     /// Returns `Some(value)` on success, or `None` if the ring is empty.
     pub fn pop(&self) -> Option<T> {
         // Consumer loads its own head with Relaxed.
-        let head = self.head.load(Ordering::Relaxed);
+        // OPTIMIZATION: Mask loaded head with CAPACITY - 1 to guarantee head < RING_CAPACITY,
+        // allowing unsafe unchecked buffer indexing and eliminating bounds checks.
+        let head = self.head.load(Ordering::Relaxed) & (Self::CAPACITY - 1);
 
         // First check against cached tail to avoid atomic contention.
         let mut tail = self.cached_tail.load(Ordering::Relaxed);
@@ -187,10 +191,10 @@ impl<T> SpscRingBuffer<T> {
         // Read the value at head position
         let value = unsafe {
             let buf = &mut *self.buffer.get();
-            let val = buf[head].assume_init_read();
+            let val = buf.get_unchecked(head).assume_init_read();
 
             // Release store to make read visible to producer
-            self.head.store(Self::increment(head), Ordering::Release);
+            self.head.store((head + 1) & (Self::CAPACITY - 1), Ordering::Release);
 
             val
         };
@@ -431,10 +435,6 @@ impl<T> SpscRingBuffer<T> {
         let new_head = head.wrapping_add(count) & mask;
         self.head.store(new_head, Ordering::Release);
         count
-    }
-
-    fn increment(index: usize) -> usize {
-        (index + 1) & (Self::CAPACITY - 1)
     }
 }
 
