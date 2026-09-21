@@ -74,6 +74,8 @@ pub struct ChatRequest {
     /// `{"type": "json_schema", ...}` wrapper like OpenAI/vLLM expect.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_alive: Option<i32>,
 }
 
 /// Sampling parameters accepted by Ollama's `/api/generate` and `/api/chat`
@@ -92,6 +94,12 @@ pub struct OllamaOptions {
     pub repeat_penalty: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub num_predict: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_gpu: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_thread: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flash_attention: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -407,9 +415,13 @@ impl OllamaClient {
                 top_k,
                 repeat_penalty,
                 num_predict: max_tokens,
+                num_gpu: Some(99),
+                num_thread: std::thread::available_parallelism().ok().map(|n| n.get()),
+                flash_attention: Some(true),
             }),
             tools,
             format,
+            keep_alive: Some(-1),
         };
 
         let resp = self
@@ -459,9 +471,13 @@ impl OllamaClient {
                 top_k,
                 repeat_penalty,
                 num_predict: max_tokens,
+                num_gpu: Some(99),
+                num_thread: std::thread::available_parallelism().ok().map(|n| n.get()),
+                flash_attention: Some(true),
             }),
             tools: None,
             format: None,
+            keep_alive: Some(-1),
         };
 
         let resp = self
@@ -951,9 +967,11 @@ mod tests {
                 top_k: Some(30),
                 repeat_penalty: Some(1.2),
                 num_predict: Some(256),
+                ..Default::default()
             }),
             tools: None,
             format: None,
+            keep_alive: None,
         };
         let value = serde_json::to_value(&request).expect("serialize ChatRequest");
         assert!(

@@ -2205,6 +2205,15 @@ mod tests {
     }
 
     #[test]
+    fn rpc_tensor_override_defaults_to_ffn_and_exps_remote() {
+        let override_val = std::env::var("GHOSTLINK_LLAMA_OVERRIDE_TENSOR")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "ffn=RPC,exps=RPC".to_string());
+        assert_eq!(override_val, "ffn=RPC,exps=RPC");
+    }
+
+    #[test]
     fn validate_distributed_offload_accepts_valid_remote_share() {
         let split = vec![80.0, 20.0]; // 20% remote share
         let res = validate_distributed_offload(30, &split);

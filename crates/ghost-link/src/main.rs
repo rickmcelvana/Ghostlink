@@ -5563,6 +5563,21 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                 }
             }; // <-- short-lived discovery lock dropped here, before any .await
 
+            let model_size_gb = native_engine::NativeEngineClient::resolve_model_path(&selected_model)
+                .ok()
+                .and_then(|p| fs::metadata(p).ok())
+                .map(|m| m.len() as f32 / (1024.0 * 1024.0 * 1024.0))
+                .unwrap_or(0.0);
+
+            let mut peers = peers;
+            if !peers.is_empty() && local_vram > 0.0 && (model_size_gb + 1.0) <= local_vram && !require_offload {
+                tracing::warn!(
+                    "rpc_cluster: model ({:.2} GB) fits locally in VRAM ({:.2} GB) \u{2014} auto-disabling distributed inference to avoid unnecessary Ethernet RPC. Set GHOSTLINK_REQUIRE_CLUSTER_OFFLOAD=1 to force.",
+                    model_size_gb, local_vram
+                );
+                peers.clear();
+            }
+
             // When a shared secret is configured, each discovered peer must
             // complete the RPC-auth handshake before it's trusted enough to
             // route real layers through — see `rpc_cluster`'s top-of-file
@@ -7884,6 +7899,42 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
     /// `token_estimate` computed a few lines into `handle_gui_chat`) rather
     /// than a real tokenizer - consistent, not exact, which is all a rough
     /// budget needs.
+    async fn trim_conversation_history_async(
+        native_engine_client: &native_engine::NativeEngineClient,
+        is_native: bool,
+        messages: &[ChatHistoryTurn],
+        token_budget: usize,
+    ) -> (Vec<(String, String)>, bool) {
+        let prior = if messages.is_empty() {
+            &[][..]
+        } else {
+            &messages[..messages.len() - 1]
+        };
+
+        let mut budget = token_budget;
+        let mut kept: Vec<(String, String)> = Vec::new();
+        for turn in prior.iter().rev() {
+            let cost = if is_native {
+                native_engine_client
+                    .tokenize(&turn.content)
+                    .await
+                    .unwrap_or_else(|| turn.content.split_whitespace().count().max(1))
+            } else {
+                turn.content.split_whitespace().count().max(1)
+            };
+            if cost > budget {
+                break;
+            }
+            budget -= cost;
+            kept.push((turn.role.clone(), turn.content.clone()));
+        }
+        kept.reverse();
+
+        let truncated = kept.len() < prior.len();
+        (kept, truncated)
+    }
+
+    #[allow(dead_code)]
     fn trim_conversation_history(
         messages: &[ChatHistoryTurn],
         token_budget: usize,
@@ -8015,10 +8066,13 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         }
 
         let token_estimate = req.message.split_whitespace().count().clamp(1, 1024);
-        let (history_turns, history_truncated) = trim_conversation_history(
+        let (history_turns, history_truncated) = trim_conversation_history_async(
+            &native_engine_client,
+            matches!(inference_backend, InferenceEngine::Native),
             req.messages.as_deref().unwrap_or(&[]),
             settings.conversation_token_limit,
-        );
+        )
+        .await;
         let temp = req.temperature.unwrap_or(settings.temperature);
         let top_p = req.top_p.unwrap_or(settings.top_p);
         let top_k = req.top_k.unwrap_or(settings.top_k);

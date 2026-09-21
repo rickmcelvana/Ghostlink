@@ -209,6 +209,109 @@ impl VllmClient {
         })
     }
 
+    /// Streaming chat turn for vLLM over OpenAI /v1/chat/completions endpoint.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
+    pub async fn chat_stream(
+        &self,
+        model: &str,
+        messages: Vec<Value>,
+        temperature: f32,
+        top_p: f32,
+        top_k: usize,
+        repeat_penalty: f32,
+        max_tokens: usize,
+        response_format: Option<Value>,
+    ) -> Result<
+        std::pin::Pin<
+            Box<dyn futures::Stream<Item = Result<String, Box<dyn Error + Send + Sync>>> + Send>,
+        >,
+        Box<dyn Error>,
+    > {
+        use futures::StreamExt;
+        let mut payload = json!({
+            "model": model,
+            "messages": messages,
+            "stream": true,
+            "temperature": temperature.clamp(0.0, 2.0),
+            "top_p": top_p.clamp(0.0, 1.0),
+            "top_k": top_k.clamp(1, 200),
+            "repetition_penalty": repeat_penalty.clamp(0.0, 2.0),
+            "max_tokens": max_tokens,
+        });
+
+        if let Some(obj) = payload.as_object_mut() {
+            if let Some(response_format) = response_format {
+                obj.insert("response_format".to_string(), response_format);
+            }
+        }
+
+        let resp = self
+            .request(
+                self.client
+                    .post(format!("{}/v1/chat/completions", self.base_url)),
+            )
+            .json(&payload)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Box::new(std::io::Error::other(format!(
+                "vLLM streaming request failed HTTP {status}: {body}"
+            ))));
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel(100);
+        tokio::spawn(async move {
+            let mut byte_stream = resp.bytes_stream();
+            let mut buf = String::new();
+            while let Some(chunk) = byte_stream.next().await {
+                let chunk = match chunk {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(Box::new(e) as Box<dyn Error + Send + Sync>))
+                            .await;
+                        return;
+                    }
+                };
+                buf.push_str(&String::from_utf8_lossy(&chunk));
+                while let Some(pos) = buf.find('\n') {
+                    let line = buf[..pos].trim().to_string();
+                    buf.drain(..=pos);
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let payload = match line.strip_prefix("data: ") {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    if payload == "[DONE]" {
+                        return;
+                    }
+                    if let Ok(data) = serde_json::from_str::<Value>(payload) {
+                        if let Some(delta) = data
+                            .get("choices")
+                            .and_then(|c| c.get(0))
+                            .and_then(|choice| choice.get("delta"))
+                        {
+                            if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
+                                if !text.is_empty() && tx.send(Ok(text.to_string())).await.is_err()
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
+    }
+
     fn request(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         if let Some(api_key) = &self.api_key {
             let mut headers = HeaderMap::new();
