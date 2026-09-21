@@ -191,10 +191,9 @@ pub fn select_quantization_mode(delivery_ratio: f32) -> QuantizationMode {
 
 /// Assign layers sequentially across nodes based on VRAM capacity.
 ///
-/// OPTIMIZATION: Replaces per-layer `Option<LayerAssignment>` state tracking and repeated `.as_mut()`
-/// calls with a single-pass index range and VRAM accumulator. Pre-allocates output capacity for `nodes.len()`
-/// and constructs `LayerAssignment` objects only once per node transition or stream completion,
-/// preserving exact `LayerSpec.index` range boundaries while reducing allocation churn and instructions.
+/// OPTIMIZATION: Caches `current_node = &nodes[node_idx]` and tracks `current_start_layer` /
+/// `last_layer_index` during iteration over `layers.iter()`. This eliminates repeated slice bounds
+/// checks on `nodes[node_idx]` and `layers[...]` indexing when constructing `LayerAssignment` objects.
 pub fn assign_layers_sequentially(
     nodes: &[NodeResources],
     layers: &[LayerSpec],
@@ -208,18 +207,21 @@ pub fn assign_layers_sequentially(
 
     let mut assignments = Vec::with_capacity(nodes.len());
     let mut node_idx = 0usize;
-    let mut remaining_capacity = nodes[0].vram_gb;
+    let mut current_node = &nodes[0];
+    let mut remaining_capacity = current_node.vram_gb;
     let mut current_start = 0usize;
+    let mut current_start_layer = layers[0].index;
+    let mut last_layer_index = layers[0].index;
     let mut current_vram = 0.0f32;
 
     for (i, layer) in layers.iter().enumerate() {
         while layer.vram_gb > remaining_capacity {
             // Need to move to next node: flush current accumulated layer assignment
             if i > current_start {
-                let start_layer = layers[current_start].index;
-                let end_layer = layers[i - 1].index + 1;
+                let start_layer = current_start_layer;
+                let end_layer = last_layer_index + 1;
                 assignments.push(LayerAssignment::new(
-                    nodes[node_idx].id.clone(),
+                    current_node.id.clone(),
                     start_layer,
                     end_layer,
                     current_vram,
@@ -233,22 +235,25 @@ pub fn assign_layers_sequentially(
                     layer.index, layer.vram_gb
                 ));
             }
-            remaining_capacity = nodes[node_idx].vram_gb;
+            current_node = &nodes[node_idx];
+            remaining_capacity = current_node.vram_gb;
             current_start = i;
+            current_start_layer = layer.index;
             current_vram = 0.0;
         }
 
         // Accumulate layer onto current node
         remaining_capacity -= layer.vram_gb;
         current_vram += layer.vram_gb;
+        last_layer_index = layer.index;
     }
 
     // Finalize last assignment for remaining layers
     if current_start < layers.len() {
-        let start_layer = layers[current_start].index;
-        let end_layer = layers[layers.len() - 1].index + 1;
+        let start_layer = current_start_layer;
+        let end_layer = last_layer_index + 1;
         assignments.push(LayerAssignment::new(
-            nodes[node_idx].id.clone(),
+            current_node.id.clone(),
             start_layer,
             end_layer,
             current_vram,
@@ -302,9 +307,9 @@ pub fn chunk_assignments_for_workers(
 /// `LayerAssignment` objects and their associated allocation/clone overhead.
 ///
 /// OPTIMIZATION: Computes chunked layer assignments directly in a single pass over
-/// the input layer slice, bypassing intermediate `PlacementPlan`/`LayerAssignment` allocations,
-/// post-allocation chunking loops (`chunk_assignments_for_workers`), and redundant meta-calculations.
-/// Preserves exact `LayerSpec.index` range boundaries (matching `assign_layers_sequentially`).
+/// the input layer slice while caching `current_node = &nodes[node_idx]` and tracking
+/// `chunk_start_layer` and `last_layer_index`. This eliminates slice bounds checks on `nodes` and `layers`
+/// during iteration and when pushing `LayerAssignment` objects.
 fn assign_layers_chunked(
     nodes: &[NodeResources],
     layers: &[LayerSpec],
@@ -321,19 +326,22 @@ fn assign_layers_chunked(
     let est_assignments = (layers.len().div_ceil(chunk_size)).max(nodes.len());
     let mut assignments = Vec::with_capacity(est_assignments);
     let mut node_idx = 0usize;
-    let mut remaining_vram = nodes[0].vram_gb;
+    let mut current_node = &nodes[0];
+    let mut remaining_vram = current_node.vram_gb;
     // Index of the first layer in the current chunk
     let mut chunk_start = 0usize;
+    let mut chunk_start_layer = layers[0].index;
+    let mut last_layer_index = layers[0].index;
     let mut chunk_vram = 0.0f32;
 
     for (i, layer) in layers.iter().enumerate() {
         // Move to next node if current node is out of capacity
         while layer.vram_gb > remaining_vram {
             if i > chunk_start {
-                let start_layer = layers[chunk_start].index;
-                let end_layer = layers[i - 1].index + 1;
+                let start_layer = chunk_start_layer;
+                let end_layer = last_layer_index + 1;
                 assignments.push(LayerAssignment::new(
-                    nodes[node_idx].id.clone(),
+                    current_node.id.clone(),
                     start_layer,
                     end_layer,
                     chunk_vram,
@@ -346,26 +354,32 @@ fn assign_layers_chunked(
                     layer.index, layer.vram_gb
                 ));
             }
-            remaining_vram = nodes[node_idx].vram_gb;
+            current_node = &nodes[node_idx];
+            remaining_vram = current_node.vram_gb;
             chunk_start = i;
+            chunk_start_layer = layer.index;
             chunk_vram = 0.0;
         }
 
         remaining_vram -= layer.vram_gb;
         chunk_vram += layer.vram_gb;
+        last_layer_index = layer.index;
 
         // Flush chunk if it reached the maximum chunk size
         let chunk_len = i + 1 - chunk_start;
         if chunk_len >= chunk_size {
-            let start_layer = layers[chunk_start].index;
-            let end_layer = layers[i].index + 1;
+            let start_layer = chunk_start_layer;
+            let end_layer = layer.index + 1;
             assignments.push(LayerAssignment::new(
-                nodes[node_idx].id.clone(),
+                current_node.id.clone(),
                 start_layer,
                 end_layer,
                 chunk_vram,
             ));
             chunk_start = i + 1;
+            if let Some(next_layer) = layers.get(i + 1) {
+                chunk_start_layer = next_layer.index;
+            }
             chunk_vram = 0.0;
         }
     }
@@ -375,10 +389,10 @@ fn assign_layers_chunked(
     // otherwise leave `chunk_vram == 0.0` and be silently dropped from the
     // plan even though `chunk_start..layers.len()` is non-empty.
     if chunk_start < layers.len() {
-        let start_layer = layers[chunk_start].index;
-        let end_layer = layers[layers.len() - 1].index + 1;
+        let start_layer = chunk_start_layer;
+        let end_layer = last_layer_index + 1;
         assignments.push(LayerAssignment::new(
-            nodes[node_idx].id.clone(),
+            current_node.id.clone(),
             start_layer,
             end_layer,
             chunk_vram,
