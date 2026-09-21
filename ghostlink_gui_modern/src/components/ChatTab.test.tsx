@@ -361,5 +361,41 @@ describe('ChatTab', () => {
       const deleteBtn = screen.getByRole("button", { name: "Delete thread Project Architecture" });
       expect(deleteBtn).toBeInTheDocument();
     });
+
+    it("toggles MCP tool selector popover overlay when clicking Select tools button", () => {
+      useAppStore.setState({
+        mcpServers: [
+          {
+            name: "calculator-mcp",
+            slot: "calculator",
+            enabled: true,
+            connected: true,
+            requires_confirmation: false,
+            timeout_secs: 30,
+            tool_count: 1,
+            transport: { transport: "stdio", command: "calc", args: [], env: {} },
+          },
+        ],
+      });
+      const api = createMockApi();
+      render(<ChatTab api={api} />);
+
+      const selectToolsBtn = screen.getByRole("button", { name: "Select tools" });
+      expect(selectToolsBtn).toHaveAttribute("aria-expanded", "false");
+
+      fireEvent.click(selectToolsBtn);
+      expect(selectToolsBtn).toHaveAttribute("aria-expanded", "true");
+      expect(screen.getByText("Select MCP Tools")).toBeInTheDocument();
+      expect(screen.getByText("calculator")).toBeInTheDocument();
+
+      const checkbox = screen.getByRole("checkbox");
+      expect(checkbox).not.toBeChecked();
+      fireEvent.click(checkbox);
+      expect(checkbox).toBeChecked();
+
+      const closeBtn = screen.getByRole("button", { name: "Close tool selector" });
+      fireEvent.click(closeBtn);
+      expect(screen.queryByText("Select MCP Tools")).not.toBeInTheDocument();
+    });
   });
 });
