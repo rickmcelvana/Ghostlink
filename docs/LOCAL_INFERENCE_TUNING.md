@@ -195,6 +195,22 @@ quality loss for agent/tool loops.
 This repo already ships `models/gemma-4-E4B-it-Q4_K_M.gguf` as the preferred
 Windows launch model.
 
+
+## Speculative Decoding & Tensor Pinning
+
+### Speculative Decoding
+Speculative decoding uses a smaller draft model to accelerate text generation.
+Configure draft knobs via environment variables:
+- `GHOSTLINK_DRAFT_MODEL`: Path to the draft model file (`.gguf`).
+- `GHOSTLINK_DRAFT_MAX`: Number of tokens to draft per step (e.g. `16`).
+- `GHOSTLINK_DRAFT_P_MIN`: Minimum probability threshold for accepting draft tokens (e.g. `0.2`).
+
+When `GHOSTLINK_DRAFT_MODEL` is set and points to a valid file, Ghostlink passes `--model-draft <path>`, `--draft-max`, and `--draft-p-min` to `llama-server`.
+
+### RPC Tensor Pinning & "RPC Only If It Does Not Fit"
+- **Fit-Local Rule**: RPC distribution is automatically bypassed if the model plus KV cache fits completely within local VRAM. Same-host or unnecessary Ethernet RPC is a performance regression. Set `GHOSTLINK_REQUIRE_CLUSTER_OFFLOAD=1` if you want to force RPC offloading regardless.
+- **Tensor Pinning (`-ot`)**: When RPC is used, Ghostlink pins latency-critical tensors locally (attention, KV cache, embeddings, output/lm_head) on the local accelerator and routes heavy FFN / MoE expert tensors to remote RPC workers via `-ot ffn=RPC,exps=RPC`. Set `GHOSTLINK_LLAMA_OVERRIDE_TENSOR` to override this tensor layout mapping.
+
 ## Quick verify
 
 ```bash

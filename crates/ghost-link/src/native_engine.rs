@@ -224,6 +224,21 @@ impl NativeEngineClient {
     /// Best-effort: a missing binary or an unparsable `--version` output
     /// returns `None` rather than panicking or blocking startup, matching
     /// this codebase's established pattern for hardware/binary detection.
+        /// Tokenize content using llama-server's /tokenize endpoint for accurate token counts.
+    pub async fn tokenize(&self, content: &str) -> Option<usize> {
+        let base_url = Self::get_llama_base_url();
+        let url = format!("{base_url}/tokenize");
+        let payload = serde_json::json!({ "content": content });
+        let response = self.http.post(&url).json(&payload).send().await.ok()?;
+        if response.status().is_success() {
+            let json: serde_json::Value = response.json().await.ok()?;
+            if let Some(tokens) = json.get("tokens").and_then(|v| v.as_array()) {
+                return Some(tokens.len().max(1));
+            }
+        }
+        None
+    }
+
     pub fn get_llama_build_id() -> Option<String> {
         LLAMA_BUILD_ID
             .get_or_init(|| {
@@ -789,7 +804,7 @@ impl NativeEngineClient {
     }
 
     /// Resolve a model path that may be relative to the project root / cwd.
-    fn resolve_model_path(model_path: &str) -> Result<PathBuf, String> {
+    pub fn resolve_model_path(model_path: &str) -> Result<PathBuf, String> {
         let direct = PathBuf::from(model_path);
         if direct.is_file() {
             return Ok(direct);
