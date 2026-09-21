@@ -224,7 +224,7 @@ impl NativeEngineClient {
     /// Best-effort: a missing binary or an unparsable `--version` output
     /// returns `None` rather than panicking or blocking startup, matching
     /// this codebase's established pattern for hardware/binary detection.
-        /// Tokenize content using llama-server's /tokenize endpoint for accurate token counts.
+    /// Tokenize content using llama-server's /tokenize endpoint for accurate token counts.
     pub async fn tokenize(&self, content: &str) -> Option<usize> {
         let base_url = Self::get_llama_base_url();
         let url = format!("{base_url}/tokenize");

@@ -8071,7 +8071,8 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             matches!(inference_backend, InferenceEngine::Native),
             req.messages.as_deref().unwrap_or(&[]),
             settings.conversation_token_limit,
-        ).await;
+        )
+        .await;
         let temp = req.temperature.unwrap_or(settings.temperature);
         let top_p = req.top_p.unwrap_or(settings.top_p);
         let top_k = req.top_k.unwrap_or(settings.top_k);

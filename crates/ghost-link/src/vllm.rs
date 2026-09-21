@@ -223,7 +223,9 @@ impl VllmClient {
         max_tokens: usize,
         response_format: Option<Value>,
     ) -> Result<
-        std::pin::Pin<Box<dyn futures::Stream<Item = Result<String, Box<dyn Error + Send + Sync>>> + Send>>,
+        std::pin::Pin<
+            Box<dyn futures::Stream<Item = Result<String, Box<dyn Error + Send + Sync>>> + Send>,
+        >,
         Box<dyn Error>,
     > {
         use futures::StreamExt;
@@ -296,7 +298,8 @@ impl VllmClient {
                             .and_then(|choice| choice.get("delta"))
                         {
                             if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
-                                if !text.is_empty() && tx.send(Ok(text.to_string())).await.is_err() {
+                                if !text.is_empty() && tx.send(Ok(text.to_string())).await.is_err()
+                                {
                                     return;
                                 }
                             }

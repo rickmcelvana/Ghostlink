@@ -2204,7 +2204,6 @@ mod tests {
             .contains("below the 1.0% minimum threshold"));
     }
 
-
     #[test]
     fn rpc_tensor_override_defaults_to_ffn_and_exps_remote() {
         let override_val = std::env::var("GHOSTLINK_LLAMA_OVERRIDE_TENSOR")
