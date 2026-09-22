@@ -367,6 +367,9 @@ impl NetworkHealthMonitor {
     }
 
     /// Check if node needs quantization fallback
+    ///
+    /// OPTIMIZATION: Accumulates delivery ratio and latency across recent checks in a single pass
+    /// without allocating intermediate candidate vectors or performing multiple iterator traversals.
     pub fn needs_quantization_fallback(&self, node_id: &str) -> bool {
         let cfg = self.config();
         let checks = self
@@ -375,19 +378,21 @@ impl NetworkHealthMonitor {
             .unwrap_or_else(|poison| poison.into_inner());
 
         if let Some(node_checks) = checks.get(node_id) {
-            // Check last 3 results for consistent degradation
-            let recent: Vec<_> = node_checks.iter().rev().take(3).collect();
-
-            if recent.len() < 3 {
+            if node_checks.len() < 3 {
                 return false;
             }
 
-            // Calculate average delivery ratio of last 3 checks
-            let avg_delivery_ratio: f32 =
-                recent.iter().map(|r| r.delivery_ratio).sum::<f32>() / 3.0;
+            // Calculate average delivery ratio and latency of last 3 checks in a single pass
+            let mut sum_delivery_ratio = 0.0f32;
+            let mut sum_latency_us = 0.0f32;
 
-            // Check average latency
-            let avg_latency_us: f32 = recent.iter().map(|r| r.latency_us).sum::<f32>() / 3.0;
+            for r in node_checks.iter().rev().take(3) {
+                sum_delivery_ratio += r.delivery_ratio;
+                sum_latency_us += r.latency_us;
+            }
+
+            let avg_delivery_ratio = sum_delivery_ratio / 3.0;
+            let avg_latency_us = sum_latency_us / 3.0;
 
             // Need fallback if delivery ratio dropped below threshold or latency increased significantly
             avg_delivery_ratio < cfg.healthy_delivery_ratio
@@ -398,6 +403,9 @@ impl NetworkHealthMonitor {
     }
 
     /// Get cluster-wide health summary
+    ///
+    /// OPTIMIZATION: Consolidates node health counts into a single-pass traversal over recent_checks,
+    /// eliminating three redundant iterator traversals and repeated back() calls per node.
     pub fn get_health_summary(&self) -> String {
         let checks = self
             .recent_checks
@@ -405,35 +413,20 @@ impl NetworkHealthMonitor {
             .unwrap_or_else(|poison| poison.into_inner());
 
         let total_nodes = self.cluster.node_count();
-        let healthy_count = checks
-            .values()
-            .filter(|node_checks| {
-                node_checks
-                    .back()
-                    .map(|c| c.status == HealthStatus::Healthy)
-                    .unwrap_or(false)
-            })
-            .count();
+        let mut healthy_count = 0usize;
+        let mut degraded_count = 0usize;
+        let mut failed_count = 0usize;
 
-        let degraded_count = checks
-            .values()
-            .filter(|node_checks| {
-                node_checks
-                    .back()
-                    .map(|c| c.status == HealthStatus::Degraded)
-                    .unwrap_or(false)
-            })
-            .count();
-
-        let failed_count = checks
-            .values()
-            .filter(|node_checks| {
-                node_checks
-                    .back()
-                    .map(|c| c.status == HealthStatus::Failed)
-                    .unwrap_or(false)
-            })
-            .count();
+        for node_checks in checks.values() {
+            if let Some(c) = node_checks.back() {
+                match c.status {
+                    HealthStatus::Healthy => healthy_count += 1,
+                    HealthStatus::Degraded => degraded_count += 1,
+                    HealthStatus::Failed => failed_count += 1,
+                    HealthStatus::Unknown => {}
+                }
+            }
+        }
 
         format!(
             "Network Health Summary\n\
