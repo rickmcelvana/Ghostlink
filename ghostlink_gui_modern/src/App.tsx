@@ -259,7 +259,7 @@ function App() {
       clearInterval(metricsInterval);
       clearInterval(workersInterval);
     };
-  }, [api, setModels, setMetrics, setWorkers, setSessions, setBackendOnline]);
+  }, [api, setModels, setMetrics, setWorkers, setSessions, setBackendOnline, setActiveTab]);
 
   const renderTab = () => {
     if (!api) {
