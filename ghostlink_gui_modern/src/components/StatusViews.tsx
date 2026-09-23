@@ -46,6 +46,7 @@ export const EmptyState: React.FC<EmptyStateProps> = ({
         <button
           onClick={action.onClick}
           aria-label={action.ariaLabel || action.label}
+          title={action.ariaLabel || action.label}
           className="mt-4 inline-flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold rounded-xl transition focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
         >
           {ActionIcon && <ActionIcon size={14} aria-hidden="true" />}
@@ -75,6 +76,8 @@ interface ErrorPanelProps {
   message: string;
   onRetry?: () => void;
   retryLabel?: string;
+  retryAriaLabel?: string;
+  isRetrying?: boolean;
   className?: string;
 }
 
@@ -84,24 +87,33 @@ export const ErrorPanel: React.FC<ErrorPanelProps> = ({
   message,
   onRetry,
   retryLabel = 'Try Again',
+  retryAriaLabel,
+  isRetrying = false,
   className = '',
-}) => (
-  <div
-    role="alert"
-    aria-live="assertive"
-    className={`flex flex-col items-center justify-center text-center py-16 bg-slate-900/30 border border-red-800/50 border-dashed rounded-3xl ${className}`}
-  >
-    {Icon && <Icon size={48} className="mb-4 opacity-40 text-red-400" aria-hidden="true" />}
-    <p className="text-base font-medium text-red-400">{title}</p>
-    <p className="text-sm text-slate-500 opacity-80 mt-1 max-w-sm">{message}</p>
-    {onRetry && (
-      <button
-        onClick={onRetry}
-        className="mt-4 inline-flex items-center gap-2 px-4 py-2 bg-red-600/20 hover:bg-red-600/30 text-red-300 border border-red-800/60 text-xs font-bold rounded-xl transition focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
-      >
-        <RefreshCw size={14} aria-hidden="true" />
-        {retryLabel}
-      </button>
-    )}
-  </div>
-);
+}) => {
+  const effectiveLabel = retryAriaLabel || (isRetrying ? 'Retrying...' : retryLabel);
+  return (
+    <div
+      role="alert"
+      aria-live="assertive"
+      className={`flex flex-col items-center justify-center text-center py-16 bg-slate-900/30 border border-red-800/50 border-dashed rounded-3xl ${className}`}
+    >
+      {Icon && <Icon size={48} className="mb-4 opacity-40 text-red-400" aria-hidden="true" />}
+      <p className="text-base font-medium text-red-400">{title}</p>
+      <p className="text-sm text-slate-500 opacity-80 mt-1 max-w-sm">{message}</p>
+      {onRetry && (
+        <button
+          onClick={onRetry}
+          disabled={isRetrying}
+          aria-busy={isRetrying}
+          aria-label={effectiveLabel}
+          title={effectiveLabel}
+          className="mt-4 inline-flex items-center gap-2 px-4 py-2 bg-red-600/20 hover:bg-red-600/30 text-red-300 border border-red-800/60 text-xs font-bold rounded-xl transition disabled:opacity-50 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
+        >
+          <RefreshCw size={14} className={isRetrying ? 'animate-spin' : ''} aria-hidden="true" />
+          {isRetrying ? 'Retrying...' : retryLabel}
+        </button>
+      )}
+    </div>
+  );
+};

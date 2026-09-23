@@ -13,3 +13,7 @@
 ## 2026-09-15 - Context-Aware Disabled Reasons and Busy States on Toolbar Action Buttons
 **Learning:** Action buttons in toolbars or editor headers disabled based on contextual state (e.g. no open document, no unsaved edits) leave users and screen readers guessing why an action cannot be triggered.
 **Action:** Pair disabled toolbar buttons with dynamic `aria-label`, `aria-busy`, and native `title` tooltips that explicitly state the reason for being disabled (e.g. "Cannot save: no file open" or "No unsaved changes in [filename]") and update to active/busy states during async operations.
+
+## 2026-09-15 - Contextual Retries, Tooltips, and Busy States in Shared ErrorPanels
+**Learning:** Shared ErrorPanels providing retry buttons without `isRetrying` state, explicit `aria-label`, or `title` tooltips fail to inform screen reader users or mouse users when a background retry is in progress, while allowing repeated button clicks during asynchronous recovery attempts.
+**Action:** Equip shared `ErrorPanel` retry controls with `isRetrying` and `retryAriaLabel` properties bound to `disabled`, `aria-busy`, spinning icon animation, dynamic `aria-label`, and native `title` tooltips.
