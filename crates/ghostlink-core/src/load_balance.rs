@@ -183,6 +183,14 @@ impl LoadBalancer {
         &self,
         layers: &[crate::planning::LayerSpec],
     ) -> Result<LoadDistributionPlan, String> {
+        self.distribute_layers_internal(layers, None)
+    }
+
+    fn distribute_layers_internal(
+        &self,
+        layers: &[crate::planning::LayerSpec],
+        max_layers_per_slice: Option<usize>,
+    ) -> Result<LoadDistributionPlan, String> {
         let nodes_snapshot = self.cluster.nodes_snapshot();
         if nodes_snapshot.is_empty() {
             return Err("no nodes available".into());
@@ -213,6 +221,7 @@ impl LoadBalancer {
         let mut distributions = Vec::with_capacity(sorted_nodes.len());
         let mut participating_nodes = Vec::with_capacity(sorted_nodes.len());
         let mut current_layer_idx = 0usize;
+        let slice_limit = max_layers_per_slice.unwrap_or(usize::MAX).max(1);
 
         for node in &sorted_nodes {
             if current_layer_idx >= sorted_layers.len() {
@@ -232,13 +241,35 @@ impl LoadBalancer {
             }
 
             if end_idx > start_idx {
-                let start_layer = sorted_layers[start_idx].index;
-                let end_layer = sorted_layers[end_idx - 1].index + 1;
-                // Optimize: Reuse `used_vram` directly instead of re-iterating over sorted_layers[start_idx..end_idx] to re-sum vram_gb.
-                let slice = TensorSlice::new((start_layer, end_layer), used_vram);
+                let total_node_layers = end_idx - start_idx;
                 let node_id = node.id.clone();
                 participating_nodes.push(node_id.clone());
-                distributions.push((node_id, vec![slice]));
+
+                if total_node_layers <= slice_limit {
+                    let start_layer = sorted_layers[start_idx].index;
+                    let end_layer = sorted_layers[end_idx - 1].index + 1;
+                    let slice = TensorSlice::new((start_layer, end_layer), used_vram);
+                    distributions.push((node_id, vec![slice]));
+                } else {
+                    let chunks_count = total_node_layers.div_ceil(slice_limit);
+                    let mut slices = Vec::with_capacity(chunks_count);
+                    let avg_size = used_vram / total_node_layers as f32;
+
+                    let mut chunk_start_idx = start_idx;
+                    while chunk_start_idx < end_idx {
+                        let chunk_end_idx = (chunk_start_idx + slice_limit).min(end_idx);
+                        let chunk_layers = chunk_end_idx - chunk_start_idx;
+                        let start_layer = sorted_layers[chunk_start_idx].index;
+                        let end_layer = sorted_layers[chunk_end_idx - 1].index + 1;
+                        slices.push(TensorSlice::new(
+                            (start_layer, end_layer),
+                            avg_size * chunk_layers as f32,
+                        ));
+                        chunk_start_idx = chunk_end_idx;
+                    }
+                    distributions.push((node_id, slices));
+                }
+
                 current_layer_idx = end_idx;
             }
         }
@@ -257,14 +288,18 @@ impl LoadBalancer {
         }
     }
 
-    /// Distribute layers and then chunk large node allocations to match worker parallelism.
+    /// Distribute layers and directly chunk large node allocations to match worker parallelism.
+    ///
+    /// OPTIMIZATION: Delegates directly to `distribute_layers_internal` with `Some(max_layers_per_slice)`
+    /// to generate chunked tensor slices in a single pass during greedy assignment. This completely
+    /// eliminates intermediate single-slice vector allocations (`vec![slice]`), avoids intermediate
+    /// `LoadDistributionPlan` construction, and bypasses multi-pass post-processing traversals.
     pub fn distribute_layers_with_runtime_profile(
         &self,
         layers: &[crate::planning::LayerSpec],
         profile: &RuntimeProfile,
     ) -> Result<LoadDistributionPlan, String> {
         let cfg = self.config();
-        let plan = self.distribute_layers(layers)?;
         let backend = ExecutionBackend::from_runtime_profile(profile);
         let vector_bias = (backend.vector_width_bits / 128).max(1);
         let max_layers_per_slice = cfg
@@ -272,7 +307,8 @@ impl LoadBalancer {
             .min(profile.recommended_workers.max(1).saturating_mul(2))
             .min(backend.preferred_batch_size / vector_bias)
             .max(1);
-        Ok(chunk_distribution_plan(plan, max_layers_per_slice))
+
+        self.distribute_layers_internal(layers, Some(max_layers_per_slice))
     }
 
     /// Rebalance load based on current node metrics
@@ -437,7 +473,8 @@ impl LoadBalancer {
     }
 }
 
-fn chunk_distribution_plan(
+/// Split large tensor slices in an existing distribution plan into smaller contiguous chunks.
+pub fn chunk_distribution_plan(
     plan: LoadDistributionPlan,
     max_layers_per_slice: usize,
 ) -> LoadDistributionPlan {
