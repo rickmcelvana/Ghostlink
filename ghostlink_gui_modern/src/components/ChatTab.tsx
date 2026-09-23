@@ -1179,6 +1179,7 @@ export const ChatTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
                 tools.map((t) => (
                   <label
                     key={t.name}
+                    htmlFor={`mcp-tool-${t.name}`}
                     className="flex items-center justify-between p-2.5 rounded-xl bg-slate-950/60 hover:bg-slate-800/80 border border-slate-800/80 cursor-pointer text-xs transition"
                   >
                     <div className="flex flex-col min-w-0 pr-2">
@@ -1186,8 +1187,10 @@ export const ChatTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
                       <span className="text-[10px] text-slate-400 truncate">{t.description}</span>
                     </div>
                     <input
+                      id={`mcp-tool-${t.name}`}
                       type="checkbox"
                       checked={t.enabled}
+                      aria-label={`Enable tool ${t.name}`}
                       onChange={(e) => {
                         const checked = e.target.checked;
                         setTools((prev) =>
