@@ -2417,7 +2417,9 @@ fn build_cluster_topology_json(
     serde_json::json!({
         "summary": {
             "node_count": nodes.len(),
-            "active_nodes": cluster.active_nodes().len(),
+            // OPTIMIZATION: Use active_nodes_count() directly under lock instead of active_nodes().len(),
+            // which allocates a Vec<NodeMetrics> and deep-clones every active NodeMetrics struct.
+            "active_nodes": cluster.active_nodes_count(),
             "total_vram_gb": cluster.total_vram_gb(),
             "total_system_memory_gb": cluster.total_system_memory_gb(),
         },
