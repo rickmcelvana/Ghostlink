@@ -43,6 +43,8 @@ flowchart LR
     CustomBackend[Custom backend\ne.g. vLLM, LM Studio, hosted API]
 
     UI -->|/v1/chat/completions, /api/*| API
+    API -->|Context Governor| Gov[Context Governor
+token estimation + sliding/compact/truncate policy]
     API --> MCP
     API --> Native
     API --> Ollama

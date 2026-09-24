@@ -550,6 +550,13 @@ Launch scripts check for port conflicts before binding. If you see "address alre
 | `GHOSTLINK_FORCE_RUNTIME` | `false` | When `true`, honor `GHOSTLINK_RUNTIME` even if not auto-detected |
 | `GHOSTLINK_SYSTEM_MEMORY_GB` | — | Override detected system memory |
 | `NPU_DEVICE` / `QUALCOMM_NPU` | — | Enable NPU detection via env |
+| `GHOSTLINK_CTX_SIZE` | auto | Explicit context window size in tokens (`-c`) |
+| `GHOSTLINK_CTX_POLICY` | `sliding_window` | Context governor policy (`sliding_window`, `compact`, `truncate_oldest`) |
+| `GHOSTLINK_KEEP_LAST_TURNS` | `12` | Number of recent conversation turns preserved by governor |
+| `GHOSTLINK_RESERVE_COMPLETION_RATIO` | `0.2` | Fraction of context window reserved for response generation |
+| `GHOSTLINK_STICKY_SLOT` | `1` | Pin conversation threads to llama-server KV slots (`id_slot`) for slot reuse |
+| `GHOSTLINK_LLAMA_KV_CACHE_TYPE` | `q8_0` | KV cache quantization type (`q4_0`, `q8_0`, `f16`) |
+| `GHOSTLINK_LLAMA_FLASH_ATTN` | `1` | Enable fused Flash Attention kernel |
 
 ### Config File (TOML)
 

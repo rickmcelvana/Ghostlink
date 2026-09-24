@@ -242,3 +242,27 @@ $$\text{timeout\_secs} = \text{clamp}(90\text{s (floor)} + (\text{model\_size\_g
 - **Floor**: 90s minimum.
 - **Cap**: 1800s (30 minutes) maximum.
 - **Override**: Set `GHOSTLINK_MODEL_READY_TIMEOUT_SECS=<seconds>` to force a specific timeout.
+
+
+## Single Context Policy & Context Governor System
+
+Ghostlink features a unified, typed context policy system operating directly on the live inference path (`ChatTab / store.ts` → control-plane `:8000` → `crates/ghost-link` → `native_engine.rs` / `ollama.rs` / `vllm.rs` → `llama-server`).
+
+### Context Policy Shape
+- `n_ctx`: Context window size in tokens (`-c`).
+- `n_ctx_auto`: When `true`, automatically selects context size based on available VRAM and cluster capacity.
+- `kv_cache_type`: `"q4_0"` | `"q8_0"` | `"f16"` (`-ctk`/`-ctv`).
+- `conversation_token_limit`: Max tokens allowed for conversation history (0 = use `n_ctx`).
+- `max_tokens`: Response generation token cap.
+- `policy`: Context governor policy when budget is exceeded:
+  - `sliding_window`: Keeps system prompt, pinned messages, and the last `keep_last_turns` turns.
+  - `truncate_oldest`: Drops oldest non-system non-pinned turns until prompt fits budget.
+  - `compact`: Summarizes dropped turns into a concise memory blob (`[Memory of earlier context: ...]`).
+- `keep_last_turns`: Number of recent turns to preserve (default: `12`).
+- `reserve_completion_ratio`: Fraction of context window reserved for completion output (default: `0.2`).
+- `sticky_slot`: Pin conversation threads to llama-server KV slots (`id_slot`) with `cache_prompt: true` to accelerate repeat turns.
+
+### Memory Budgeting for Large & Distributed Models
+- On single-node execution, large models (>= 10GB) on VRAM-constrained GPUs receive a safety context ceiling to avoid exhausting system RAM.
+- When distributed RPC inference (`--rpc`) is active, aggregate cluster memory capacity is evaluated. Large models are **not** hard-capped at 4096 tokens when aggregate VRAM fits weights and context.
+- If an explicitly configured `n_ctx` exceeds available memory capacity, `load_model_into_slot` returns a structured memory fit error detailing required vs available memory, preventing silent clamping or VRAM OOM crashes.
