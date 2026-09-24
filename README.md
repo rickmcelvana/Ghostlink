@@ -54,19 +54,13 @@ Route workloads across CPU, GPU, and NPU resources with explicit scheduling, har
 
 ## What Ghostlink brings
 
-- Clear routing and scheduling for custom inference topologies
-- Real cross-machine distributed inference: opt in a node's spare GPU/CPU and
-  a request automatically splits across it via llama.cpp's own RPC backend —
-  zero-config, no manual `--rpc` flags
-- Hardware-aware placement across mixed compute environments (CPU, GPU, NPU)
-- SPSC ring-buffer transport with spin-wait for sub-microsecond handoff (transport and latency research; real distributed inference uses llama.cpp's `ggml-rpc`)
-- TCP and Unix domain socket transport for multi-process pipelines
-- Session-level authentication on transport frames
-- Dynamic system profile watching with auto-tuning cache
-- In-GUI code editor (Monaco) with copilot-style actions — Explain/Fix/Refactor
-  with diff preview before anything is written, multi-file refactor, opt-in
-  ghost-text autocomplete, and repo-aware chat via local RAG indexing
-- A strong open-source foundation with a commercial support path
+**Product North Star: Happy Path Only**
+Discover LAN peers → Split GGUF model weights via `ggml-rpc` → Serve OpenAI-compatible `/v1/chat/completions`.
+
+- Zero-config cross-machine distributed inference across LAN worker nodes using llama.cpp's `ggml-rpc` backend.
+- Hardware-aware placement across mixed compute environments (CPU, GPU, NPU).
+- OpenAI-compatible `/v1/chat/completions` API server.
+- Research components (Experimental): SPSC ring buffers (`flow`), TCP/UDS transport pipelines, and AF_XDP kernel-bypass are experimental research paths. Synthetic tok/s measurements from these research components reflect transport framing latency only and are never presented as LLM token generation speed.
 
 ## Why Ghostlink
 

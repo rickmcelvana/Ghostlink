@@ -337,11 +337,9 @@ make the Priority Zero fix land on solid ground.
    same logic implies should already be failing — flagged separately
    rather than fixed here, since confirming and fixing it needs a working
    Docker daemon this environment didn't have.
-5. **One-line install script** (`curl | sh` / a signed installer per
-   platform) using the now-multi-OS release artifacts. Ollama's biggest UX
-   win is `curl -fsSL https://ollama.com/install.sh | sh`; Ghostlink should
-   have the exact equivalent, now that Windows/macOS binaries actually
-   exist.
+5. **One-line install script** (`curl | sh` / PowerShell installer per
+   platform) using multi-OS release artifacts. **Shipped**: `scripts/install.sh` and
+   `scripts/install.ps1` are available and download SHA256-verified prebuilt release binaries.
 6. **Config hot-reload for the settings that are safe to change live**
    (already flagged as a gap in the earlier review pass) — `/api/settings`
    exists for runtime changes; add a file-watch path for
