@@ -53,6 +53,7 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
               <details className="text-left mb-4 p-3 bg-slate-900 border border-slate-700 rounded-lg text-xs">
                 <summary
                   title="Toggle error stack trace details"
+                  aria-label="Error Details - Toggle error stack trace details"
                   className="cursor-pointer text-slate-500 hover:text-slate-300 transition-colors mb-2 rounded focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
                 >
                   Error Details
@@ -64,6 +65,8 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
             )}
             <button
               onClick={this.handleRetry}
+              aria-label="Try Again - Retry recovering from application error"
+              title="Try Again - Retry recovering from application error"
               className="inline-flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-xl text-sm font-medium transition focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
             >
               <RefreshCw size={16} aria-hidden="true" /> Try Again
@@ -99,6 +102,8 @@ export const ConnectionErrorBoundary: React.FC<ConnectionErrorBoundaryProps> = (
           </p>
           <button
             onClick={() => window.location.reload()}
+            aria-label="Reconnect - Reconnect to server and reload page"
+            title="Reconnect - Reconnect to server and reload page"
             className="inline-flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-xl text-sm font-medium transition focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
           >
             <RefreshCw size={16} aria-hidden="true" /> Reconnect
