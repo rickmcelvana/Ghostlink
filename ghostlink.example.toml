@@ -121,3 +121,16 @@ max_lines = 0
 # Default: 5. Older files beyond this limit are automatically purged.
 # Overridden by GHOSTLINK_AUDIT_LOG_MAX_FILES
 max_files = 5
+
+[context]
+# Single context policy configuration
+# n_ctx: context window size in tokens (-c launch arg to llama-server)
+n_ctx = 8192
+n_ctx_auto = true
+kv_cache_type = "q8_0" # "q4_0" | "q8_0" | "f16"
+conversation_token_limit = 0 # 0 = use n_ctx
+max_tokens = 2048
+policy = "sliding_window" # "sliding_window" | "compact" | "truncate_oldest"
+keep_last_turns = 12
+reserve_completion_ratio = 0.2
+sticky_slot = true
