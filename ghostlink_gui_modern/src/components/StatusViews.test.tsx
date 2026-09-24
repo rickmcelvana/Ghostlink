@@ -51,9 +51,32 @@ describe('StatusViews', () => {
     );
     const retryBtn = screen.getByRole('button', { name: 'Try Again' });
     expect(retryBtn).toBeInTheDocument();
+    expect(retryBtn).toHaveAttribute('title', 'Try Again');
     expect(retryBtn).toHaveClass('focus-visible:ring-2');
     fireEvent.click(retryBtn);
     expect(handleRetry).toHaveBeenCalledTimes(1);
+  });
+
+  it('renders ErrorPanel with busy state, disabled attribute, and spinning icon when isRetrying is true', () => {
+    render(
+      <ErrorPanel
+        icon={AlertCircle}
+        title="Session Failure"
+        message="Failed to load session history."
+        onRetry={vi.fn()}
+        isRetrying={true}
+        retryAriaLabel="Retrying session load..."
+      />
+    );
+    const retryBtn = screen.getByRole('button', { name: 'Retrying session load...' });
+    expect(retryBtn).toBeInTheDocument();
+    expect(retryBtn).toBeDisabled();
+    expect(retryBtn).toHaveAttribute('aria-busy', 'true');
+    expect(retryBtn).toHaveAttribute('title', 'Retrying session load...');
+    expect(screen.getByText('Retrying...')).toBeInTheDocument();
+
+    const icon = retryBtn.querySelector('svg');
+    expect(icon).toHaveClass('animate-spin');
   });
 
   it('renders EmptyState with title and description', () => {
