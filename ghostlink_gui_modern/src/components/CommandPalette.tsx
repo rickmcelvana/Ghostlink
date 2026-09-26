@@ -387,7 +387,7 @@ export const CommandPalette: React.FC = () => {
                         i === highlight ? 'bg-blue-600/10 text-blue-400' : 'text-slate-300'
                       }`}
                     >
-                      <Icon size={16} className={i === highlight ? 'text-blue-400' : 'text-slate-500'} />
+                      <Icon size={16} className={i === highlight ? 'text-blue-400' : 'text-slate-500'} aria-hidden="true" />
                       <div className="flex flex-col min-w-0">
                         <span className="truncate">{cmd.label}</span>
                         {cmd.hint && <span className="text-[10px] text-slate-500 truncate">{cmd.hint}</span>}

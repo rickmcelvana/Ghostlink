@@ -17,3 +17,7 @@
 ## 2026-09-15 - Contextual Retries, Tooltips, and Busy States in Shared ErrorPanels
 **Learning:** Shared ErrorPanels providing retry buttons without `isRetrying` state, explicit `aria-label`, or `title` tooltips fail to inform screen reader users or mouse users when a background retry is in progress, while allowing repeated button clicks during asynchronous recovery attempts.
 **Action:** Equip shared `ErrorPanel` retry controls with `isRetrying` and `retryAriaLabel` properties bound to `disabled`, `aria-busy`, spinning icon animation, dynamic `aria-label`, and native `title` tooltips.
+
+## 2026-09-26 - Descriptive Tooltips and Explicit ARIA Labels on Empty-State Suggestion Chips
+**Learning:** Empty-state suggestion chips often present concise text prompts for visual compactness, which may lack full intent context for screen reader users or mouse hoverers.
+**Action:** Always pair prompt suggestion chip buttons with explicit `aria-label={s.label}` and native `title={s.label}` tooltips so screen reader users and mouse hoverers hear and see the complete action intent.
