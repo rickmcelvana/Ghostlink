@@ -100,11 +100,20 @@ describe('ChatTab', () => {
     expect(screen.getByText('Select Model')).toBeInTheDocument();
   });
 
-  it('shows send button', () => {
+  it('shows send button and accessible composer textarea', () => {
     const api = createMockApi();
     render(<ChatTab api={api} />);
-    const textarea = screen.getByPlaceholderText(/Send a Message/i);
+    const textarea = screen.getByLabelText('Chat message input');
     expect(textarea).toBeInTheDocument();
+    expect(textarea).toHaveAttribute('placeholder', 'Send a Message');
+  });
+
+  it('renders accessible suggestion chips with aria-label and title tooltips on empty state', () => {
+    const api = createMockApi();
+    render(<ChatTab api={api} />);
+    const suggestionBtn = screen.getByRole('button', { name: 'Ask about active cluster node health' });
+    expect(suggestionBtn).toBeInTheDocument();
+    expect(suggestionBtn).toHaveAttribute('title', 'Ask about active cluster node health');
   });
 
   it('allows typing a message', () => {

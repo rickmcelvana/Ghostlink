@@ -644,10 +644,11 @@ export const ChatTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
 
           <div className="p-2 border-b border-slate-900">
             <div className="relative">
-              <Search size={14} className="absolute left-2.5 top-2.5 text-slate-500" />
+              <Search size={14} className="absolute left-2.5 top-2.5 text-slate-500" aria-hidden="true" />
               <input
                 type="text"
                 placeholder="Search threads…"
+                aria-label="Search threads"
                 value={threadSearch}
                 onChange={(e) => setThreadSearch(e.target.value)}
                 className="w-full bg-slate-900 border border-slate-800 rounded-lg pl-8 pr-3 py-1 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
@@ -978,6 +979,8 @@ export const ChatTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
                       setInput(s.text);
                       textareaRef.current?.focus();
                     }}
+                    aria-label={s.label}
+                    title={s.label}
                     className="p-3 bg-slate-900/60 hover:bg-slate-900 border border-slate-800 rounded-xl transition text-xs text-slate-300 hover:text-white focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
                   >
                     {s.text}
@@ -1027,6 +1030,7 @@ export const ChatTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
                         <div className="space-y-2 bg-slate-900 p-3 rounded-2xl border border-slate-800">
                           <textarea
                             value={editingMsgText}
+                            aria-label="Edit message"
                             onChange={(e) => setEditingMsgText(e.target.value)}
                             className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-xs text-slate-200 focus:outline-none focus:ring-1 focus:ring-blue-500"
                             rows={3}
@@ -1291,6 +1295,7 @@ export const ChatTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
               <textarea
                 ref={textareaRef}
                 value={input}
+                aria-label="Chat message input"
                 onChange={(e) => {
                   setInput(e.target.value);
                   if (e.target.value === "/") {
