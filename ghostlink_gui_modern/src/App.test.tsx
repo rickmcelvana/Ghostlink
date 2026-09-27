@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
-import App from './App';
+import App, { SplashScreen } from './App';
 import { useAppStore } from './store';
 
 vi.mock('./api', () => ({
@@ -69,5 +69,15 @@ describe('App', () => {
   it('shows New Chat button', () => {
     render(<App />);
     expect(screen.getAllByText('New Chat')[0]).toBeInTheDocument();
+  });
+
+  it('renders SplashScreen with proper accessibility attributes', () => {
+    const { getByRole, getByLabelText } = render(<SplashScreen />);
+    const spinner = getByLabelText('Loading Ghostlink Studio');
+    expect(spinner).toBeInTheDocument();
+
+    const statusContainer = getByRole('status');
+    expect(statusContainer).toBeInTheDocument();
+    expect(statusContainer).toHaveAttribute('aria-live', 'polite');
   });
 });
