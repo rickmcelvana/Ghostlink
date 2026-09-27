@@ -1116,9 +1116,6 @@ start_services() {
     fi
 
     local MLOCK_FLAG=""
-    if [ "$TOTAL_RAM_GB" -ge 8 ] 2>/dev/null; then
-        MLOCK_FLAG="--mlock"
-    fi
 
     mkdir -p "$PROJECT_ROOT/models"
     export GHOSTLINK_VRAM_GB="${VRAM_GB:-0}"
