@@ -1659,6 +1659,7 @@ show_success() {
     echo -e "${GREEN}│${NC}   ${BOLD}${WHITE}██║     ██║  ██║██║  ██║███████╗   ██║   ╚██████╔╝███████║${NC}                        ${GREEN}│${NC}"
     echo -e "${GREEN}│${NC}   ${BOLD}${WHITE}╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝   ╚═╝    ╚═════╝ ╚══════╝${NC}                        ${GREEN}│${NC}"
     echo -e "${GREEN}│${NC}                                                                                 ${GREEN}│${NC}"
+    local gui_port="${GUI_PORT:-5173}"
     echo -e "${GREEN}│${NC}   ${BOLD}${CYAN}Open Studio at http://127.0.0.1:${gui_port}${NC}                                        ${GREEN}│${NC}"
     echo -e "${GREEN}│${NC}                                                                                 ${GREEN}│${NC}"
     local credit_line="Sovereign Mohawk Proto LLC  ·  Zero-Config LAN Inference Fabric  ·  v$(ghostlink_version)"
@@ -1668,7 +1669,6 @@ show_success() {
     echo -e "${GREEN}└────────────────────────────────────────────────────────────────────────────────────┘${NC}"
     echo ""
     
-    local gui_port="${GUI_PORT:-5173}"
     local api_port="${GHOSTLINK_API_PORT:-8003}"
     local api_scheme
     api_scheme=$(get_api_scheme)

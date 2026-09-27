@@ -16,20 +16,21 @@ cd /d "%ROOT_DIR%"
 
 if "%GHOSTLINK_USE_WSL%"=="1" goto :use_wsl
 
-where powershell >nul 2>nul
-if errorlevel 1 (
-    echo ERROR: PowerShell is required for the native launcher but was not found.
-    echo Set GHOSTLINK_USE_WSL=1 to fall back to the WSL-based launcher instead.
-    exit /b 1
-)
-
 echo.
 echo Launching Ghostlink natively on Windows...
 echo.
 
-set "PS_CMD=powershell"
+set "PS_CMD="
+where powershell >nul 2>nul
+if not errorlevel 1 set "PS_CMD=powershell"
 where pwsh >nul 2>nul
 if not errorlevel 1 set "PS_CMD=pwsh"
+
+if "%PS_CMD%"=="" (
+    echo ERROR: PowerShell is required for the native launcher but was not found.
+    echo Set GHOSTLINK_USE_WSL=1 to fall back to the WSL-based launcher instead.
+    exit /b 1
+)
 
 %PS_CMD% -NoProfile -ExecutionPolicy Bypass -File "%ROOT_DIR%\launch-native.ps1" -OpenBrowser %*
 set "RC=%ERRORLEVEL%"
