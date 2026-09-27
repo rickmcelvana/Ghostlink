@@ -11,6 +11,7 @@ import {
   Settings,
   Plug,
   FileCode,
+  FolderGit2,
   CornerDownLeft,
   Activity,
   type LucideIcon,
@@ -28,6 +29,7 @@ export interface NavTab {
 // eslint-disable-next-line react-refresh/only-export-components
 export const NAV_TABS: NavTab[] = [
   { label: 'Chat', icon: MessageSquare, id: 0 },
+  { label: 'Projects', icon: FolderGit2 as any, id: 9 },
   { label: 'Editor', icon: FileCode, id: 8 },
   { label: 'Models', icon: Database, id: 1 },
   { label: 'Metrics', icon: BarChart3, id: 2 },
@@ -180,6 +182,7 @@ export const CommandPalette: React.FC = () => {
         label: 'Index workspace',
         hint: 'Scan and index workspace files in Editor tab',
         icon: FileCode,
+  FolderGit2,
         action: () => {
           setActiveTab(8);
           window.dispatchEvent(new CustomEvent('index-workspace-files'));
@@ -190,6 +193,7 @@ export const CommandPalette: React.FC = () => {
         label: 'Toggle workspace context',
         hint: 'Toggle RAG workspace context in Editor tab',
         icon: FileCode,
+  FolderGit2,
         action: () => {
           setActiveTab(8);
           window.dispatchEvent(new CustomEvent('toggle-workspace-context'));

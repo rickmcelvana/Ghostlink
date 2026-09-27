@@ -294,3 +294,21 @@ resp = client.chat.completions.create(
 
 - `distributed_inference` (bool): Enable cross-machine RPC tensor splitting.
 - `require_cluster_offload` (bool): When true, fail model load if offload is a no-op (-ngl == 0 or remote share < 1%) instead of falling back to single-node.
+## Task Agents API (v2.3)
+
+Studio Task Agents enable durable project management, autonomous implementer agent loops, deterministic command judging, and human-in-the-loop review.
+
+### Projects & Tasks Endpoints
+
+- **`POST /api/projects`**: Create a project (`{ name, kind: "code"|"work", root_path, allowed_tools?, default_model? }`).
+- **`GET /api/projects`**: List all projects.
+- **`GET /api/projects/:id`**: Get project details.
+- **`PATCH /api/projects/:id`**: Update project details.
+- **`POST /api/projects/:id/tasks`**: Create a task (`{ goal, acceptance_criteria?, budget?: { max_steps, max_minutes }, model? }`).
+- **`GET /api/projects/:id/tasks`**: List tasks for a project.
+- **`GET /api/tasks/:id`**: Get task details.
+- **`POST /api/tasks/:id/spawn`**: Spawn implementer agent run (`{ role: "implementer", model?, brief? }`).
+- **`POST /api/tasks/:id/cancel`**: Cancel active task run.
+- **`GET /api/tasks/:id/events`**: Stream live task events via SSE (`text/event-stream`).
+- **`GET /api/tasks/:id/review`**: Get task `ReviewPacket`.
+- **`POST /api/reviews/:id/decide`**: Submit human review decision (`{ decision: "accept"|"request_changes"|"reject", note? }`).

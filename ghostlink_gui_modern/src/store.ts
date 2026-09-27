@@ -1,3 +1,4 @@
+import { Project, Task, ReviewPacket, TaskEvent } from './api';
 import { create } from "zustand";
 
 export interface Model {
@@ -248,6 +249,9 @@ export interface DownloadProgressEntry {
   totalBytes?: number;
 }
 
+
+
+
 export interface Toast {
   id: string;
   type: "success" | "error" | "info";
@@ -302,6 +306,25 @@ interface AppState {
   toasts: Toast[];
   addToast: (toast: Omit<Toast, "id">) => string;
   removeToast: (id: string) => void;
+
+  // Task Agents (v2.3)
+  projects: Project[];
+  activeProject: Project | null;
+  tasks: Task[];
+  activeTask: Task | null;
+  reviewPacket: ReviewPacket | null;
+  taskEvents: TaskEvent[];
+  unreadNeedsReviewCount: number;
+
+  setProjects: (projects: Project[]) => void;
+  setActiveProject: (project: Project | null) => void;
+  setTasks: (tasks: Task[]) => void;
+  setActiveTask: (task: Task | null) => void;
+  setReviewPacket: (packet: ReviewPacket | null) => void;
+  addTaskEvent: (event: TaskEvent) => void;
+  clearTaskEvents: () => void;
+  setUnreadNeedsReviewCount: (count: number | ((prev: number) => number)) => void;
+
 
   setApiBase: (base: string) => void;
   setBackendOnline: (online: boolean) => void;
@@ -670,4 +693,24 @@ export const useAppStore = create<AppState>((set) => ({
     return id;
   },
   removeToast: (id) => set((state) => ({ toasts: state.toasts.filter((t) => t.id !== id) })),
+
+  projects: [],
+  activeProject: null,
+  tasks: [],
+  activeTask: null,
+  reviewPacket: null,
+  taskEvents: [],
+  unreadNeedsReviewCount: 0,
+
+  setProjects: (projects) => set({ projects }),
+  setActiveProject: (activeProject) => set({ activeProject }),
+  setTasks: (tasks) => set({ tasks }),
+  setActiveTask: (activeTask) => set({ activeTask }),
+  setReviewPacket: (reviewPacket) => set({ reviewPacket }),
+  addTaskEvent: (event) => set((state) => ({ taskEvents: [...state.taskEvents, event] })),
+  clearTaskEvents: () => set({ taskEvents: [] }),
+  setUnreadNeedsReviewCount: (count) =>
+    set((state) => ({
+      unreadNeedsReviewCount: typeof count === 'function' ? count(state.unreadNeedsReviewCount) : count,
+    })),
 }));

@@ -4,6 +4,7 @@ import { useAppStore } from './store';
 import { GhostlinkAPI } from './api';
 import { ChatTab } from './components/ChatTab';
 import { EditorTab } from './components/EditorTab';
+import { ProjectsTab } from './components/ProjectsTab';
 import { ModelsTab } from './components/ModelsTab';
 import { MetricsTab } from './components/MetricsTab';
 import { SessionsTab } from './components/SessionsTab';
@@ -107,6 +108,7 @@ function SplashScreen() {
 
 function App() {
   const { currentModel, activeTab, setActiveTab, setModels, setApiBase, setMetrics, setWorkers, setSessions, setBackendOnline, setChatMessages } = useAppStore();
+  const unreadNeedsReviewCount = useAppStore((state) => state.unreadNeedsReviewCount);
   const [api, setApi] = useState<GhostlinkAPI | null>(null);
   // Starts collapsed on phone-width viewports — at 375px a permanently
   // open 256px sidebar left only ~119px for actual content, which is
@@ -285,6 +287,8 @@ function App() {
         return <McpTab api={api} />;
       case 8:
         return <EditorTab api={api} />;
+      case 9:
+        return <ProjectsTab />;
       default:
         return null;
     }
@@ -378,6 +382,11 @@ function App() {
                 >
                   <Icon size={18} aria-hidden="true" />
                   <span>{tab.label}</span>
+                  {tab.id === 9 && unreadNeedsReviewCount > 0 && (
+                    <span className="ml-auto bg-amber-500 text-slate-950 font-extrabold text-[10px] px-1.5 py-0.5 rounded-full">
+                      {unreadNeedsReviewCount}
+                    </span>
+                  )}
                 </button>
               );
             })}

@@ -383,3 +383,85 @@ components:
               object: { type: string, example: model }
               created: { type: integer }
               owned_by: { type: string, example: ghostlink }
+
+  /api/projects:
+    get:
+      summary: List projects
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: List of projects
+    post:
+      summary: Create project
+      security: [{ BearerAuth: [] }]
+      responses:
+        '201':
+          description: Created project
+  /api/projects/{id}:
+    get:
+      summary: Get project details
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: Project details
+    patch:
+      summary: Update project
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: Updated project
+  /api/projects/{id}/tasks:
+    get:
+      summary: List tasks for project
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: Project tasks
+    post:
+      summary: Create task for project
+      security: [{ BearerAuth: [] }]
+      responses:
+        '201':
+          description: Created task
+  /api/tasks/{id}:
+    get:
+      summary: Get task details
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: Task details
+  /api/tasks/{id}/spawn:
+    post:
+      summary: Spawn implementer agent run for task
+      security: [{ BearerAuth: [] }]
+      responses:
+        '202':
+          description: Spawned agent run
+  /api/tasks/{id}/cancel:
+    post:
+      summary: Cancel active task run
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: Cancelled task
+  /api/tasks/{id}/events:
+    get:
+      summary: SSE event stream for task
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: SSE event stream
+  /api/tasks/{id}/review:
+    get:
+      summary: Get ReviewPacket for task
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: Task ReviewPacket
+  /api/reviews/{id}/decide:
+    post:
+      summary: Decide ReviewPacket (accept | request_changes | reject)
+      security: [{ BearerAuth: [] }]
+      responses:
+        '200':
+          description: Review decision applied

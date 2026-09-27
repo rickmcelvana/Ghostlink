@@ -1,3 +1,78 @@
+
+export interface Project {
+  id: string;
+  name: string;
+  kind: 'code' | 'work';
+  root_path: string;
+  allowed_tools: string[];
+  default_model?: string;
+  created_at: string;
+}
+
+export interface TaskBudget {
+  max_steps: number;
+  max_tokens?: number;
+  max_minutes: number;
+}
+
+export interface Task {
+  id: string;
+  project_id: string;
+  goal: string;
+  acceptance_criteria?: string;
+  status: 'queued' | 'running' | 'needs_review' | 'accepted' | 'rejected' | 'blocked' | 'cancelled';
+  parent_id?: string;
+  budget: TaskBudget;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AgentRun {
+  id: string;
+  task_id: string;
+  role: string;
+  model: string;
+  status: string;
+  step_count: number;
+  token_count: number;
+  started_at: string;
+  finished_at?: string;
+  error?: string;
+}
+
+export interface ReviewDiff {
+  path: string;
+  unified_diff: string;
+  original: string;
+  proposed: string;
+}
+
+export interface ReviewCommand {
+  argv: string[];
+  judge: 'allow' | 'deny' | 'pause';
+  exit: number;
+  excerpt: string;
+}
+
+export interface ReviewPacket {
+  id: string;
+  task_id: string;
+  run_id: string;
+  summary: string;
+  diffs: ReviewDiff[];
+  commands: ReviewCommand[];
+  checks: string[];
+  risks: string[];
+  created_at: string;
+}
+
+export interface TaskEvent {
+  task_id: string;
+  ts: number;
+  kind: string;
+  payload: any;
+}
+
 import axios, { AxiosInstance } from 'axios';
 import { Model, Metric, MetricSample, Session, Worker, Settings, McpServer, McpServerInput, WorkspaceEntry } from './store';
 import { InferenceEngineDescriptor } from './types/engines';
@@ -1136,6 +1211,63 @@ export class GhostlinkAPI {
     } catch (error: any) {
       return { response: null, error: error.response?.data?.error || error.message };
     }
+  }
+
+
+  // Projects & Task Agents (v2.3)
+  async listProjects(): Promise<Project[]> {
+    const res = await this.http.get('/api/projects');
+    return res.data;
+  }
+
+  async createProject(data: { name: string; kind?: 'code' | 'work'; root_path: string; allowed_tools?: string[]; default_model?: string }): Promise<Project> {
+    const res = await this.http.post('/api/projects', data);
+    return res.data;
+  }
+
+  async getProject(id: string): Promise<Project> {
+    const res = await this.http.get(`/api/projects/${id}`);
+    return res.data;
+  }
+
+  async updateProject(id: string, data: { name?: string; default_model?: string; allowed_tools?: string[] }): Promise<Project> {
+    const res = await this.http.patch(`/api/projects/${id}`, data);
+    return res.data;
+  }
+
+  async listProjectTasks(projectId: string): Promise<Task[]> {
+    const res = await this.http.get(`/api/projects/${projectId}/tasks`);
+    return res.data;
+  }
+
+  async createTask(projectId: string, data: { goal: string; acceptance_criteria?: string; budget?: Partial<TaskBudget>; model?: string }): Promise<Task> {
+    const res = await this.http.post(`/api/projects/${projectId}/tasks`, data);
+    return res.data;
+  }
+
+  async getTask(id: string): Promise<Task> {
+    const res = await this.http.get(`/api/tasks/${id}`);
+    return res.data;
+  }
+
+  async spawnTask(id: string, data?: { role?: string; model?: string; brief?: string }): Promise<AgentRun> {
+    const res = await this.http.post(`/api/tasks/${id}/spawn`, data || {});
+    return res.data;
+  }
+
+  async cancelTask(id: string): Promise<Task> {
+    const res = await this.http.post(`/api/tasks/${id}/cancel`);
+    return res.data;
+  }
+
+  async getTaskReview(taskId: string): Promise<ReviewPacket> {
+    const res = await this.http.get(`/api/tasks/${taskId}/review`);
+    return res.data;
+  }
+
+  async decideReview(reviewId: string, data: { decision: 'accept' | 'request_changes' | 'reject'; note?: string }): Promise<{ status: string; task_id: string }> {
+    const res = await this.http.post(`/api/reviews/${reviewId}/decide`, data);
+    return res.data;
   }
 
 }
