@@ -175,7 +175,7 @@ if ($InferenceBackend -eq "native" -and -not $SkipLlamaBuild) {
     if (Get-Command "cl.exe" -ErrorAction SilentlyContinue) {
         $hasVctools = $true
     } elseif ($vsWhereCandidates) {
-        & $vsWhereCandidates[0] -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath *> $null
+        & ($vsWhereCandidates[0]) -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath *> $null
         $hasVctools = $LASTEXITCODE -eq 0
     }
     if (-not $hasVctools) {
