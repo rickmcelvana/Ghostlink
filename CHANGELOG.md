@@ -6,6 +6,14 @@ All notable changes to Ghostlink Studio are documented here.
 
 ## [Unreleased]
 
+- **Cross-Platform Launcher Bootstrap and Readiness Fixes** (`launch.bat`, `launch-native.ps1`, `launch.sh`):
+  Added PowerShell Core compatibility, native Windows toolchain preflight checks, UTF-8 runtime GUI configuration, strict readiness status handling, and corrected the Linux success-screen URL.
+
+## [2.2.2] - 2026-09-26
+
+- **Full First-Run Stack Launchers and Release Pipeline Automation** (`launch.bat`, `launch-native.ps1`, `launch.sh`, `.github/workflows/tag-release-on-main.yml`):
+  Added native Windows and Unix launcher support, dependency preflight checks, lazy backend builds, default model bootstrap, gateway configuration, and manifest/changelog validation for release tagging.
+
 - **Secure-by-Default RPC Fabric & IPv6 CIDR Support (PR 3)** (`crates/ghost-link/src/rpc_cluster.rs`, `docs/SECURITY_MODEL.md`):
   Enforced fail-closed security validation (`validate_non_loopback_rpc_security`) for non-loopback RPC listener binds, requiring both `rpc_shared_secret` and `rpc_allowed_peers` to be set when binding outside loopback. Added full IPv6 exact address and IPv6 CIDR range matching to `ip_allowed`. Documented HMAC challenge-response peer admission vs wire-level tensor payload encryption limits in `docs/SECURITY_MODEL.md`.
 
