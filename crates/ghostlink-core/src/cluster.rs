@@ -490,6 +490,30 @@ impl ClusterState {
         });
     }
 
+    /// Check heartbeat timeouts across all nodes and mark timed-out nodes as failed in a single pass.
+    ///
+    /// OPTIMIZATION: Acquires cluster metrics lock once to inspect heartbeat timeouts and
+    /// update node status in-place. Eliminates repeated Mutex acquisitions (1 + 2N lock ops),
+    /// String heap allocations, and HashMap key lookups during periodic health checks.
+    pub fn mark_timed_out_nodes_failed(&self) -> usize {
+        let now = Instant::now();
+        let mut failed_count = 0;
+        let mut metrics = self
+            .metrics
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        for m in metrics.values_mut() {
+            if m.status != NodeStatus::Failed
+                && now.saturating_duration_since(m.last_heartbeat) >= m.heartbeat_timeout
+            {
+                m.status = NodeStatus::Failed;
+                failed_count += 1;
+            }
+        }
+        failed_count
+    }
+
     /// Recover a failed node
     pub fn recover_node(&self, node_id: &str) {
         self.get_metrics_mut(node_id, |metrics| {
@@ -552,18 +576,7 @@ impl ClusterHealthMonitor {
 
     /// Run health check on all nodes
     pub fn check_health(&self) {
-        let failed_nodes: Vec<String> = self
-            .cluster
-            .nodes_snapshot()
-            .iter()
-            .filter(|n| self.cluster.check_heartbeat_timeout(&n.id))
-            .map(|n| n.id.clone())
-            .collect();
-
-        // Mark timed-out nodes as failed
-        for node_id in &failed_nodes {
-            self.cluster.mark_failed(node_id);
-        }
+        self.cluster.mark_timed_out_nodes_failed();
 
         // Update last update timestamp
         self.cluster.last_update.store(

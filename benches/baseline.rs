@@ -372,6 +372,13 @@ fn main() {
     bench("health: detect_failures (10 nodes)", 200_000, || {
         let _ = fault_detector.detect_failures();
     });
+    let cluster_health_monitor = ghostlink_core::cluster::ClusterHealthMonitor::new(
+        Arc::clone(&health_cluster),
+        std::time::Duration::from_secs(10),
+    );
+    bench("cluster: check_health (10 nodes)", 200_000, || {
+        cluster_health_monitor.check_health();
+    });
     bench("cluster: nodes() snapshot (10 nodes)", 200_000, || {
         let _ = cluster2.nodes();
     });
