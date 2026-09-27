@@ -36,10 +36,10 @@ jobs:
           gui_version="$(node -p "require('./ghostlink_gui_modern/package.json').version")"
           js_sdk_version="$(node -p "require('./sdks/js/package.json').version")"
           py_sdk_version="$(python3 -c '
-import tomllib
-with open("sdks/python/pyproject.toml", "rb") as f:
-    print(tomllib.load(f)["project"]["version"])
-')"
+          import tomllib
+          with open("sdks/python/pyproject.toml", "rb") as f:
+              print(tomllib.load(f)["project"]["version"])
+          ')"
 
           echo "Detected ghost-link version: ${version}"
           echo "core_version: ${core_version}"
