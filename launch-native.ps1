@@ -521,8 +521,11 @@ try {
     }
     if ($needNpmInstall) {
         Write-Warn "Installing npm packages..."
-        npm install --legacy-peer-deps *>> (Join-Path $LogDir "ghostlink_frontend_install.log")
-        if ($LASTEXITCODE -ne 0) { Write-Err "npm install failed - see logs\ghostlink_frontend_install.log"; exit 1 }
+        $npmInstallLog = Join-Path $LogDir "ghostlink_frontend_install.log"
+        $npmInstallCommand = 'npm install --legacy-peer-deps >> "' + $npmInstallLog + '" 2>&1'
+        cmd.exe /d /c $npmInstallCommand
+        $npmInstallExitCode = $LASTEXITCODE
+        if ($npmInstallExitCode -ne 0) { Write-Err "npm install failed - see logs\ghostlink_frontend_install.log"; exit 1 }
     }
     $guiLog = Join-Path $LogDir "ghostlink_frontend.log"
     $guiProc = Start-Process -FilePath "cmd.exe" `
