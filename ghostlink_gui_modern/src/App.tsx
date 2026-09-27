@@ -23,7 +23,7 @@ const LOADING_STEPS = [
   'Establishing real-time metrics...',
 ];
 
-function SplashScreen() {
+export function SplashScreen() {
   const [step, setStep] = useState(0);
   const [dots, setDots] = useState('');
 
@@ -55,12 +55,12 @@ function SplashScreen() {
         <p className="text-sm text-slate-500 mb-8">Distributed LLM Inference Fabric</p>
 
         {/* Loading animation */}
-        <div className="relative mb-8 flex justify-center">
-          <div className="w-12 h-12 border-[3px] border-slate-800 border-t-blue-500 rounded-full animate-spin" />
+        <div className="relative mb-8 flex justify-center" aria-label="Loading Ghostlink Studio">
+          <div className="w-12 h-12 border-[3px] border-slate-800 border-t-blue-500 rounded-full animate-spin" aria-hidden="true" />
         </div>
 
         {/* Connection status */}
-        <div className="space-y-3">
+        <div className="space-y-3" role="status" aria-live="polite">
           {LOADING_STEPS.map((s, i) => (
             <div key={i} className="flex items-center gap-3 text-sm">
               <div
@@ -71,6 +71,7 @@ function SplashScreen() {
                     ? 'border-blue-500 text-blue-400'
                     : 'border-slate-700 text-slate-600'
                 }`}
+                aria-hidden="true"
               >
                 {i < step ? (
                   <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
@@ -87,7 +88,7 @@ function SplashScreen() {
               >
                 {s}
                 {i === step && (
-                  <span className="inline-block w-4 text-left text-blue-400">{dots}</span>
+                  <span className="inline-block w-4 text-left text-blue-400" aria-hidden="true">{dots}</span>
                 )}
               </span>
             </div>
@@ -96,9 +97,9 @@ function SplashScreen() {
 
         {/* Footer */}
         <div className="mt-10 flex items-center justify-center gap-4 text-xs text-slate-600">
-          <span className="flex items-center gap-1"><Cpu size={12} /> GPU</span>
-          <span className="flex items-center gap-1"><Zap size={12} /> NPU</span>
-          <span className="flex items-center gap-1"><Wifi size={12} /> Cluster</span>
+          <span className="flex items-center gap-1"><Cpu size={12} aria-hidden="true" /> GPU</span>
+          <span className="flex items-center gap-1"><Zap size={12} aria-hidden="true" /> NPU</span>
+          <span className="flex items-center gap-1"><Wifi size={12} aria-hidden="true" /> Cluster</span>
         </div>
       </div>
     </div>
