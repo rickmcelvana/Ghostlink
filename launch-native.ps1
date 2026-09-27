@@ -171,11 +171,12 @@ if ($InferenceBackend -eq "native" -and -not $SkipLlamaBuild) {
         (Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"),
         (Join-Path $env:ProgramFiles "Microsoft Visual Studio\Installer\vswhere.exe")
     ) | Where-Object { $_ -and (Test-Path $_) }
+    $vsWherePath = $vsWhereCandidates | Select-Object -First 1
     $hasVctools = $false
     if (Get-Command "cl.exe" -ErrorAction SilentlyContinue) {
         $hasVctools = $true
-    } elseif ($vsWhereCandidates) {
-        & ($vsWhereCandidates[0]) -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath *> $null
+    } elseif ($vsWherePath) {
+        & $vsWherePath -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath *> $null
         $hasVctools = $LASTEXITCODE -eq 0
     }
     if (-not $hasVctools) {
