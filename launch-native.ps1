@@ -287,16 +287,18 @@ if ($InferenceBackend -eq "ollama") {
         try {
             $cmakeLog = Join-Path $LogDir "llama_cmake_configure.log"
             $buildLog = Join-Path $LogDir "llama_cmake_build.log"
-            cmake -S . -B build -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release 2>&1 |
-                Tee-Object -FilePath $cmakeLog
-            if ($LASTEXITCODE -ne 0) {
+            $configureCommand = 'cmake -S . -B build -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release >> "' + $cmakeLog + '" 2>&1'
+            cmd.exe /d /c $configureCommand
+            $configureExitCode = $LASTEXITCODE
+            if ($configureExitCode -ne 0) {
                 Write-Err "cmake configure failed - see $cmakeLog"
                 Get-Content $cmakeLog -Tail 30 -ErrorAction SilentlyContinue
                 exit 1
             }
-            cmake --build build --config Release --target llama-server -j 2>&1 |
-                Tee-Object -FilePath $buildLog
-            if ($LASTEXITCODE -ne 0) {
+            $buildCommand = 'cmake --build build --config Release --target llama-server -j >> "' + $buildLog + '" 2>&1'
+            cmd.exe /d /c $buildCommand
+            $buildExitCode = $LASTEXITCODE
+            if ($buildExitCode -ne 0) {
                 Write-Err "llama-server build failed - see $buildLog"
                 Get-Content $buildLog -Tail 30 -ErrorAction SilentlyContinue
                 exit 1
