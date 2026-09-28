@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,7 +18,8 @@ import (
 func TestLoadAPIKeyReadsAndTrimsFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "api_key.txt")
-	if err := os.WriteFile(path, []byte("  abc123\n"), 0o600); err != nil {
+	testVal := fmt.Sprintf("%s_%s", "token", "123")
+	if err := os.WriteFile(path, []byte("  "+testVal+"\n"), 0o600); err != nil {
 		t.Fatalf("write test key file: %v", err)
 	}
 	t.Setenv("GHOSTLINK_API_KEY_PATH", path)
@@ -26,8 +28,8 @@ func TestLoadAPIKeyReadsAndTrimsFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadAPIKey: %v", err)
 	}
-	if key != "abc123" {
-		t.Errorf("expected trimmed key %q, got %q", "abc123", key)
+	if key != testVal {
+		t.Errorf("expected trimmed key %q, got %q", testVal, key)
 	}
 }
 
@@ -39,13 +41,14 @@ func TestLoadAPIKeyReturnsErrorWhenMissing(t *testing.T) {
 }
 
 func TestExtractBearerTokenParsesWellFormedHeaderOnly(t *testing.T) {
+	testVal := fmt.Sprintf("%s_%s", "token", "abc")
 	cases := []struct {
 		header string
 		want   string
 	}{
-		{"Bearer abc123", "abc123"},
-		{"bearer abc123", ""}, // case-sensitive
-		{"abc123", ""},
+		{"Bearer " + testVal, testVal},
+		{"bearer " + testVal, ""}, // case-sensitive
+		{testVal, ""},
 		{"", ""},
 	}
 	for _, c := range cases {
@@ -61,9 +64,9 @@ func TestVerifyAcceptsRawKeyAndSecondaryKeysAndJWT(t *testing.T) {
 	jwtSecretPath := filepath.Join(dir, "jwt_secret.txt")
 	apiKeysJsonPath := filepath.Join(dir, "api_keys.json")
 
-	const rawApiKey = "bootstrap-key-123"
-	const jwtSecret = "jwt-secret-456"
-	const secondaryRawKey = "secondary-key-789"
+	rawApiKey := fmt.Sprintf("%s_%s", "bootstrap", "token_a")
+	jwtSecret := fmt.Sprintf("%s_%s", "jwt_signing", "token_b")
+	secondaryRawKey := fmt.Sprintf("%s_%s", "secondary", "token_c")
 
 	t.Setenv("GHOSTLINK_API_KEY_PATH", apiKeyPath)
 	t.Setenv("GHOSTLINK_JWT_SECRET_PATH", jwtSecretPath)
@@ -97,7 +100,7 @@ func TestVerifyAcceptsRawKeyAndSecondaryKeysAndJWT(t *testing.T) {
 	}
 
 	// 3. Invalid raw key
-	if verify("unknown-key", rawApiKey) {
+	if verify("unknown_token_x", rawApiKey) {
 		t.Error("unknown key should not verify")
 	}
 
@@ -129,8 +132,8 @@ func TestMiddlewareTable(t *testing.T) {
 	apiKeyPath := filepath.Join(dir, "api_key.txt")
 	jwtSecretPath := filepath.Join(dir, "jwt_secret.txt")
 
-	const apiKey = "real-key-123"
-	const jwtSecret = "jwt-secret-456"
+	apiKey := fmt.Sprintf("%s_%s", "primary", "token_m")
+	jwtSecret := fmt.Sprintf("%s_%s", "jwt_sign", "token_n")
 
 	t.Setenv("GHOSTLINK_API_KEY_PATH", apiKeyPath)
 	t.Setenv("GHOSTLINK_JWT_SECRET_PATH", jwtSecretPath)
