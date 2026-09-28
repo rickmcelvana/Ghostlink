@@ -309,6 +309,29 @@ pub fn extract_bearer_token(header_value: Option<&str>) -> Option<&str> {
     header_value?.strip_prefix("Bearer ").map(str::trim)
 }
 
+/// URL-decodes percent-encoded characters (e.g., %20 -> space, + -> space).
+pub fn percent_decode(input: &str) -> String {
+    let mut bytes = Vec::with_capacity(input.len());
+    let mut chars = input.bytes();
+    while let Some(b) = chars.next() {
+        if b == b'%' {
+            let h1 = chars.next();
+            let h2 = chars.next();
+            if let (Some(h1), Some(h2)) = (h1, h2) {
+                if let Ok(val) = u8::from_str_radix(&format!("{}{}", h1 as char, h2 as char), 16) {
+                    bytes.push(val);
+                    continue;
+                }
+            }
+        } else if b == b'+' {
+            bytes.push(b' ');
+            continue;
+        }
+        bytes.push(b);
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,6 +373,13 @@ mod tests {
 
         std::env::remove_var("GHOSTLINK_API_KEY_PATH");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn percent_decode_decodes_url_encoded_strings() {
+        assert_eq!(percent_decode("hello%20world"), "hello world");
+        assert_eq!(percent_decode("key%2B123"), "key+123");
+        assert_eq!(percent_decode("plain_key"), "plain_key");
     }
 
     #[test]

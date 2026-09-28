@@ -1,9 +1,9 @@
-import { resolveApiBase } from '../config';
-import React, { useState, useEffect } from 'react';
-import { Play, Square, Shield, Clock, Layers } from 'lucide-react';
-import { Task, ReviewPacket, TaskEvent, GhostlinkAPI } from '../api';
-import { useAppStore } from '../store';
-import { ReviewPane } from './ReviewPane';
+import { resolveApiBase } from "../config";
+import React, { useState, useEffect } from "react";
+import { Play, Square, Shield, Clock, Layers, KeyRound } from "lucide-react";
+import { Task, ReviewPacket, TaskEvent, GhostlinkAPI } from "../api";
+import { useAppStore } from "../store";
+import { ReviewPane } from "./ReviewPane";
 
 interface TaskViewProps {
   task: Task;
@@ -16,16 +16,18 @@ export const TaskView: React.FC<TaskViewProps> = ({ task, api: propApi, onRefres
 
   const [review, setReview] = useState<ReviewPacket | null>(null);
   const [spawning, setSpawning] = useState<boolean>(false);
-  const [brief, setBrief] = useState<string>('');
+  const [brief, setBrief] = useState<string>("");
 
   const taskEvents = useAppStore((state) => state.taskEvents);
   const addTaskEvent = useAppStore((state) => state.addTaskEvent);
   const addToast = useAppStore((state) => state.addToast);
 
+  const apiKey = api.getApiKey?.() || "";
+
   // Fetch review packet if task is in needs_review or blocked or accepted/rejected
   useEffect(() => {
     let active = true;
-    if (['needs_review', 'accepted', 'rejected', 'blocked'].includes(task.status)) {
+    if (["needs_review", "accepted", "rejected", "blocked"].includes(task.status)) {
       api
         .getTaskReview(task.id)
         .then((rev) => {
@@ -44,16 +46,15 @@ export const TaskView: React.FC<TaskViewProps> = ({ task, api: propApi, onRefres
 
   // Connect to SSE event stream
   useEffect(() => {
-    const token = localStorage.getItem("ghostlink_api_key") || "";
-    const sseUrl = token
-      ? `/api/tasks/${task.id}/events?access_token=${encodeURIComponent(token)}`
-      : `/api/tasks/${task.id}/events`;
+    if (!apiKey) return;
+
+    const sseUrl = `/api/tasks/${task.id}/events?access_token=${encodeURIComponent(apiKey)}`;
     const es = new EventSource(sseUrl);
     es.onmessage = (e) => {
       try {
         const ev: TaskEvent = JSON.parse(e.data);
         addTaskEvent(ev);
-        if (['needs_review', 'accepted', 'rejected', 'cancelled', 'blocked'].includes(ev.kind) && onRefresh) {
+        if (["needs_review", "accepted", "rejected", "cancelled", "blocked"].includes(ev.kind) && onRefresh) {
           onRefresh();
         }
       } catch {
@@ -63,7 +64,7 @@ export const TaskView: React.FC<TaskViewProps> = ({ task, api: propApi, onRefres
     return () => {
       es.close();
     };
-  }, [task.id, addTaskEvent, onRefresh]);
+  }, [task.id, apiKey, addTaskEvent, onRefresh]);
 
   const handleSpawn = async () => {
     setSpawning(true);
@@ -71,13 +72,13 @@ export const TaskView: React.FC<TaskViewProps> = ({ task, api: propApi, onRefres
       await api.spawnTask(task.id, { brief: brief.trim() || undefined });
       addToast({
         message: `Implementer run started for task #${task.id.slice(0, 8)}`,
-        type: 'info',
+        type: "info",
       });
       if (onRefresh) onRefresh();
     } catch (err: any) {
       addToast({
-        message: err.response?.data?.error || err.message || 'Failed to spawn task',
-        type: 'error',
+        message: err.response?.data?.error || err.message || "Failed to spawn task",
+        type: "error",
       });
     } finally {
       setSpawning(false);
@@ -89,13 +90,13 @@ export const TaskView: React.FC<TaskViewProps> = ({ task, api: propApi, onRefres
       await api.cancelTask(task.id);
       addToast({
         message: `Task #${task.id.slice(0, 8)} was cancelled.`,
-        type: 'info',
+        type: "info",
       });
       if (onRefresh) onRefresh();
     } catch (err: any) {
       addToast({
-        message: err.response?.data?.error || err.message || 'Failed to cancel task',
-        type: 'error',
+        message: err.response?.data?.error || err.message || "Failed to cancel task",
+        type: "error",
       });
     }
   };
@@ -104,21 +105,28 @@ export const TaskView: React.FC<TaskViewProps> = ({ task, api: propApi, onRefres
 
   return (
     <div className="flex flex-col h-full bg-slate-950 p-6 space-y-6 overflow-y-auto">
+      {!apiKey && (
+        <div className="bg-amber-500/10 border border-amber-500/20 rounded-xl p-4 flex items-center gap-3 text-xs text-amber-400">
+          <KeyRound size={16} className="shrink-0" aria-hidden="true" />
+          <span>API key required to stream live task events. Paste your API key in the Security tab.</span>
+        </div>
+      )}
+
       {/* Header & Meta */}
       <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 flex flex-wrap items-center justify-between gap-4">
         <div>
           <div className="flex items-center gap-3">
             <span
               className={`px-2.5 py-1 rounded-full text-xs font-bold uppercase tracking-wider ${
-                task.status === 'needs_review'
-                  ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
-                  : task.status === 'running'
-                  ? 'bg-indigo-500/20 text-indigo-400 border border-indigo-500/30 animate-pulse'
-                  : task.status === 'accepted'
-                  ? 'bg-green-500/20 text-green-400 border border-green-500/30'
-                  : task.status === 'rejected'
-                  ? 'bg-rose-500/20 text-rose-400 border border-rose-500/30'
-                  : 'bg-slate-800 text-slate-400 border border-slate-700'
+                task.status === "needs_review"
+                  ? "bg-amber-500/20 text-amber-400 border border-amber-500/30"
+                  : task.status === "running"
+                  ? "bg-indigo-500/20 text-indigo-400 border border-indigo-500/30 animate-pulse"
+                  : task.status === "accepted"
+                  ? "bg-green-500/20 text-green-400 border border-green-500/30"
+                  : task.status === "rejected"
+                  ? "bg-rose-500/20 text-rose-400 border border-rose-500/30"
+                  : "bg-slate-800 text-slate-400 border border-slate-700"
               }`}
             >
               {task.status}
@@ -142,7 +150,7 @@ export const TaskView: React.FC<TaskViewProps> = ({ task, api: propApi, onRefres
 
         {/* Action Controls */}
         <div className="flex items-center gap-3">
-          {task.status !== 'running' && task.status !== 'needs_review' && (
+          {task.status !== "running" && task.status !== "needs_review" && (
             <div className="flex items-center gap-2">
               <input
                 type="text"
@@ -162,7 +170,7 @@ export const TaskView: React.FC<TaskViewProps> = ({ task, api: propApi, onRefres
               </button>
             </div>
           )}
-          {task.status === 'running' && (
+          {task.status === "running" && (
             <button
               onClick={handleCancel}
               aria-label="Cancel Task"
@@ -178,16 +186,14 @@ export const TaskView: React.FC<TaskViewProps> = ({ task, api: propApi, onRefres
       {/* Embedded ReviewPane when needs_review or review exists */}
       {review && (
         <div className="h-[600px]">
+          {task.parent_id && (
+            <div className="mt-3 flex items-center gap-2 text-xs text-slate-400 bg-slate-900/50 p-2 rounded border border-slate-800">
+              <Layers className="w-3.5 h-3.5 text-indigo-400" />
+              <span>Child task of parent: <code className="text-indigo-300">{task.parent_id}</code></span>
+            </div>
+          )}
 
-      {/* Phase B: Child Tasks & Fan-out status chips */}
-      {task.parent_id && (
-        <div className="mt-3 flex items-center gap-2 text-xs text-slate-400 bg-slate-900/50 p-2 rounded border border-slate-800">
-          <Layers className="w-3.5 h-3.5 text-indigo-400" />
-          <span>Child task of parent: <code className="text-indigo-300">{task.parent_id}</code></span>
-        </div>
-      )}
-
-      <ReviewPane packet={review} api={api} onDecided={onRefresh} />
+          <ReviewPane packet={review} api={api} onDecided={onRefresh} />
         </div>
       )}
 

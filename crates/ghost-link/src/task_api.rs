@@ -681,7 +681,9 @@ async fn handle_get_task_events(
             if event.task_id == id {
                 if let Ok(json) = serde_json::to_string(&event) {
                     return Some(Ok::<_, std::convert::Infallible>(
-                        Event::default().data(json),
+                        Event::default()
+                            .id(format!("{}_{}", event.task_id, event.ts))
+                            .data(json),
                     ));
                 }
             }

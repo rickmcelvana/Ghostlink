@@ -6,6 +6,9 @@ All notable changes to Ghostlink Studio are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- **Gateway & Studio EventSource Auth Alignment**: Studio EventSource and control-plane now share jwt_secret.txt and accept ?access_token= on task SSE only.
+
 ### Added
 - **Real Task Agent Tool Loop & v2.4 Child Fan-Out**: Replaced stub canned implementer loop with bounded tool loop using in-process `AgentBackend` trait, `Judge` policy enforcement, proposed file staging in `.ghostlink/tasks/<id>/proposed/`, real command execution, child task fan-out APIs (`/api/tasks/:id/children`), budget inheritance, and UI child task representation. (`crates/ghost-link/src/task_runtime.rs`, `crates/ghost-link/src/task_api.rs`, `ghostlink_gui_modern/src/components/TaskView.tsx`, `ghostlink_gui_modern/src/components/ProjectsTab.tsx`)
 
