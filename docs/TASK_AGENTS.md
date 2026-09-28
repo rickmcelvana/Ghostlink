@@ -53,7 +53,7 @@ Before running shell commands or file mutations, the runtime passes the request 
 
 ### Implemented in v2.4 Task Agents & Fan-out:
 - **Task Runtime Engine (`crates/ghost-link/src/task_runtime.rs`)**: Store atomic JSON persistence under `GHOSTLINK_DATA_DIR`, canonical path isolation in `.ghostlink/tasks/<task_id>/proposed/`, `Judge` policy evaluation, `TaskRunner` implementer loop with budget constraints, and SSE broadcast channels.
-- **Task API Server Handlers (`crates/ghost-link/src/task_api.rs`)**: Axum routes for `/api/projects`, `/api/tasks`, `/api/reviews`, and EventSource SSE event streaming with RBAC (`Viewer` read-only vs `Operator` mutation) and `?access_token=` authentication.
+- **Task API Server Handlers (`crates/ghost-link/src/task_api.rs`)**: Axum routes for `/api/projects`, `/api/tasks`, `/api/reviews`, and EventSource SSE event streaming with RBAC (`Viewer` read-only vs `Operator` mutation) and `?access_token=` authentication. Studio EventSource and control-plane now share jwt_secret.txt and accept ?access_token= on task SSE only.
 
 ### Implemented v2.4 Capabilities:
 - **Bounded Agent Tool Loop**: Real bounded tool-calling loop using in-process `AgentBackend` and OpenAI-compatible inference with deterministic `Judge` policy evaluation, staged file mutations in `.ghostlink/tasks/<id>/proposed/`, real shell tool execution, and budget controls (`max_steps`, `max_tokens`, `max_minutes`).

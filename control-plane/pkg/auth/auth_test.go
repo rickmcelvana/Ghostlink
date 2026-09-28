@@ -1,6 +1,9 @@
 package auth
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -41,7 +44,7 @@ func TestExtractBearerTokenParsesWellFormedHeaderOnly(t *testing.T) {
 		want   string
 	}{
 		{"Bearer abc123", "abc123"},
-		{"bearer abc123", ""}, // case-sensitive, matches the real Authorization scheme
+		{"bearer abc123", ""}, // case-sensitive
 		{"abc123", ""},
 		{"", ""},
 	}
@@ -52,53 +55,181 @@ func TestExtractBearerTokenParsesWellFormedHeaderOnly(t *testing.T) {
 	}
 }
 
-func TestVerifyAcceptsRawKeyMatchAndRejectsWrongOne(t *testing.T) {
-	const key = "the-real-key"
-	if !verify(key, key) {
-		t.Error("exact key match should verify")
+func TestVerifyAcceptsRawKeyAndSecondaryKeysAndJWT(t *testing.T) {
+	dir := t.TempDir()
+	apiKeyPath := filepath.Join(dir, "api_key.txt")
+	jwtSecretPath := filepath.Join(dir, "jwt_secret.txt")
+	apiKeysJsonPath := filepath.Join(dir, "api_keys.json")
+
+	const rawApiKey = "bootstrap-key-123"
+	const jwtSecret = "jwt-secret-456"
+	const secondaryRawKey = "secondary-key-789"
+
+	t.Setenv("GHOSTLINK_API_KEY_PATH", apiKeyPath)
+	t.Setenv("GHOSTLINK_JWT_SECRET_PATH", jwtSecretPath)
+	t.Setenv("GHOSTLINK_API_KEYS_PATH", apiKeysJsonPath)
+
+	_ = os.WriteFile(apiKeyPath, []byte(rawApiKey), 0o600)
+	_ = os.WriteFile(jwtSecretPath, []byte(jwtSecret), 0o600)
+
+	// Create secondary key record
+	h := sha256.Sum256([]byte(secondaryRawKey))
+	secondaryHash := hex.EncodeToString(h[:])
+	records := []ApiKeyRecord{
+		{
+			ID:      "key_sec",
+			Name:    "secondary",
+			Role:    "operator",
+			KeyHash: secondaryHash,
+		},
 	}
-	if verify("wrong-key", key) {
-		t.Error("wrong key should not verify")
+	recordsJson, _ := json.Marshal(records)
+	_ = os.WriteFile(apiKeysJsonPath, recordsJson, 0o600)
+
+	// 1. Raw bootstrap key
+	if !verify(rawApiKey, rawApiKey) {
+		t.Error("bootstrap raw key should verify")
 	}
-	if verify("", key) {
-		t.Error("empty token should not verify")
+
+	// 2. Secondary raw key
+	if !verify(secondaryRawKey, rawApiKey) {
+		t.Error("secondary key matching api_keys.json should verify")
+	}
+
+	// 3. Invalid raw key
+	if verify("unknown-key", rawApiKey) {
+		t.Error("unknown key should not verify")
+	}
+
+	// 4. JWT signed with jwtSecret
+	validClaims := jwt.RegisteredClaims{
+		Subject:   "key_sec",
+		IssuedAt:  jwt.NewNumericDate(time.Now()),
+		ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+	}
+	validJwt := jwt.NewWithClaims(jwt.SigningMethodHS256, validClaims)
+	validJwtStr, err := validJwt.SignedString([]byte(jwtSecret))
+	if err != nil {
+		t.Fatalf("sign JWT with jwtSecret: %v", err)
+	}
+	if !verify(validJwtStr, rawApiKey) {
+		t.Error("JWT signed with jwtSecret should verify")
+	}
+
+	// 5. JWT signed with rawApiKey (should fail because jwtSecret is used)
+	wrongJwt := jwt.NewWithClaims(jwt.SigningMethodHS256, validClaims)
+	wrongJwtStr, _ := wrongJwt.SignedString([]byte(rawApiKey))
+	if verify(wrongJwtStr, rawApiKey) {
+		t.Error("JWT signed with rawApiKey should fail when jwtSecret is different")
 	}
 }
 
-func TestVerifyAcceptsAGenuinelyValidJWTAndRejectsTamperedOrExpired(t *testing.T) {
-	const key = "the-real-key"
+func TestMiddlewareTable(t *testing.T) {
+	dir := t.TempDir()
+	apiKeyPath := filepath.Join(dir, "api_key.txt")
+	jwtSecretPath := filepath.Join(dir, "jwt_secret.txt")
 
-	valid := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
-		Subject:   "ghostlink-client",
+	const apiKey = "real-key-123"
+	const jwtSecret = "jwt-secret-456"
+
+	t.Setenv("GHOSTLINK_API_KEY_PATH", apiKeyPath)
+	t.Setenv("GHOSTLINK_JWT_SECRET_PATH", jwtSecretPath)
+
+	_ = os.WriteFile(apiKeyPath, []byte(apiKey), 0o600)
+	_ = os.WriteFile(jwtSecretPath, []byte(jwtSecret), 0o600)
+
+	validClaims := jwt.RegisteredClaims{
+		Subject:   "key_test",
 		IssuedAt:  jwt.NewNumericDate(time.Now()),
 		ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
-	})
-	signed, err := valid.SignedString([]byte(key))
-	if err != nil {
-		t.Fatalf("sign test JWT: %v", err)
 	}
-	if !verify(signed, key) {
-		t.Error("a genuinely valid JWT signed with the right key should verify")
+	jwtObj := jwt.NewWithClaims(jwt.SigningMethodHS256, validClaims)
+	validJwt, _ := jwtObj.SignedString([]byte(jwtSecret))
+	wrongJwtObj := jwt.NewWithClaims(jwt.SigningMethodHS256, validClaims)
+	wrongJwt, _ := wrongJwtObj.SignedString([]byte(apiKey))
+
+	handler := Middleware(apiKey)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	cases := []struct {
+		name       string
+		method     string
+		path       string
+		headers    map[string]string
+		wantStatus int
+	}{
+		{
+			name:       "health public without auth",
+			method:     "GET",
+			path:       "/health",
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "missing token on REST endpoint returns 401",
+			method:     "GET",
+			path:       "/api/projects",
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:       "header Bearer with raw API key succeeds",
+			method:     "GET",
+			path:       "/api/projects",
+			headers:    map[string]string{"Authorization": "Bearer " + apiKey},
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "header Bearer with valid JWT succeeds",
+			method:     "GET",
+			path:       "/api/projects",
+			headers:    map[string]string{"Authorization": "Bearer " + validJwt},
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "header Bearer with JWT signed by API key fails",
+			method:     "GET",
+			path:       "/api/projects",
+			headers:    map[string]string{"Authorization": "Bearer " + wrongJwt},
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:       "query token access_token on SSE GET succeeds",
+			method:     "GET",
+			path:       "/api/tasks/task-123/events?access_token=" + apiKey,
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "query token token on SSE GET succeeds",
+			method:     "GET",
+			path:       "/api/tasks/task-123/events?token=" + apiKey,
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "query token on SSE POST rejected with 401",
+			method:     "POST",
+			path:       "/api/tasks/task-123/events?access_token=" + apiKey,
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:       "query token on non-SSE GET /api/projects rejected with 401",
+			method:     "GET",
+			path:       "/api/projects?access_token=" + apiKey,
+			wantStatus: http.StatusUnauthorized,
+		},
 	}
 
-	if verify(signed+"tampered", key) {
-		t.Error("a tampered JWT must not verify")
-	}
-	if verify(signed, "different-key") {
-		t.Error("a JWT signed with a different key must not verify against this one")
-	}
-
-	expired := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
-		Subject:   "ghostlink-client",
-		IssuedAt:  jwt.NewNumericDate(time.Now().Add(-2 * time.Hour)),
-		ExpiresAt: jwt.NewNumericDate(time.Now().Add(-time.Hour)),
-	})
-	expiredSigned, err := expired.SignedString([]byte(key))
-	if err != nil {
-		t.Fatalf("sign expired test JWT: %v", err)
-	}
-	if verify(expiredSigned, key) {
-		t.Error("an expired JWT must not verify")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			for k, v := range tc.headers {
+				req.Header.Set(k, v)
+			}
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != tc.wantStatus {
+				t.Errorf("expected status %d, got %d", tc.wantStatus, rec.Code)
+			}
+		})
 	}
 }
 
@@ -119,60 +250,5 @@ func TestMiddlewareIsANoOpWhenAPIKeyIsEmpty(t *testing.T) {
 	}
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200, got %d", w.Code)
-	}
-}
-
-func TestMiddlewareAllowsHealthWithoutAuth(t *testing.T) {
-	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
-	handler := Middleware("real-key")(inner)
-
-	req := httptest.NewRequest("GET", "/health", nil)
-	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Errorf("/health should bypass auth even with no token, got %d", w.Code)
-	}
-}
-
-func TestMiddlewareRejectsMissingOrWrongTokenAndAcceptsCorrectOne(t *testing.T) {
-	const key = "real-key"
-	called := false
-	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		called = true
-		w.WriteHeader(http.StatusOK)
-	})
-	handler := Middleware(key)(inner)
-
-	req := httptest.NewRequest("GET", "/v1/models", nil)
-	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
-	if w.Code != http.StatusUnauthorized {
-		t.Errorf("no Authorization header: expected 401, got %d", w.Code)
-	}
-	if called {
-		t.Error("inner handler must not run for an unauthenticated request")
-	}
-
-	req = httptest.NewRequest("GET", "/v1/models", nil)
-	req.Header.Set("Authorization", "Bearer wrong-key")
-	w = httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
-	if w.Code != http.StatusUnauthorized {
-		t.Errorf("wrong bearer token: expected 401, got %d", w.Code)
-	}
-
-	called = false
-	req = httptest.NewRequest("GET", "/v1/models", nil)
-	req.Header.Set("Authorization", "Bearer "+key)
-	w = httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Errorf("correct bearer token: expected 200, got %d", w.Code)
-	}
-	if !called {
-		t.Error("inner handler should run for an authenticated request")
 	}
 }

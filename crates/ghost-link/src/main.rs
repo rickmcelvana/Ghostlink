@@ -4203,11 +4203,118 @@ fn detect_node_id() -> String {
 mod task_api;
 mod task_runtime;
 
+fn lock_state(
+    state: &Arc<std::sync::Mutex<BackendState>>,
+) -> std::sync::MutexGuard<'_, BackendState> {
+    state.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+async fn auth_middleware(
+    axum::extract::State(state): axum::extract::State<Arc<std::sync::Mutex<BackendState>>>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if req.uri().path() == "/health" {
+        return next.run(req).await;
+    }
+
+    let header_str = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    let mut token = auth::extract_bearer_token(header_str).map(|s| s.to_string());
+    if token.is_none() {
+        let is_sse_get = req.method() == axum::http::Method::GET
+            && req.uri().path().starts_with("/api/tasks/")
+            && req.uri().path().ends_with("/events");
+        if is_sse_get {
+            if let Some(query) = req.uri().query() {
+                for pair in query.split('&') {
+                    let mut parts = pair.split('=');
+                    if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
+                        if k == "access_token" || k == "token" {
+                            token = Some(auth::percent_decode(v));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let ctx = token
+        .as_deref()
+        .and_then(|t| auth::authenticate(t, &lock_state(&state).api_keys));
+
+    let Some(ctx) = ctx else {
+        record_audit_event(
+            &mut lock_state(&state),
+            "auth",
+            "FAILED",
+            addr.ip().to_string(),
+            Some(format!("{} {}", req.method(), req.uri().path())),
+        );
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            axum::Json(serde_json::json!({
+                "error": {
+                    "message": "missing or invalid Authorization: Bearer <token> — see the API key printed at server startup, or POST /api/security/jwt/refresh with it to get a short-lived token",
+                    "type": "unauthorized"
+                }
+            })),
+        )
+            .into_response();
+    };
+
+    let needed = required_role(req.method(), req.uri().path());
+    if !ctx.role.satisfies(needed) {
+        record_audit_event(
+            &mut lock_state(&state),
+            "authz",
+            "DENIED",
+            addr.ip().to_string(),
+            Some(format!(
+                "{} {} — key '{}' has role {:?}, needs {:?}",
+                req.method(),
+                req.uri().path(),
+                ctx.name,
+                ctx.role,
+                needed
+            )),
+        );
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({
+                "error": {
+                    "message": format!(
+                        "key '{}' does not have sufficient permissions for this route",
+                        ctx.name
+                    ),
+                    "type": "forbidden"
+                }
+            })),
+        )
+            .into_response();
+    }
+
+    {
+        let mut backend = lock_state(&state);
+        if let Some(record) = backend.api_keys.iter_mut().find(|k| k.id == ctx.key_id) {
+            record.last_used_at = Some(chrono::Utc::now().to_rfc3339());
+        }
+    }
+
+    req.extensions_mut().insert(ctx);
+    next.run(req).await
+}
+
 fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
     use axum::{
-        extract::{ConnectInfo, Extension, Path, Query, Request, State},
+        extract::{ConnectInfo, Extension, Path, Query, State},
         http::StatusCode,
-        middleware::{self, Next},
+        middleware,
         response::{
             sse::{Event, Sse},
             IntoResponse,
@@ -4224,111 +4331,6 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
     use tower_http::cors::CorsLayer;
     use tower_http::trace::TraceLayer;
     use tracing::Instrument;
-
-    fn lock_state(state: &Arc<Mutex<BackendState>>) -> std::sync::MutexGuard<'_, BackendState> {
-        state.lock().unwrap_or_else(|poison| poison.into_inner())
-    }
-
-    /// Guards every route except `/health` behind a real bearer token —
-    /// resolved to an `AuthContext` (`auth::authenticate`) against the live
-    /// key store, then checked against `required_role`. A key without
-    /// sufficient role gets a 403, not a silent downgrade or a 401 (which
-    /// would misleadingly suggest the credential itself was invalid).
-    /// Successfully-authorized requests carry their `AuthContext` forward
-    /// via request extensions — see `handle_gui_jwt_refresh` for the one
-    /// handler in this pass that reads it.
-    async fn auth_middleware(
-        State(state): State<Arc<Mutex<BackendState>>>,
-        ConnectInfo(addr): ConnectInfo<SocketAddr>,
-        mut req: Request,
-        next: Next,
-    ) -> axum::response::Response {
-        if req.uri().path() == "/health" {
-            return next.run(req).await;
-        }
-
-        let header_str = req
-            .headers()
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok());
-        let mut token = auth::extract_bearer_token(header_str);
-        if token.is_none() {
-            if let Some(query) = req.uri().query() {
-                for pair in query.split('&') {
-                    let mut parts = pair.split('=');
-                    if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
-                        if k == "access_token" || k == "token" {
-                            token = Some(v);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        let ctx = token.and_then(|t| auth::authenticate(t, &lock_state(&state).api_keys));
-
-        let Some(ctx) = ctx else {
-            record_audit_event(
-                &mut lock_state(&state),
-                "auth",
-                "FAILED",
-                addr.ip().to_string(),
-                Some(format!("{} {}", req.method(), req.uri().path())),
-            );
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({
-                    "error": {
-                        "message": "missing or invalid Authorization: Bearer <token> — see the API key printed at server startup, or POST /api/security/jwt/refresh with it to get a short-lived token",
-                        "type": "unauthorized"
-                    }
-                })),
-            )
-                .into_response();
-        };
-
-        let needed = required_role(req.method(), req.uri().path());
-        if !ctx.role.satisfies(needed) {
-            record_audit_event(
-                &mut lock_state(&state),
-                "authz",
-                "DENIED",
-                addr.ip().to_string(),
-                Some(format!(
-                    "{} {} — key '{}' has role {:?}, needs {:?}",
-                    req.method(),
-                    req.uri().path(),
-                    ctx.name,
-                    ctx.role,
-                    needed
-                )),
-            );
-            return (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({
-                    "error": {
-                        "message": format!(
-                            "key '{}' does not have sufficient permissions for this route",
-                            ctx.name
-                        ),
-                        "type": "forbidden"
-                    }
-                })),
-            )
-                .into_response();
-        }
-
-        {
-            let mut backend = lock_state(&state);
-            if let Some(record) = backend.api_keys.iter_mut().find(|k| k.id == ctx.key_id) {
-                record.last_used_at = Some(chrono::Utc::now().to_rfc3339());
-            }
-        }
-
-        req.extensions_mut().insert(ctx);
-        next.run(req).await
-    }
 
     /// Waits for Ctrl+C, then force-tears-down every connected MCP server before
     /// `axum::serve`'s graceful shutdown lets the process exit. Without this, a
@@ -13033,5 +13035,84 @@ mod tests {
         assert_eq!(tool_results.len(), 2);
         assert_eq!(tool_results[0].tool, "tool-10");
         assert_eq!(tool_results[1].tool, "tool-99");
+    }
+
+    #[tokio::test]
+    async fn test_auth_middleware_query_token_rules() {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use axum::routing::{get, post};
+        use axum::Router;
+        use std::net::SocketAddr;
+        use tower::ServiceExt;
+
+        let (record, raw_key) = auth::create_key("test_key".to_string(), auth::Role::Owner);
+        let backend_state = test_backend_state();
+        backend_state.lock().unwrap().api_keys = vec![record];
+        let auth_mw_state = backend_state.clone();
+
+        let app = Router::new()
+            .route(
+                "/api/tasks/:id/events",
+                get(|| async { (StatusCode::OK, "events") }),
+            )
+            .route(
+                "/api/projects",
+                post(|| async { (StatusCode::OK, "project_created") })
+                    .get(|| async { (StatusCode::OK, "projects_list") }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                auth_mw_state,
+                auth_middleware,
+            ));
+
+        let make_req = |method: Method, uri: &str, header: Option<(&str, &str)>| {
+            let mut builder = Request::builder().method(method).uri(uri);
+            if let Some((k, v)) = header {
+                builder = builder.header(k, v);
+            }
+            let mut req = builder.body(Body::empty()).unwrap();
+            req.extensions_mut().insert(ConnectInfo(
+                "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
+            ));
+            req
+        };
+
+        // 1. Query token on SSE GET succeeds
+        let req = make_req(
+            Method::GET,
+            &format!("/api/tasks/task123/events?access_token={}", raw_key),
+            None,
+        );
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // 2. Query token on POST /api/projects fails (401)
+        let req = make_req(
+            Method::POST,
+            &format!("/api/projects?access_token={}", raw_key),
+            None,
+        );
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // 3. Query token on non-SSE GET /api/projects fails (401)
+        let req = make_req(
+            Method::GET,
+            &format!("/api/projects?access_token={}", raw_key),
+            None,
+        );
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // 4. Bearer header on POST /api/projects succeeds
+        let req = make_req(
+            Method::POST,
+            "/api/projects",
+            Some(("Authorization", &format!("Bearer {}", raw_key))),
+        );
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
