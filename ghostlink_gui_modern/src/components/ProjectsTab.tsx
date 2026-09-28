@@ -40,10 +40,10 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({ api: propApi }) => {
       if (list.length > 0 && !activeProject) {
         setActiveProject(list[0]);
       }
-    } catch {
-      /* ignore */
+    } catch (err: any) {
+      addToast({ type: 'error', message: err.message || 'Failed to fetch projects' });
     }
-  }, [api, setProjects, activeProject, setActiveProject]);
+  }, [api, setProjects, activeProject, setActiveProject, addToast]);
 
   const fetchTasks = useCallback(async () => {
     if (!activeProject) return;

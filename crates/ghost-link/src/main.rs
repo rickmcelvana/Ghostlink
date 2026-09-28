@@ -1635,6 +1635,7 @@ struct BackendState {
     /// download, updated live from the background download task and read by
     /// `/api/models/download/progress` for the GUI's polling loop.
     download_progress: HashMap<String, DownloadProgressInfo>,
+    task_store: Arc<task_runtime::TaskRuntimeStore>,
     /// Guards the model-switch race between `/api/models/load` and every
     /// chat request. `load_model_into_slot` kills the old llama-server and
     /// spawns/warms up a new one — real wall-clock time during which the
@@ -4199,6 +4200,8 @@ fn detect_node_id() -> String {
     "studio-api".to_string()
 }
 
+mod task_runtime;
+
 fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
     use axum::{
         extract::{ConnectInfo, Extension, Path, Query, Request, State},
@@ -4243,11 +4246,24 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             return next.run(req).await;
         }
 
-        let header = req
+        let header_str = req
             .headers()
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok());
-        let token = auth::extract_bearer_token(header);
+        let mut token = auth::extract_bearer_token(header_str);
+        if token.is_none() {
+            if let Some(query) = req.uri().query() {
+                for pair in query.split('&') {
+                    let mut parts = pair.split('=');
+                    if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
+                        if k == "access_token" || k == "token" {
+                            token = Some(v);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
 
         let ctx = token.and_then(|t| auth::authenticate(t, &lock_state(&state).api_keys));
 
@@ -9554,6 +9570,12 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         mcp_registry: Arc::clone(&mcp_registry),
         pending_tool_calls: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         download_progress: HashMap::new(),
+        task_store: Arc::new(
+            task_runtime::TaskRuntimeStore::new(
+                std::env::var("GHOSTLINK_DATA_DIR").unwrap_or_else(|_| ".ghostlink/data".into()),
+            )
+            .expect("failed to initialize task runtime store"),
+        ),
         model_lifecycle_lock: Arc::new(tokio::sync::RwLock::new(())),
         plugin_registry: backend_plugin::BackendPluginRegistry::from_env(),
         enable_tls_active: use_tls,
@@ -9644,7 +9666,247 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         // failed-auth attempts to the audit log) via `from_fn_with_state`.
         let auth_mw_state = Arc::clone(&state);
 
-        let app = Router::new()
+// --- Task Runtime API Handlers (v2.3) ---
+
+        #[derive(Deserialize)]
+        struct CreateProjectReq {
+            name: String,
+            kind: Option<task_runtime::ProjectKind>,
+            root_path: String,
+            allowed_tools: Option<Vec<String>>,
+            default_model: Option<String>,
+        }
+
+        #[derive(Deserialize)]
+        struct UpdateProjectReq {
+            name: Option<String>,
+            default_model: Option<String>,
+            allowed_tools: Option<Vec<String>>,
+        }
+
+        async fn handle_create_project(
+            State(state): State<Arc<Mutex<BackendState>>>,
+            Json(payload): Json<CreateProjectReq>,
+        ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+            let store = Arc::clone(&lock_state(&state).task_store);
+            let kind = payload.kind.unwrap_or(task_runtime::ProjectKind::Code);
+            match store.create_project(payload.name, kind, payload.root_path, payload.allowed_tools, payload.default_model) {
+                Ok(proj) => Ok((StatusCode::CREATED, Json(serde_json::to_value(proj).unwrap()))),
+                Err(e) => Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e.to_string() })))),
+            }
+        }
+
+        async fn handle_list_projects(
+            State(state): State<Arc<Mutex<BackendState>>>,
+        ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+            let store = Arc::clone(&lock_state(&state).task_store);
+            match store.list_projects() {
+                Ok(projs) => Ok(Json(serde_json::to_value(projs).unwrap())),
+                Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() })))),
+            }
+        }
+
+        async fn handle_get_project(
+            State(state): State<Arc<Mutex<BackendState>>>,
+            Path(id): Path<String>,
+        ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+            let store = Arc::clone(&lock_state(&state).task_store);
+            match store.get_project(&id) {
+                Ok(proj) => Ok(Json(serde_json::to_value(proj).unwrap())),
+                Err(e) => Err((StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": e.to_string() })))),
+            }
+        }
+
+        async fn handle_update_project(
+            State(state): State<Arc<Mutex<BackendState>>>,
+            Path(id): Path<String>,
+            Json(payload): Json<UpdateProjectReq>,
+        ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+            let store = Arc::clone(&lock_state(&state).task_store);
+            match store.update_project(&id, payload.name, payload.default_model, payload.allowed_tools) {
+                Ok(proj) => Ok(Json(serde_json::to_value(proj).unwrap())),
+                Err(e) => Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e.to_string() })))),
+            }
+        }
+
+        #[derive(Deserialize)]
+        struct CreateTaskReq {
+            goal: String,
+            acceptance_criteria: Option<String>,
+            budget: Option<task_runtime::TaskBudget>,
+            parent_id: Option<String>,
+        }
+
+        async fn handle_create_project_task(
+            State(state): State<Arc<Mutex<BackendState>>>,
+            Path(project_id): Path<String>,
+            Json(payload): Json<CreateTaskReq>,
+        ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+            let store = Arc::clone(&lock_state(&state).task_store);
+            match store.create_task(&project_id, payload.goal, payload.acceptance_criteria, payload.budget, payload.parent_id) {
+                Ok(task) => Ok((StatusCode::CREATED, Json(serde_json::to_value(task).unwrap()))),
+                Err(e) => Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e.to_string() })))),
+            }
+        }
+
+        async fn handle_list_project_tasks(
+            State(state): State<Arc<Mutex<BackendState>>>,
+            Path(project_id): Path<String>,
+        ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+            let store = Arc::clone(&lock_state(&state).task_store);
+            match store.list_project_tasks(&project_id) {
+                Ok(tasks) => Ok(Json(serde_json::to_value(tasks).unwrap())),
+                Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() })))),
+            }
+        }
+
+        async fn handle_get_task(
+            State(state): State<Arc<Mutex<BackendState>>>,
+            Path(id): Path<String>,
+        ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+            let store = Arc::clone(&lock_state(&state).task_store);
+            match store.get_task(&id) {
+                Ok(task) => Ok(Json(serde_json::to_value(task).unwrap())),
+                Err(e) => Err((StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": e.to_string() })))),
+            }
+        }
+
+        #[derive(Deserialize)]
+        struct SpawnTaskReq {
+            role: Option<String>,
+            model: Option<String>,
+            brief: Option<String>,
+        }
+
+        async fn handle_spawn_task(
+            State(state): State<Arc<Mutex<BackendState>>>,
+            Path(id): Path<String>,
+            Json(payload): Json<SpawnTaskReq>,
+        ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+            let (store, current_model) = {
+                let guard = lock_state(&state);
+                (Arc::clone(&guard.task_store), guard.current_model.clone())
+            };
+            let task = match store.get_task(&id) {
+                Ok(t) => t,
+                Err(e) => return Err((StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": e.to_string() })))),
+            };
+            let project = match store.get_project(&task.project_id) {
+                Ok(p) => p,
+                Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() })))),
+            };
+
+            let role = payload.role.unwrap_or_else(|| "implementer".into());
+            let model = payload.model.or(project.default_model).unwrap_or(current_model);
+            let cancel_token = tokio_util::sync::CancellationToken::new();
+
+            match task_runtime::TaskRunner::spawn_implementer(
+                store,
+                task,
+                role,
+                model,
+                payload.brief,
+                cancel_token,
+            ).await {
+                Ok(run) => Ok((StatusCode::ACCEPTED, Json(serde_json::to_value(run).unwrap()))),
+                Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() })))),
+            }
+        }
+
+        async fn handle_cancel_task(
+            State(state): State<Arc<Mutex<BackendState>>>,
+            Path(id): Path<String>,
+        ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+            let store = Arc::clone(&lock_state(&state).task_store);
+            let _ = store.cancel_task_run(&id);
+            match store.update_task_status(&id, task_runtime::TaskStatus::Cancelled) {
+                Ok(task) => Ok(Json(serde_json::to_value(task).unwrap())),
+                Err(e) => Err((StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": e.to_string() })))),
+            }
+        }
+
+        async fn handle_get_task_review(
+            State(state): State<Arc<Mutex<BackendState>>>,
+            Path(id): Path<String>,
+        ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+            let store = Arc::clone(&lock_state(&state).task_store);
+            match store.get_task_review(&id) {
+                Ok(review) => Ok(Json(serde_json::to_value(review).unwrap())),
+                Err(e) => Err((StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": e.to_string() })))),
+            }
+        }
+
+        #[derive(Deserialize)]
+        struct DecideReviewReq {
+            decision: String,
+            note: Option<String>,
+        }
+
+        async fn handle_decide_review(
+            State(state): State<Arc<Mutex<BackendState>>>,
+            Path(review_id): Path<String>,
+            Json(payload): Json<DecideReviewReq>,
+        ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+            let store = Arc::clone(&lock_state(&state).task_store);
+            let review = match store.get_review(&review_id) {
+                Ok(r) => r,
+                Err(e) => return Err((StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": e.to_string() })))),
+            };
+            let task = match store.get_task(&review.task_id) {
+                Ok(t) => t,
+                Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() })))),
+            };
+            let project = match store.get_project(&task.project_id) {
+                Ok(p) => p,
+                Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() })))),
+            };
+
+            match payload.decision.as_str() {
+                "accept" => {
+                    if let Err(e) = store.check_parent_accept_allowed(&project.id, &task.id) {
+                        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e.to_string() }))));
+                    }
+                    let _ = store.apply_proposed_changes(&project.root_path, &task.id);
+                    let _ = store.update_task_status(&task.id, task_runtime::TaskStatus::Accepted);
+                    Ok(Json(serde_json::json!({ "status": "accepted", "task_id": task.id })))
+                }
+                "reject" => {
+                    let _ = store.discard_proposed_changes(&project.root_path, &task.id);
+                    let _ = store.update_task_status(&task.id, task_runtime::TaskStatus::Rejected);
+                    Ok(Json(serde_json::json!({ "status": "rejected", "task_id": task.id })))
+                }
+                "request_changes" => {
+                    let _ = store.requeue_task(&task.id);
+                    Ok(Json(serde_json::json!({ "status": "queued", "task_id": task.id, "note": payload.note })))
+                }
+                _ => Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "invalid decision: must be accept, reject, or request_changes" })))),
+            }
+        }
+
+        async fn handle_get_task_events(
+            State(state): State<Arc<Mutex<BackendState>>>,
+            Path(id): Path<String>,
+        ) -> impl IntoResponse {
+            let store = Arc::clone(&lock_state(&state).task_store);
+            let rx = store.subscribe_events();
+            let stream = tokio_stream::wrappers::BroadcastStream::new(rx);
+            let sse_stream = stream.filter_map(move |msg| {
+                let id = id.clone();
+                async move {
+                    if let Ok(event) = msg {
+                        if event.task_id == id {
+                            if let Ok(json) = serde_json::to_string(&event) {
+                                return Some(Ok::<_, std::convert::Infallible>(Event::default().data(json)));
+                            }
+                        }
+                    }
+                    None
+                }
+            });
+            Sse::new(sse_stream).keep_alive(axum::response::sse::KeepAlive::default())
+        }
+
+                let app = Router::new()
             .route("/v1/chat/completions", post(handle_chat_completions))
             .route("/v1/completions", post(handle_completions))
             .route("/v1/embeddings", post(handle_embeddings))
@@ -9718,6 +9980,15 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                 post(handle_gui_session_cancel),
             )
             .route("/api/queue", post(handle_gui_queue))
+            .route("/api/projects", post(handle_create_project).get(handle_list_projects))
+            .route("/api/projects/:id", get(handle_get_project).patch(handle_update_project))
+            .route("/api/projects/:id/tasks", post(handle_create_project_task).get(handle_list_project_tasks))
+            .route("/api/tasks/:id", get(handle_get_task))
+            .route("/api/tasks/:id/spawn", post(handle_spawn_task))
+            .route("/api/tasks/:id/cancel", post(handle_cancel_task))
+            .route("/api/tasks/:id/events", get(handle_get_task_events))
+            .route("/api/tasks/:id/review", get(handle_get_task_review))
+            .route("/api/reviews/:id/decide", post(handle_decide_review))
             .route("/api/security/jwt/refresh", post(handle_gui_jwt_refresh))
             .route("/api/security/pqc/enable", post(handle_gui_pqc_enable))
             .route("/api/security/pqc/state", get(handle_gui_pqc_state))
@@ -12132,6 +12403,13 @@ mod tests {
             ))),
             pending_tool_calls: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             download_progress: HashMap::new(),
+            task_store: Arc::new(
+                task_runtime::TaskRuntimeStore::new(
+                    std::env::var("GHOSTLINK_DATA_DIR")
+                        .unwrap_or_else(|_| ".ghostlink/data".into()),
+                )
+                .expect("failed to initialize task runtime store"),
+            ),
             model_lifecycle_lock: Arc::new(tokio::sync::RwLock::new(())),
             enable_tls_active: false,
             plugin_registry: backend_plugin::BackendPluginRegistry::from_env(),

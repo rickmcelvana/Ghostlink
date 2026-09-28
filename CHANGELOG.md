@@ -6,6 +6,10 @@ All notable changes to Ghostlink Studio are documented here.
 
 ## [Unreleased]
 
+### Added
+- **v2.3 Task Runtime & v2.4 Child Fan-Out**: Implemented `crates/ghost-link/src/task_runtime.rs` and wired REST/SSE API endpoints (`/api/projects`, `/api/tasks`, `/api/reviews`) in `main.rs`. Added durable JSON storage under `GHOSTLINK_DATA_DIR`, path isolation/canonicalization, staging engine for proposed workspace modifications, deterministic `Judge` security policy, background Tokio implementer loop, real-time SSE stream with token query parameter support (`?access_token=`), and child task fan-out caps (`max_depth=1`, `max_children=4`).
+
+
 - **Cross-Platform Launcher Bootstrap and Readiness Fixes** (`launch.bat`, `launch-native.ps1`, `launch.sh`):
   Added PowerShell Core compatibility, native Windows toolchain preflight checks, UTF-8 runtime GUI configuration, strict readiness status handling, and corrected the Linux success-screen URL.
 

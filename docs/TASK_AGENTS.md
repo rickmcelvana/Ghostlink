@@ -48,10 +48,10 @@ Before running shell commands or file mutations, the runtime passes the request 
 - **DENY**: Destructive file commands (`rm -rf`, disk formatting), rewriting `.git` history (`git reset --hard`), secret exfiltration via `curl`/`wget`, docker container escape, and privilege escalation (`sudo`, `su`).
 - **PAUSE**: Any unrecognized command pauses execution, sets task status to `blocked`, and emits a `judge` pause event pending human review.
 
-## Out of Scope (Future Releases)
+## v2.4 Child Fan-Out Subagent Trees
 
 The v2.3 release establishes the closed-loop core. The following items remain out of scope for v2.3:
-- Child fan-out & subagent task trees (v2.4)
+- Implemented: Child task creation (), , , parent accept blocking on open children, and cascading cancellation.
 - Per-role model routing across heterogeneous cluster nodes
 - Git worktree management for parallel agents
 - Agent skills, voice interfaces, or cloud model routing
