@@ -1,0 +1,104 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { ReviewPane } from './ReviewPane';
+import { ReviewPacket } from '../api';
+
+vi.mock('@monaco-editor/react', () => {
+  const DiffEditor = ({ original, modified }: any) => {
+    return (
+      <div data-testid="mock-diff-editor">
+        <div data-testid="mock-original">{original}</div>
+        <div data-testid="mock-modified">{modified}</div>
+      </div>
+    );
+  };
+  return {
+    __esModule: true,
+    default: () => <div />,
+    DiffEditor,
+  };
+});
+
+describe('ReviewPane', () => {
+  let mockPacket: ReviewPacket;
+  let mockApi: any;
+
+  beforeEach(() => {
+    mockPacket = {
+      id: 'rev_1234567890',
+      task_id: 'task_1',
+      run_id: 'run_1',
+      summary: 'Propose new feature implementation',
+      diffs: [
+        {
+          path: 'src/lib.rs',
+          unified_diff: '--- a/src/lib.rs\n+++ b/src/lib.rs',
+          original: 'fn old() {}',
+          proposed: 'fn new_func() {}',
+        },
+      ],
+      commands: [
+        {
+          argv: ['cargo', 'test'],
+          judge: 'allow',
+          exit: 0,
+          excerpt: 'test result: ok',
+        },
+      ],
+      checks: ['cargo test passed'],
+      risks: ['None identified'],
+      created_at: '2026-08-10T12:00:00Z',
+    };
+
+    mockApi = {
+      decideReview: vi.fn().mockResolvedValue({ status: 'accepted', task_id: 'task_1' }),
+    };
+  });
+
+  it('renders review packet summary and diff file path', () => {
+    render(<ReviewPane packet={mockPacket} api={mockApi} />);
+
+    expect(screen.getByText(/ReviewPacket #rev_1234/i)).toBeInTheDocument();
+    expect(screen.getByText('Propose new feature implementation')).toBeInTheDocument();
+    expect(screen.getByText('src/lib.rs')).toBeInTheDocument();
+  });
+
+  it('calls decideReview with accept when Accept button is clicked', async () => {
+    const onDecided = vi.fn();
+    render(<ReviewPane packet={mockPacket} api={mockApi} onDecided={onDecided} />);
+
+    const acceptBtn = screen.getByRole('button', { name: /accept proposed changes/i });
+    fireEvent.click(acceptBtn);
+
+    await waitFor(() => {
+      expect(mockApi.decideReview).toHaveBeenCalledWith('rev_1234567890', {
+        decision: 'accept',
+        note: undefined,
+      });
+      expect(onDecided).toHaveBeenCalled();
+    });
+  });
+
+  it('calls decideReview with reject when Reject button is clicked', async () => {
+    const onDecided = vi.fn();
+    render(<ReviewPane packet={mockPacket} api={mockApi} onDecided={onDecided} />);
+
+    const rejectBtn = screen.getByRole('button', { name: /reject proposed changes/i });
+    fireEvent.click(rejectBtn);
+
+    await waitFor(() => {
+      expect(mockApi.decideReview).toHaveBeenCalledWith('rev_1234567890', {
+        decision: 'reject',
+        note: undefined,
+      });
+      expect(onDecided).toHaveBeenCalled();
+    });
+  });
+
+  it('renders commands list with judge status badges', () => {
+    render(<ReviewPane packet={mockPacket} api={mockApi} />);
+
+    expect(screen.getByText('cargo test')).toBeInTheDocument();
+    expect(screen.getByText('allow')).toBeInTheDocument();
+  });
+});
