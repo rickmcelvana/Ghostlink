@@ -27,6 +27,20 @@ pub struct Project {
     pub created_at: String,
 }
 
+impl Project {
+    pub fn effective_allowed_tools(&self) -> Vec<String> {
+        if self.allowed_tools.is_empty() && self.kind == ProjectKind::Code {
+            vec![
+                "write_file".to_string(),
+                "read_file".to_string(),
+                "run_command".to_string(),
+            ]
+        } else {
+            self.allowed_tools.clone()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskBudget {
     pub max_steps: u32,
@@ -831,363 +845,401 @@ impl TaskRunner {
         Ok(run)
     }
 
-    async fn run_loop(
+    #[allow(clippy::type_complexity)]
+    fn run_loop<'a>(
         store: Arc<TaskRuntimeStore>,
         backend: Arc<dyn AgentBackend>,
         task: Task,
-        run: &mut AgentRun,
+        run: &'a mut AgentRun,
         brief: Option<String>,
         cancel_token: tokio_util::sync::CancellationToken,
-    ) -> Result<(ReviewPacket, TaskStatus)> {
-        let project = store.get_project(&task.project_id)?;
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(ReviewPacket, TaskStatus)>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let project = store.get_project(&task.project_id)?;
 
-        store.emit_event(TaskEvent {
-            task_id: task.id.clone(),
-            ts: Utc::now().timestamp_millis() as u64,
-            kind: "run_started".into(),
-            payload: serde_json::json!({ "run_id": run.id, "brief": brief }),
-        });
+            store.emit_event(TaskEvent {
+                task_id: task.id.clone(),
+                ts: Utc::now().timestamp_millis() as u64,
+                kind: "run_started".into(),
+                payload: serde_json::json!({ "run_id": run.id, "brief": brief }),
+            });
 
-        let mut commands_executed = Vec::new();
-        let mut checks = Vec::new();
-        let mut risks = Vec::new();
-        let mut final_status = TaskStatus::NeedsReview;
+            let mut commands_executed = Vec::new();
+            let mut checks = Vec::new();
+            let mut risks = Vec::new();
+            let mut final_status = TaskStatus::NeedsReview;
 
-        let start_time = std::time::Instant::now();
+            let start_time = std::time::Instant::now();
 
-        // Build initial messages
-        let system_prompt = format!(
+            // Build initial messages
+            let system_prompt = format!(
             "You are an AI task agent implementing project '{}' at root path '{}'. Use available tools to write proposed files and execute checks.",
             project.name, project.root_path
         );
 
-        let mut user_prompt = format!("Task Goal: {}\n", task.goal);
-        if let Some(b) = &brief {
-            user_prompt.push_str(&format!("Execution Brief: {}\n", b));
-        }
-        if let Some(ac) = &task.acceptance_criteria {
-            user_prompt.push_str(&format!("Acceptance Criteria: {}\n", ac));
-        }
-
-        let mut messages = vec![
-            serde_json::json!({ "role": "system", "content": system_prompt }),
-            serde_json::json!({ "role": "user", "content": user_prompt }),
-        ];
-
-        let max_steps = task.budget.max_steps;
-        let max_minutes = task.budget.max_minutes as u64;
-
-        for _step in 1..=max_steps {
-            if cancel_token.is_cancelled() {
-                return Err(anyhow!("Task execution cancelled by user"));
+            let mut user_prompt = format!("Task Goal: {}\n", task.goal);
+            if let Some(b) = &brief {
+                user_prompt.push_str(&format!("Execution Brief: {}\n", b));
+            }
+            if let Some(ac) = &task.acceptance_criteria {
+                user_prompt.push_str(&format!("Acceptance Criteria: {}\n", ac));
             }
 
-            if start_time.elapsed().as_secs() > max_minutes * 60 {
-                risks.push("Exceeded time budget (max_minutes)".into());
-                break;
-            }
+            let mut messages = vec![
+                serde_json::json!({ "role": "system", "content": system_prompt }),
+                serde_json::json!({ "role": "user", "content": user_prompt }),
+            ];
 
-            if let Some(max_tok) = task.budget.max_tokens {
-                if run.token_count >= max_tok {
-                    risks.push("Exceeded token budget (max_tokens)".into());
+            let max_steps = task.budget.max_steps;
+            let max_minutes = task.budget.max_minutes as u64;
+
+            for _step in 1..=max_steps {
+                if cancel_token.is_cancelled() {
+                    return Err(anyhow!("Task execution cancelled by user"));
+                }
+
+                if start_time.elapsed().as_secs() > max_minutes * 60 {
+                    risks.push("Exceeded time budget (max_minutes)".into());
                     break;
                 }
-            }
 
-            run.step_count += 1;
-            store.emit_event(TaskEvent {
+                if let Some(max_tok) = task.budget.max_tokens {
+                    if run.token_count >= max_tok {
+                        risks.push("Exceeded token budget (max_tokens)".into());
+                        break;
+                    }
+                }
+
+                run.step_count += 1;
+                store.emit_event(TaskEvent {
                 task_id: task.id.clone(),
                 ts: Utc::now().timestamp_millis() as u64,
                 kind: "step".into(),
                 payload: serde_json::json!({ "step": run.step_count, "description": format!("Agent step {}", run.step_count) }),
             });
 
-            // Call model via AgentBackend
-            let agent_resp = match backend.chat(&messages, &project.allowed_tools).await {
-                Ok(resp) => resp,
-                Err(err) => {
-                    risks.push(format!("Backend inference error: {}", err));
+                // Call model via AgentBackend
+                let agent_resp = match backend
+                    .chat(&messages, &project.effective_allowed_tools())
+                    .await
+                {
+                    Ok(resp) => resp,
+                    Err(err) => {
+                        risks.push(format!("Backend inference error: {}", err));
+                        break;
+                    }
+                };
+
+                // Estimate tokens
+                let content_str = agent_resp.content.clone().unwrap_or_default();
+                run.token_count += (content_str.len() / 4).max(10) as u32;
+
+                if !content_str.is_empty() {
+                    messages
+                        .push(serde_json::json!({ "role": "assistant", "content": content_str }));
+                }
+
+                if agent_resp.tool_calls.is_empty() {
                     break;
                 }
-            };
 
-            // Estimate tokens
-            let content_str = agent_resp.content.clone().unwrap_or_default();
-            run.token_count += (content_str.len() / 4).max(10) as u32;
+                let mut should_stop = false;
 
-            if !content_str.is_empty() {
-                messages.push(serde_json::json!({ "role": "assistant", "content": content_str }));
-            }
-
-            if agent_resp.tool_calls.is_empty() {
-                break;
-            }
-
-            let mut should_stop = false;
-
-            for tool_call in agent_resp.tool_calls {
-                store.emit_event(TaskEvent {
+                for tool_call in agent_resp.tool_calls {
+                    store.emit_event(TaskEvent {
                     task_id: task.id.clone(),
                     ts: Utc::now().timestamp_millis() as u64,
                     kind: "tool".into(),
                     payload: serde_json::json!({ "name": tool_call.name, "args": tool_call.args }),
                 });
 
-                match tool_call.name.as_str() {
-                    "spawn_subagent" | "create_child_task" => {
-                        if run.role != "planner" {
-                            risks.push("Implementer agent tried to spawn subagent (denied)".into());
-                            messages.push(serde_json::json!({ "role": "user", "content": "Error: implementer agents cannot spawn subagents" }));
-                            continue;
-                        }
+                    match tool_call.name.as_str() {
+                        "spawn_subagent" | "create_child_task" => {
+                            if run.role != "planner" {
+                                risks.push(
+                                    "Implementer agent tried to spawn subagent (denied)".into(),
+                                );
+                                messages.push(serde_json::json!({ "role": "user", "content": "Error: implementer agents cannot spawn subagents" }));
+                                continue;
+                            }
 
-                        let child_goal = tool_call
-                            .args
-                            .get("goal")
-                            .and_then(|g| g.as_str())
-                            .unwrap_or("");
-                        let child_criteria = tool_call
-                            .args
-                            .get("acceptance_criteria")
-                            .and_then(|c| c.as_str());
+                            let child_goal = tool_call
+                                .args
+                                .get("goal")
+                                .and_then(|g| g.as_str())
+                                .unwrap_or("");
+                            let child_criteria = tool_call
+                                .args
+                                .get("acceptance_criteria")
+                                .and_then(|c| c.as_str());
 
-                        if child_goal.is_empty() {
-                            messages.push(serde_json::json!({ "role": "user", "content": "Error: goal cannot be empty for child task" }));
-                            continue;
-                        }
+                            if child_goal.is_empty() {
+                                messages.push(serde_json::json!({ "role": "user", "content": "Error: goal cannot be empty for child task" }));
+                                continue;
+                            }
 
-                        let elapsed_mins = (start_time.elapsed().as_secs() / 60) as u32;
-                        let rem_mins = task.budget.max_minutes.saturating_sub(elapsed_mins).max(1);
-                        let rem_steps = task.budget.max_steps.saturating_sub(run.step_count).max(1);
-                        let rem_tokens = task
-                            .budget
-                            .max_tokens
-                            .map(|mt| mt.saturating_sub(run.token_count));
+                            let elapsed_mins = (start_time.elapsed().as_secs() / 60) as u32;
+                            let rem_mins =
+                                task.budget.max_minutes.saturating_sub(elapsed_mins).max(1);
+                            let rem_steps =
+                                task.budget.max_steps.saturating_sub(run.step_count).max(1);
+                            let rem_tokens = task
+                                .budget
+                                .max_tokens
+                                .map(|mt| mt.saturating_sub(run.token_count));
 
-                        let child_budget = TaskBudget {
-                            max_steps: rem_steps,
-                            max_tokens: rem_tokens,
-                            max_minutes: rem_mins,
-                        };
+                            let child_budget = TaskBudget {
+                                max_steps: rem_steps,
+                                max_tokens: rem_tokens,
+                                max_minutes: rem_mins,
+                            };
 
-                        match store.create_task(
-                            &project.id,
-                            child_goal.to_string(),
-                            child_criteria.map(|s| s.to_string()),
-                            Some(child_budget),
-                            Some(task.id.clone()),
-                        ) {
-                            Ok(child) => {
-                                store.emit_event(TaskEvent {
+                            match store.create_task(
+                                &project.id,
+                                child_goal.to_string(),
+                                child_criteria.map(|s| s.to_string()),
+                                Some(child_budget),
+                                Some(task.id.clone()),
+                            ) {
+                                Ok(child) => {
+                                    store.emit_event(TaskEvent {
                                     task_id: task.id.clone(),
                                     ts: Utc::now().timestamp_millis() as u64,
                                     kind: "child_created".into(),
                                     payload: serde_json::json!({ "child_id": child.id, "goal": child.goal }),
                                 });
-                                messages.push(serde_json::json!({ "role": "user", "content": format!("Successfully created child task #{} ({})", child.id, child.goal) }));
+
+                                    // Auto-spawn child task as implementer run with inherited cancel token
+                                    let child_store = Arc::clone(&store);
+                                    let child_backend = Arc::clone(&backend);
+                                    let child_task = child.clone();
+                                    let child_model = run.model.clone();
+                                    let child_token = cancel_token.child_token();
+
+                                    tokio::spawn(Box::pin(async move {
+                                        let _ = Self::spawn_implementer(
+                                            child_store,
+                                            child_backend,
+                                            child_task,
+                                            "implementer".into(),
+                                            child_model,
+                                            None,
+                                            child_token,
+                                        )
+                                        .await;
+                                    }));
+
+                                    messages.push(serde_json::json!({ "role": "user", "content": format!("Successfully created child task #{} ({})", child.id, child.goal) }));
+                                }
+                                Err(e) => {
+                                    risks.push(format!("Failed to create child task: {}", e));
+                                    messages.push(serde_json::json!({ "role": "user", "content": format!("Failed to create child task: {}", e) }));
+                                }
                             }
-                            Err(e) => {
-                                risks.push(format!("Failed to create child task: {}", e));
-                                messages.push(serde_json::json!({ "role": "user", "content": format!("Failed to create child task: {}", e) }));
+                        }
+                        "write_file" => {
+                            let rel_path = tool_call
+                                .args
+                                .get("path")
+                                .and_then(|p| p.as_str())
+                                .unwrap_or("");
+                            let file_content = tool_call
+                                .args
+                                .get("content")
+                                .and_then(|c| c.as_str())
+                                .unwrap_or("");
+
+                            if rel_path.is_empty() {
+                                risks.push("write_file tool called with empty path".into());
+                                messages.push(serde_json::json!({ "role": "user", "content": "Error: write_file path is empty" }));
+                                continue;
                             }
-                        }
-                    }
-                    "write_file" => {
-                        let rel_path = tool_call
-                            .args
-                            .get("path")
-                            .and_then(|p| p.as_str())
-                            .unwrap_or("");
-                        let file_content = tool_call
-                            .args
-                            .get("content")
-                            .and_then(|c| c.as_str())
-                            .unwrap_or("");
 
-                        if rel_path.is_empty() {
-                            risks.push("write_file tool called with empty path".into());
-                            messages.push(serde_json::json!({ "role": "user", "content": "Error: write_file path is empty" }));
-                            continue;
-                        }
+                            if !project.allowed_tools.contains(&"write_file".to_string()) {
+                                risks.push("write_file tool not allowed by project policy".into());
+                                messages.push(serde_json::json!({ "role": "user", "content": "Error: write_file tool is disabled for this project" }));
+                                continue;
+                            }
 
-                        if !project.allowed_tools.contains(&"write_file".to_string()) {
-                            risks.push("write_file tool not allowed by project policy".into());
-                            messages.push(serde_json::json!({ "role": "user", "content": "Error: write_file tool is disabled for this project" }));
-                            continue;
-                        }
-
-                        match store.write_proposed_file(
-                            &project.root_path,
-                            &task.id,
-                            rel_path,
-                            file_content,
-                        ) {
-                            Ok(_) => {
-                                store.emit_event(TaskEvent {
+                            match store.write_proposed_file(
+                                &project.root_path,
+                                &task.id,
+                                rel_path,
+                                file_content,
+                            ) {
+                                Ok(_) => {
+                                    store.emit_event(TaskEvent {
                                     task_id: task.id.clone(),
                                     ts: Utc::now().timestamp_millis() as u64,
                                     kind: "file".into(),
                                     payload: serde_json::json!({ "path": rel_path, "action": "write_proposed" }),
                                 });
-                                messages.push(serde_json::json!({ "role": "user", "content": format!("Successfully wrote proposed file {}", rel_path) }));
-                            }
-                            Err(e) => {
-                                risks.push(format!(
-                                    "Failed writing proposed file {}: {}",
-                                    rel_path, e
-                                ));
-                                messages.push(serde_json::json!({ "role": "user", "content": format!("Error writing proposed file {}: {}", rel_path, e) }));
+                                    messages.push(serde_json::json!({ "role": "user", "content": format!("Successfully wrote proposed file {}", rel_path) }));
+                                }
+                                Err(e) => {
+                                    risks.push(format!(
+                                        "Failed writing proposed file {}: {}",
+                                        rel_path, e
+                                    ));
+                                    messages.push(serde_json::json!({ "role": "user", "content": format!("Error writing proposed file {}: {}", rel_path, e) }));
+                                }
                             }
                         }
-                    }
-                    "read_file" => {
-                        let rel_path = tool_call
-                            .args
-                            .get("path")
-                            .and_then(|p| p.as_str())
-                            .unwrap_or("");
-                        let proposed_file = store
-                            .get_task_proposed_dir(&project.root_path, &task.id)
-                            .join(rel_path);
-                        let file_text = if proposed_file.exists() {
-                            fs::read_to_string(&proposed_file).unwrap_or_default()
-                        } else if let Ok(live_p) = TaskRuntimeStore::validate_and_resolve_path(
-                            &project.root_path,
-                            rel_path,
-                        ) {
-                            fs::read_to_string(&live_p).unwrap_or_default()
-                        } else {
-                            "File not found".to_string()
-                        };
-                        messages.push(serde_json::json!({ "role": "user", "content": format!("File content of {}:\n{}", rel_path, file_text) }));
-                    }
-                    "run_command" | "exec" | "execute" | "shell" => {
-                        let argv: Vec<String> = if let Some(arr) =
-                            tool_call.args.get("argv").and_then(|a| a.as_array())
-                        {
-                            arr.iter()
-                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                                .collect()
-                        } else if let Some(cmd_str) =
-                            tool_call.args.get("command").and_then(|c| c.as_str())
-                        {
-                            cmd_str.split_whitespace().map(|s| s.to_string()).collect()
-                        } else {
-                            vec![]
-                        };
-
-                        if argv.is_empty() {
-                            messages.push(serde_json::json!({ "role": "user", "content": "Error: empty command" }));
-                            continue;
+                        "read_file" => {
+                            let rel_path = tool_call
+                                .args
+                                .get("path")
+                                .and_then(|p| p.as_str())
+                                .unwrap_or("");
+                            let proposed_file = store
+                                .get_task_proposed_dir(&project.root_path, &task.id)
+                                .join(rel_path);
+                            let file_text = if proposed_file.exists() {
+                                fs::read_to_string(&proposed_file).unwrap_or_default()
+                            } else if let Ok(live_p) = TaskRuntimeStore::validate_and_resolve_path(
+                                &project.root_path,
+                                rel_path,
+                            ) {
+                                fs::read_to_string(&live_p).unwrap_or_default()
+                            } else {
+                                "File not found".to_string()
+                            };
+                            messages.push(serde_json::json!({ "role": "user", "content": format!("File content of {}:\n{}", rel_path, file_text) }));
                         }
+                        "run_command" | "exec" | "execute" | "shell" => {
+                            let argv: Vec<String> = if let Some(arr) =
+                                tool_call.args.get("argv").and_then(|a| a.as_array())
+                            {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                    .collect()
+                            } else if let Some(cmd_str) =
+                                tool_call.args.get("command").and_then(|c| c.as_str())
+                            {
+                                cmd_str.split_whitespace().map(|s| s.to_string()).collect()
+                            } else {
+                                vec![]
+                            };
 
-                        let judge_eval = Judge::evaluate(&argv);
-                        store.emit_event(TaskEvent {
+                            if argv.is_empty() {
+                                messages.push(serde_json::json!({ "role": "user", "content": "Error: empty command" }));
+                                continue;
+                            }
+
+                            let judge_eval = Judge::evaluate(&argv);
+                            store.emit_event(TaskEvent {
                             task_id: task.id.clone(),
                             ts: Utc::now().timestamp_millis() as u64,
                             kind: "judge".into(),
                             payload: serde_json::json!({ "argv": argv, "decision": format!("{:?}", judge_eval) }),
                         });
 
-                        match judge_eval {
-                            JudgeResult::Allow => {
-                                if !project.allowed_tools.contains(&"run_command".to_string())
-                                    && !project.allowed_tools.contains(&"execute".to_string())
-                                {
-                                    risks.push(
-                                        "Command execution tool not allowed by project policy"
-                                            .into(),
-                                    );
-                                    messages.push(serde_json::json!({ "role": "user", "content": "Error: command execution is disabled for this project" }));
-                                    continue;
-                                }
+                            match judge_eval {
+                                JudgeResult::Allow => {
+                                    if !project.allowed_tools.contains(&"run_command".to_string())
+                                        && !project.allowed_tools.contains(&"execute".to_string())
+                                    {
+                                        risks.push(
+                                            "Command execution tool not allowed by project policy"
+                                                .into(),
+                                        );
+                                        messages.push(serde_json::json!({ "role": "user", "content": "Error: command execution is disabled for this project" }));
+                                        continue;
+                                    }
 
-                                let output_res = tokio::process::Command::new(&argv[0])
-                                    .args(&argv[1..])
-                                    .current_dir(&project.root_path)
-                                    .output()
-                                    .await;
+                                    let output_res = tokio::process::Command::new(&argv[0])
+                                        .args(&argv[1..])
+                                        .current_dir(&project.root_path)
+                                        .output()
+                                        .await;
 
-                                match output_res {
-                                    Ok(output) => {
-                                        let exit_code = output.status.code().unwrap_or(-1);
-                                        let stdout = String::from_utf8_lossy(&output.stdout);
-                                        let stderr = String::from_utf8_lossy(&output.stderr);
-                                        let excerpt =
-                                            format!("STDOUT:\n{}\nSTDERR:\n{}", stdout, stderr);
-                                        let trimmed_excerpt = if excerpt.len() > 1000 {
-                                            format!("{}...\n(truncated)", &excerpt[..1000])
-                                        } else {
-                                            excerpt
-                                        };
+                                    match output_res {
+                                        Ok(output) => {
+                                            let exit_code = output.status.code().unwrap_or(-1);
+                                            let stdout = String::from_utf8_lossy(&output.stdout);
+                                            let stderr = String::from_utf8_lossy(&output.stderr);
+                                            let excerpt =
+                                                format!("STDOUT:\n{}\nSTDERR:\n{}", stdout, stderr);
+                                            let trimmed_excerpt = if excerpt.len() > 1000 {
+                                                format!("{}...\n(truncated)", &excerpt[..1000])
+                                            } else {
+                                                excerpt
+                                            };
 
-                                        commands_executed.push(ReviewCommand {
-                                            argv: argv.clone(),
-                                            judge: JudgeDecision::Allow,
-                                            exit: exit_code,
-                                            excerpt: trimmed_excerpt.clone(),
-                                        });
+                                            commands_executed.push(ReviewCommand {
+                                                argv: argv.clone(),
+                                                judge: JudgeDecision::Allow,
+                                                exit: exit_code,
+                                                excerpt: trimmed_excerpt.clone(),
+                                            });
 
-                                        if exit_code == 0 {
-                                            checks.push(format!("Passed: {}", argv.join(" ")));
-                                        } else {
-                                            risks.push(format!(
-                                                "Command failed (exit {}): {}",
-                                                exit_code,
-                                                argv.join(" ")
-                                            ));
-                                        }
+                                            if exit_code == 0 {
+                                                checks.push(format!("Passed: {}", argv.join(" ")));
+                                            } else {
+                                                risks.push(format!(
+                                                    "Command failed (exit {}): {}",
+                                                    exit_code,
+                                                    argv.join(" ")
+                                                ));
+                                            }
 
-                                        messages.push(serde_json::json!({
+                                            messages.push(serde_json::json!({
                                             "role": "user",
                                             "content": format!("Command '{}' exited with {}:\n{}", argv.join(" "), exit_code, trimmed_excerpt)
                                         }));
-                                    }
-                                    Err(e) => {
-                                        commands_executed.push(ReviewCommand {
-                                            argv: argv.clone(),
-                                            judge: JudgeDecision::Allow,
-                                            exit: -1,
-                                            excerpt: format!("Failed to spawn command: {}", e),
-                                        });
-                                        risks.push(format!(
-                                            "Failed to execute command {}: {}",
-                                            argv.join(" "),
-                                            e
-                                        ));
-                                        messages.push(serde_json::json!({ "role": "user", "content": format!("Failed to execute command: {}", e) }));
+                                        }
+                                        Err(e) => {
+                                            commands_executed.push(ReviewCommand {
+                                                argv: argv.clone(),
+                                                judge: JudgeDecision::Allow,
+                                                exit: -1,
+                                                excerpt: format!("Failed to spawn command: {}", e),
+                                            });
+                                            risks.push(format!(
+                                                "Failed to execute command {}: {}",
+                                                argv.join(" "),
+                                                e
+                                            ));
+                                            messages.push(serde_json::json!({ "role": "user", "content": format!("Failed to execute command: {}", e) }));
+                                        }
                                     }
                                 }
-                            }
-                            JudgeResult::Deny => {
-                                commands_executed.push(ReviewCommand {
-                                    argv: argv.clone(),
-                                    judge: JudgeDecision::Deny,
-                                    exit: -1,
-                                    excerpt: "Command denied by Judge security policy".into(),
-                                });
-                                risks.push(format!(
-                                    "Denied unsafe command execution: {}",
-                                    argv.join(" ")
-                                ));
-                                messages.push(serde_json::json!({ "role": "user", "content": "Command denied by Judge security policy" }));
-                            }
-                            JudgeResult::Pause => {
-                                final_status = TaskStatus::Blocked;
-                                commands_executed.push(ReviewCommand {
-                                    argv: argv.clone(),
-                                    judge: JudgeDecision::Pause,
-                                    exit: -1,
-                                    excerpt: "Command execution paused pending approval".into(),
-                                });
-                                risks.push("Command requires human approval".into());
-                                messages.push(serde_json::json!({ "role": "user", "content": "Command paused pending human approval" }));
-                                should_stop = true;
+                                JudgeResult::Deny => {
+                                    commands_executed.push(ReviewCommand {
+                                        argv: argv.clone(),
+                                        judge: JudgeDecision::Deny,
+                                        exit: -1,
+                                        excerpt: "Command denied by Judge security policy".into(),
+                                    });
+                                    risks.push(format!(
+                                        "Denied unsafe command execution: {}",
+                                        argv.join(" ")
+                                    ));
+                                    messages.push(serde_json::json!({ "role": "user", "content": "Command denied by Judge security policy" }));
+                                }
+                                JudgeResult::Pause => {
+                                    final_status = TaskStatus::Blocked;
+                                    commands_executed.push(ReviewCommand {
+                                        argv: argv.clone(),
+                                        judge: JudgeDecision::Pause,
+                                        exit: -1,
+                                        excerpt: "Command execution paused pending approval".into(),
+                                    });
+                                    risks.push("Command requires human approval".into());
+                                    messages.push(serde_json::json!({ "role": "user", "content": "Command paused pending human approval" }));
+                                    should_stop = true;
+                                }
                             }
                         }
+                        _ => {
+                            messages.push(serde_json::json!({ "role": "user", "content": format!("Unknown or unhandled tool: {}", tool_call.name) }));
+                        }
                     }
-                    _ => {
-                        messages.push(serde_json::json!({ "role": "user", "content": format!("Unknown or unhandled tool: {}", tool_call.name) }));
+
+                    if should_stop {
+                        break;
                     }
                 }
 
@@ -1196,64 +1248,60 @@ impl TaskRunner {
                 }
             }
 
-            if should_stop {
-                break;
+            if run.step_count >= max_steps && final_status != TaskStatus::Blocked {
+                risks.push("Step budget exhausted (max_steps)".into());
             }
-        }
 
-        if run.step_count >= max_steps && final_status != TaskStatus::Blocked {
-            risks.push("Step budget exhausted (max_steps)".into());
-        }
+            if cancel_token.is_cancelled() {
+                return Err(anyhow!("Task execution cancelled by user"));
+            }
 
-        if cancel_token.is_cancelled() {
-            return Err(anyhow!("Task execution cancelled by user"));
-        }
+            // Generate ReviewPacket from proposed/ tree vs live root
+            let proposed_dir = store.get_task_proposed_dir(&project.root_path, &task.id);
+            let mut rel_proposed_files = Vec::new();
+            let _ = list_dir_relative(&proposed_dir, &proposed_dir, &mut rel_proposed_files);
 
-        // Generate ReviewPacket from proposed/ tree vs live root
-        let proposed_dir = store.get_task_proposed_dir(&project.root_path, &task.id);
-        let mut rel_proposed_files = Vec::new();
-        let _ = list_dir_relative(&proposed_dir, &proposed_dir, &mut rel_proposed_files);
+            let mut diffs = Vec::new();
+            for rel_path in rel_proposed_files {
+                let proposed_file_path = proposed_dir.join(&rel_path);
+                let proposed_content = fs::read_to_string(&proposed_file_path).unwrap_or_default();
 
-        let mut diffs = Vec::new();
-        for rel_path in rel_proposed_files {
-            let proposed_file_path = proposed_dir.join(&rel_path);
-            let proposed_content = fs::read_to_string(&proposed_file_path).unwrap_or_default();
+                let original_content = if let Ok(live_path) =
+                    TaskRuntimeStore::validate_and_resolve_path(&project.root_path, &rel_path)
+                {
+                    fs::read_to_string(live_path).unwrap_or_default()
+                } else {
+                    "".to_string()
+                };
 
-            let original_content = if let Ok(live_path) =
-                TaskRuntimeStore::validate_and_resolve_path(&project.root_path, &rel_path)
-            {
-                fs::read_to_string(live_path).unwrap_or_default()
-            } else {
-                "".to_string()
+                let unified_diff = format!(
+                    "--- a/{0}\n+++ b/{0}\n@@ -0,0 +1,3 @@\n+{1}",
+                    rel_path,
+                    proposed_content.replace("\n", "\n+")
+                );
+
+                diffs.push(ReviewDiff {
+                    path: rel_path,
+                    unified_diff,
+                    original: original_content,
+                    proposed: proposed_content,
+                });
+            }
+
+            let review = ReviewPacket {
+                id: format!("rev_{}", Uuid::new_v4().simple()),
+                task_id: task.id.clone(),
+                run_id: run.id.clone(),
+                summary: format!("Proposed changes for task: {}", task.goal),
+                diffs,
+                commands: commands_executed,
+                checks,
+                risks,
+                created_at: Utc::now().to_rfc3339(),
             };
 
-            let unified_diff = format!(
-                "--- a/{0}\n+++ b/{0}\n@@ -0,0 +1,3 @@\n+{1}",
-                rel_path,
-                proposed_content.replace("\n", "\n+")
-            );
-
-            diffs.push(ReviewDiff {
-                path: rel_path,
-                unified_diff,
-                original: original_content,
-                proposed: proposed_content,
-            });
-        }
-
-        let review = ReviewPacket {
-            id: format!("rev_{}", Uuid::new_v4().simple()),
-            task_id: task.id.clone(),
-            run_id: run.id.clone(),
-            summary: format!("Proposed changes for task: {}", task.goal),
-            diffs,
-            commands: commands_executed,
-            checks,
-            risks,
-            created_at: Utc::now().to_rfc3339(),
-        };
-
-        Ok((review, final_status))
+            Ok((review, final_status))
+        })
     }
 }
 
