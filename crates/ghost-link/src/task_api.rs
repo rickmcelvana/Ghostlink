@@ -1,4 +1,5 @@
 use crate::backend_plugin;
+use crate::ollama::ChatMessage as OllamaChatMessage;
 use crate::task_runtime::{
     AgentBackend, AgentResponse, ProjectKind, TaskBudget, TaskStatus, ToolCall,
 };
@@ -14,6 +15,7 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
+use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -22,13 +24,130 @@ pub struct RealAgentBackend {
     pub state: Arc<std::sync::Mutex<BackendState>>,
 }
 
+pub fn build_tool_definitions(allowed_tools: &[String]) -> Vec<Value> {
+    let mut tools = Vec::new();
+
+    if allowed_tools.contains(&"write_file".to_string()) {
+        tools.push(json!({
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": "Write or overwrite a file in the project proposed staging directory.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Relative file path within project" },
+                        "content": { "type": "string", "description": "File contents" }
+                    },
+                    "required": ["path", "content"]
+                }
+            }
+        }));
+    }
+
+    if allowed_tools.contains(&"read_file".to_string()) {
+        tools.push(json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read file contents from proposed staging or live workspace.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Relative file path within project" }
+                    },
+                    "required": ["path"]
+                }
+            }
+        }));
+    }
+
+    if allowed_tools.contains(&"run_command".to_string())
+        || allowed_tools.contains(&"execute".to_string())
+    {
+        tools.push(json!({
+            "type": "function",
+            "function": {
+                "name": "run_command",
+                "description": "Execute a shell command evaluated through the deterministic Judge security policy.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "argv": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Command and arguments as array of strings"
+                        }
+                    },
+                    "required": ["argv"]
+                }
+            }
+        }));
+    }
+
+    if allowed_tools.contains(&"create_child_task".to_string())
+        || allowed_tools.contains(&"spawn_subagent".to_string())
+    {
+        tools.push(json!({
+            "type": "function",
+            "function": {
+                "name": "create_child_task",
+                "description": "Spawn a child subtask for a sub-goal (planner only).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "goal": { "type": "string", "description": "Goal for the child task" },
+                        "acceptance_criteria": { "type": "string", "description": "Optional acceptance criteria" }
+                    },
+                    "required": ["goal"]
+                }
+            }
+        }));
+    }
+
+    tools
+}
+
+pub fn parse_fallback_tool_calls(text: &str) -> Vec<ToolCall> {
+    let mut tool_calls = Vec::new();
+
+    let try_parse = |json_val: &Value, tcs: &mut Vec<ToolCall>| {
+        if let Some(arr) = json_val.get("tool_calls").and_then(|tc| tc.as_array()) {
+            for item in arr {
+                if let (Some(name), Some(args)) =
+                    (item.get("name").and_then(|n| n.as_str()), item.get("args"))
+                {
+                    tcs.push(ToolCall {
+                        id: format!("tc_{}", uuid::Uuid::new_v4().simple()),
+                        name: name.to_string(),
+                        args: args.clone(),
+                    });
+                }
+            }
+        }
+    };
+
+    if let Some(start) = text.find("{\"tool_calls\":") {
+        if let Some(end) = text[start..].rfind("]}") {
+            let candidate = &text[start..start + end + 2];
+            if let Ok(val) = serde_json::from_str::<Value>(candidate) {
+                try_parse(&val, &mut tool_calls);
+            }
+        }
+    }
+
+    if tool_calls.is_empty() {
+        if let Ok(val) = serde_json::from_str::<Value>(text.trim()) {
+            try_parse(&val, &mut tool_calls);
+        }
+    }
+
+    tool_calls
+}
+
 #[async_trait::async_trait]
 impl AgentBackend for RealAgentBackend {
-    async fn chat(
-        &self,
-        messages: &[serde_json::Value],
-        _allowed_tools: &[String],
-    ) -> Result<AgentResponse> {
+    async fn chat(&self, messages: &[Value], allowed_tools: &[String]) -> Result<AgentResponse> {
         let (
             model,
             native_engine_client,
@@ -50,19 +169,26 @@ impl AgentBackend for RealAgentBackend {
             )
         };
 
-        let mut prompt = String::new();
-        for msg in messages {
-            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
-            let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-            if !prompt.is_empty() {
-                prompt.push('\n');
-            }
-            prompt.push_str(role);
-            prompt.push_str(": ");
-            prompt.push_str(content);
-        }
+        let tool_defs = build_tool_definitions(allowed_tools);
+        let tools_option = if !tool_defs.is_empty() {
+            Some(tool_defs)
+        } else {
+            None
+        };
 
         if let Some(plugin) = plugin_registry.get(&settings.inference_backend) {
+            let mut prompt = String::new();
+            for msg in messages {
+                let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+                let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                if !prompt.is_empty() {
+                    prompt.push('\n');
+                }
+                prompt.push_str(role);
+                prompt.push_str(": ");
+                prompt.push_str(content);
+            }
+
             let res = plugin
                 .generate(backend_plugin::PluginGenerationRequest {
                     model,
@@ -75,34 +201,123 @@ impl AgentBackend for RealAgentBackend {
                 })
                 .await
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            let tool_calls = parse_fallback_tool_calls(&res.text);
+
             return Ok(AgentResponse {
                 content: Some(res.text),
-                tool_calls: vec![],
+                tool_calls,
             });
         }
 
         match inference_backend {
             InferenceEngine::Ollama => {
-                let res_text = ollama_client
-                    .generate(&model, &prompt, 0.7, 0.9, 40, 1.1, 1024)
+                let ollama_msgs: Vec<OllamaChatMessage> = messages
+                    .iter()
+                    .filter_map(|m| serde_json::from_value(m.clone()).ok())
+                    .collect();
+
+                let res = ollama_client
+                    .chat(
+                        &model,
+                        &ollama_msgs,
+                        Some(0.7),
+                        Some(0.9),
+                        Some(40),
+                        Some(1.1),
+                        Some(1024),
+                        tools_option.clone(),
+                        None,
+                    )
                     .await
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+                let mut tool_calls = Vec::new();
+                if let Some(raw_tcs) = res.message.tool_calls {
+                    for tc in raw_tcs {
+                        if let Some(func) = tc.get("function") {
+                            if let (Some(name), Some(args)) = (
+                                func.get("name").and_then(|n| n.as_str()),
+                                func.get("arguments"),
+                            ) {
+                                tool_calls.push(ToolCall {
+                                    id: format!("tc_{}", uuid::Uuid::new_v4().simple()),
+                                    name: name.to_string(),
+                                    args: args.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+
+                if tool_calls.is_empty() && !res.message.content.is_empty() {
+                    tool_calls = parse_fallback_tool_calls(&res.message.content);
+                }
+
                 Ok(AgentResponse {
-                    content: Some(res_text),
-                    tool_calls: vec![],
+                    content: Some(res.message.content),
+                    tool_calls,
                 })
             }
             InferenceEngine::Vllm => {
-                let res_text = vllm_client
-                    .generate(&model, &prompt, 0.7, 0.9, 40, 1.1, 1024)
+                let msgs_vec = messages.to_vec();
+                let res = vllm_client
+                    .chat(
+                        &model,
+                        msgs_vec,
+                        0.7,
+                        0.9,
+                        40,
+                        1.1,
+                        1024,
+                        tools_option.clone(),
+                        None,
+                    )
                     .await
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+                let mut tool_calls = Vec::new();
+                for tc in res.tool_calls {
+                    if let Ok(args_val) = serde_json::from_str::<Value>(&tc.function.arguments) {
+                        tool_calls.push(ToolCall {
+                            id: tc
+                                .id
+                                .unwrap_or_else(|| format!("tc_{}", uuid::Uuid::new_v4().simple())),
+                            name: tc.function.name,
+                            args: args_val,
+                        });
+                    }
+                }
+
+                if tool_calls.is_empty() && !res.content.is_empty() {
+                    tool_calls = parse_fallback_tool_calls(&res.content);
+                }
+
                 Ok(AgentResponse {
-                    content: Some(res_text),
-                    tool_calls: vec![],
+                    content: Some(res.content),
+                    tool_calls,
                 })
             }
             InferenceEngine::Native => {
+                let mut prompt = String::new();
+                for msg in messages {
+                    let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+                    let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                    if !prompt.is_empty() {
+                        prompt.push('\n');
+                    }
+                    prompt.push_str(role);
+                    prompt.push_str(": ");
+                    prompt.push_str(content);
+                }
+
+                if let Some(ref tool_defs) = tools_option {
+                    prompt.push_str("\n\nAvailable tools (if tool calls are required, respond with {\"tool_calls\": [{\"name\": \"...\", \"args\": {...}}]}):\n");
+                    if let Ok(tools_json) = serde_json::to_string_pretty(tool_defs) {
+                        prompt.push_str(&tools_json);
+                    }
+                }
+
                 let gen = native_engine_client
                     .generate(
                         &model,
@@ -121,20 +336,7 @@ impl AgentBackend for RealAgentBackend {
                     .await
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-                let mut tool_calls = Vec::new();
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&gen.text) {
-                    if let Some(tc) = v.get("tool_call") {
-                        if let (Some(name), Some(args)) =
-                            (tc.get("name").and_then(|n| n.as_str()), tc.get("args"))
-                        {
-                            tool_calls.push(ToolCall {
-                                id: format!("tc_{}", uuid::Uuid::new_v4().simple()),
-                                name: name.to_string(),
-                                args: args.clone(),
-                            });
-                        }
-                    }
-                }
+                let tool_calls = parse_fallback_tool_calls(&gen.text);
 
                 Ok(AgentResponse {
                     content: Some(gen.text),
@@ -524,4 +726,50 @@ pub fn router() -> Router<Arc<std::sync::Mutex<BackendState>>> {
         .route("/api/tasks/:id/events", get(handle_get_task_events))
         .route("/api/tasks/:id/review", get(handle_get_task_review))
         .route("/api/reviews/:id/decide", post(handle_decide_review))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_fallback_tool_calls_single_and_multiple() {
+        let text_single =
+            r#"{"tool_calls":[{"name":"write_file","args":{"path":"a.txt","content":"hello"}}]}"#;
+        let tcs = parse_fallback_tool_calls(text_single);
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].name, "write_file");
+        assert_eq!(tcs[0].args["path"], "a.txt");
+
+        let text_multi = r#"Prose before... {"tool_calls":[{"name":"read_file","args":{"path":"b.txt"}},{"name":"run_command","args":{"argv":["ls"]}}]} prose after"#;
+        let tcs_multi = parse_fallback_tool_calls(text_multi);
+        assert_eq!(tcs_multi.len(), 2);
+        assert_eq!(tcs_multi[0].name, "read_file");
+        assert_eq!(tcs_multi[1].name, "run_command");
+    }
+
+    #[test]
+    fn test_parse_fallback_tool_calls_rejects_single_object() {
+        let single_obj = r#"{"tool_call":{"name":"write_file","args":{"path":"a.txt"}}}"#;
+        let tcs = parse_fallback_tool_calls(single_obj);
+        assert!(
+            tcs.is_empty(),
+            "Single tool_call object should be rejected in favor of tool_calls array"
+        );
+    }
+
+    #[test]
+    fn test_build_tool_definitions_filters_by_allowed_tools() {
+        let allowed = vec!["write_file".to_string(), "read_file".to_string()];
+        let defs = build_tool_definitions(&allowed);
+        assert_eq!(defs.len(), 2);
+        let names: Vec<&str> = defs
+            .iter()
+            .filter_map(|d| d.get("function")?.get("name")?.as_str())
+            .collect();
+        assert!(names.contains(&"write_file"));
+        assert!(names.contains(&"read_file"));
+        assert!(!names.contains(&"run_command"));
+        assert!(!names.contains(&"create_child_task"));
+    }
 }
