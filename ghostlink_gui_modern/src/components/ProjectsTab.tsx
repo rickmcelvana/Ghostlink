@@ -175,8 +175,8 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({ api: propApi }) => {
                     key={t.id}
                     onClick={() => setActiveTask(t)}
                     className={`w-full text-left p-3 rounded-lg text-xs transition flex flex-col gap-1.5 ${
-                      activeTask?.id === t.id ? 'bg-indigo-600/20 text-indigo-300 border border-indigo-500/30' : 'text-slate-300 hover:bg-slate-800'
-                    }`}
+                      t.parent_id ? 'ml-3 border-l-2 border-indigo-500/50 pl-2.5' : ''
+                    } ${activeTask?.id === t.id ? 'bg-indigo-600/20 text-indigo-300 border border-indigo-500/30' : 'text-slate-300 hover:bg-slate-800'}`}
                   >
                     <div className="flex items-center justify-between">
                       <span

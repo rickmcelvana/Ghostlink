@@ -464,6 +464,15 @@ impl TaskRuntimeStore {
         Ok(tasks)
     }
 
+    pub fn list_child_tasks(&self, parent_id: &str) -> Result<Vec<Task>> {
+        let parent = self.get_task(parent_id)?;
+        let all_tasks = self.list_project_tasks(&parent.project_id)?;
+        Ok(all_tasks
+            .into_iter()
+            .filter(|t| t.parent_id.as_deref() == Some(parent_id))
+            .collect())
+    }
+
     pub fn get_task(&self, id: &str) -> Result<Task> {
         let file_path = self.data_dir.join("tasks").join(format!("{}.json", id));
         if !file_path.exists() {
@@ -679,12 +688,58 @@ impl TaskRuntimeStore {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub args: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentResponse {
+    pub content: Option<String>,
+    pub tool_calls: Vec<ToolCall>,
+}
+
+#[async_trait::async_trait]
+pub trait AgentBackend: Send + Sync {
+    async fn chat(
+        &self,
+        messages: &[serde_json::Value],
+        allowed_tools: &[String],
+    ) -> Result<AgentResponse>;
+}
+
+// Helper to recursively list relative paths in a directory
+fn list_dir_relative(
+    base_dir: &Path,
+    current_dir: &Path,
+    rel_paths: &mut Vec<String>,
+) -> Result<()> {
+    if !current_dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(current_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            list_dir_relative(base_dir, &path, rel_paths)?;
+        } else if path.is_file() {
+            if let Ok(rel) = path.strip_prefix(base_dir) {
+                rel_paths.push(rel.to_string_lossy().to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
 // Implementer Loop Runner
 pub struct TaskRunner;
 
 impl TaskRunner {
     pub async fn spawn_implementer(
         store: Arc<TaskRuntimeStore>,
+        backend: Arc<dyn AgentBackend>,
         task: Task,
         role: String,
         model: String,
@@ -716,6 +771,7 @@ impl TaskRunner {
         tokio::spawn(async move {
             let res = Self::run_loop(
                 store_clone.clone(),
+                backend,
                 task_clone.clone(),
                 &mut run_clone,
                 brief,
@@ -777,6 +833,7 @@ impl TaskRunner {
 
     async fn run_loop(
         store: Arc<TaskRuntimeStore>,
+        backend: Arc<dyn AgentBackend>,
         task: Task,
         run: &mut AgentRun,
         brief: Option<String>,
@@ -796,114 +853,400 @@ impl TaskRunner {
         let mut risks = Vec::new();
         let mut final_status = TaskStatus::NeedsReview;
 
-        // Perform initial file analysis / proposed writes
-        let sample_rel_path = "src/task_output.txt";
-        let prompt_summary = brief.unwrap_or_else(|| task.goal.clone());
-        let proposed_content = format!(
-            "Task Goal: {}\nExecution Brief: {}\nCompleted via Ghostlink Task Runtime.",
-            task.goal, prompt_summary
+        let start_time = std::time::Instant::now();
+
+        // Build initial messages
+        let system_prompt = format!(
+            "You are an AI task agent implementing project '{}' at root path '{}'. Use available tools to write proposed files and execute checks.",
+            project.name, project.root_path
         );
 
+        let mut user_prompt = format!("Task Goal: {}\n", task.goal);
+        if let Some(b) = &brief {
+            user_prompt.push_str(&format!("Execution Brief: {}\n", b));
+        }
+        if let Some(ac) = &task.acceptance_criteria {
+            user_prompt.push_str(&format!("Acceptance Criteria: {}\n", ac));
+        }
+
+        let mut messages = vec![
+            serde_json::json!({ "role": "system", "content": system_prompt }),
+            serde_json::json!({ "role": "user", "content": user_prompt }),
+        ];
+
+        let max_steps = task.budget.max_steps;
+        let max_minutes = task.budget.max_minutes as u64;
+
+        for _step in 1..=max_steps {
+            if cancel_token.is_cancelled() {
+                return Err(anyhow!("Task execution cancelled by user"));
+            }
+
+            if start_time.elapsed().as_secs() > max_minutes * 60 {
+                risks.push("Exceeded time budget (max_minutes)".into());
+                break;
+            }
+
+            if let Some(max_tok) = task.budget.max_tokens {
+                if run.token_count >= max_tok {
+                    risks.push("Exceeded token budget (max_tokens)".into());
+                    break;
+                }
+            }
+
+            run.step_count += 1;
+            store.emit_event(TaskEvent {
+                task_id: task.id.clone(),
+                ts: Utc::now().timestamp_millis() as u64,
+                kind: "step".into(),
+                payload: serde_json::json!({ "step": run.step_count, "description": format!("Agent step {}", run.step_count) }),
+            });
+
+            // Call model via AgentBackend
+            let agent_resp = match backend.chat(&messages, &project.allowed_tools).await {
+                Ok(resp) => resp,
+                Err(err) => {
+                    risks.push(format!("Backend inference error: {}", err));
+                    break;
+                }
+            };
+
+            // Estimate tokens
+            let content_str = agent_resp.content.clone().unwrap_or_default();
+            run.token_count += (content_str.len() / 4).max(10) as u32;
+
+            if !content_str.is_empty() {
+                messages.push(serde_json::json!({ "role": "assistant", "content": content_str }));
+            }
+
+            if agent_resp.tool_calls.is_empty() {
+                break;
+            }
+
+            let mut should_stop = false;
+
+            for tool_call in agent_resp.tool_calls {
+                store.emit_event(TaskEvent {
+                    task_id: task.id.clone(),
+                    ts: Utc::now().timestamp_millis() as u64,
+                    kind: "tool".into(),
+                    payload: serde_json::json!({ "name": tool_call.name, "args": tool_call.args }),
+                });
+
+                match tool_call.name.as_str() {
+                    "spawn_subagent" | "create_child_task" => {
+                        if run.role != "planner" {
+                            risks.push("Implementer agent tried to spawn subagent (denied)".into());
+                            messages.push(serde_json::json!({ "role": "user", "content": "Error: implementer agents cannot spawn subagents" }));
+                            continue;
+                        }
+
+                        let child_goal = tool_call
+                            .args
+                            .get("goal")
+                            .and_then(|g| g.as_str())
+                            .unwrap_or("");
+                        let child_criteria = tool_call
+                            .args
+                            .get("acceptance_criteria")
+                            .and_then(|c| c.as_str());
+
+                        if child_goal.is_empty() {
+                            messages.push(serde_json::json!({ "role": "user", "content": "Error: goal cannot be empty for child task" }));
+                            continue;
+                        }
+
+                        let elapsed_mins = (start_time.elapsed().as_secs() / 60) as u32;
+                        let rem_mins = task.budget.max_minutes.saturating_sub(elapsed_mins).max(1);
+                        let rem_steps = task.budget.max_steps.saturating_sub(run.step_count).max(1);
+                        let rem_tokens = task
+                            .budget
+                            .max_tokens
+                            .map(|mt| mt.saturating_sub(run.token_count));
+
+                        let child_budget = TaskBudget {
+                            max_steps: rem_steps,
+                            max_tokens: rem_tokens,
+                            max_minutes: rem_mins,
+                        };
+
+                        match store.create_task(
+                            &project.id,
+                            child_goal.to_string(),
+                            child_criteria.map(|s| s.to_string()),
+                            Some(child_budget),
+                            Some(task.id.clone()),
+                        ) {
+                            Ok(child) => {
+                                store.emit_event(TaskEvent {
+                                    task_id: task.id.clone(),
+                                    ts: Utc::now().timestamp_millis() as u64,
+                                    kind: "child_created".into(),
+                                    payload: serde_json::json!({ "child_id": child.id, "goal": child.goal }),
+                                });
+                                messages.push(serde_json::json!({ "role": "user", "content": format!("Successfully created child task #{} ({})", child.id, child.goal) }));
+                            }
+                            Err(e) => {
+                                risks.push(format!("Failed to create child task: {}", e));
+                                messages.push(serde_json::json!({ "role": "user", "content": format!("Failed to create child task: {}", e) }));
+                            }
+                        }
+                    }
+                    "write_file" => {
+                        let rel_path = tool_call
+                            .args
+                            .get("path")
+                            .and_then(|p| p.as_str())
+                            .unwrap_or("");
+                        let file_content = tool_call
+                            .args
+                            .get("content")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("");
+
+                        if rel_path.is_empty() {
+                            risks.push("write_file tool called with empty path".into());
+                            messages.push(serde_json::json!({ "role": "user", "content": "Error: write_file path is empty" }));
+                            continue;
+                        }
+
+                        if !project.allowed_tools.contains(&"write_file".to_string()) {
+                            risks.push("write_file tool not allowed by project policy".into());
+                            messages.push(serde_json::json!({ "role": "user", "content": "Error: write_file tool is disabled for this project" }));
+                            continue;
+                        }
+
+                        match store.write_proposed_file(
+                            &project.root_path,
+                            &task.id,
+                            rel_path,
+                            file_content,
+                        ) {
+                            Ok(_) => {
+                                store.emit_event(TaskEvent {
+                                    task_id: task.id.clone(),
+                                    ts: Utc::now().timestamp_millis() as u64,
+                                    kind: "file".into(),
+                                    payload: serde_json::json!({ "path": rel_path, "action": "write_proposed" }),
+                                });
+                                messages.push(serde_json::json!({ "role": "user", "content": format!("Successfully wrote proposed file {}", rel_path) }));
+                            }
+                            Err(e) => {
+                                risks.push(format!(
+                                    "Failed writing proposed file {}: {}",
+                                    rel_path, e
+                                ));
+                                messages.push(serde_json::json!({ "role": "user", "content": format!("Error writing proposed file {}: {}", rel_path, e) }));
+                            }
+                        }
+                    }
+                    "read_file" => {
+                        let rel_path = tool_call
+                            .args
+                            .get("path")
+                            .and_then(|p| p.as_str())
+                            .unwrap_or("");
+                        let proposed_file = store
+                            .get_task_proposed_dir(&project.root_path, &task.id)
+                            .join(rel_path);
+                        let file_text = if proposed_file.exists() {
+                            fs::read_to_string(&proposed_file).unwrap_or_default()
+                        } else if let Ok(live_p) = TaskRuntimeStore::validate_and_resolve_path(
+                            &project.root_path,
+                            rel_path,
+                        ) {
+                            fs::read_to_string(&live_p).unwrap_or_default()
+                        } else {
+                            "File not found".to_string()
+                        };
+                        messages.push(serde_json::json!({ "role": "user", "content": format!("File content of {}:\n{}", rel_path, file_text) }));
+                    }
+                    "run_command" | "exec" | "execute" | "shell" => {
+                        let argv: Vec<String> = if let Some(arr) =
+                            tool_call.args.get("argv").and_then(|a| a.as_array())
+                        {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect()
+                        } else if let Some(cmd_str) =
+                            tool_call.args.get("command").and_then(|c| c.as_str())
+                        {
+                            cmd_str.split_whitespace().map(|s| s.to_string()).collect()
+                        } else {
+                            vec![]
+                        };
+
+                        if argv.is_empty() {
+                            messages.push(serde_json::json!({ "role": "user", "content": "Error: empty command" }));
+                            continue;
+                        }
+
+                        let judge_eval = Judge::evaluate(&argv);
+                        store.emit_event(TaskEvent {
+                            task_id: task.id.clone(),
+                            ts: Utc::now().timestamp_millis() as u64,
+                            kind: "judge".into(),
+                            payload: serde_json::json!({ "argv": argv, "decision": format!("{:?}", judge_eval) }),
+                        });
+
+                        match judge_eval {
+                            JudgeResult::Allow => {
+                                if !project.allowed_tools.contains(&"run_command".to_string())
+                                    && !project.allowed_tools.contains(&"execute".to_string())
+                                {
+                                    risks.push(
+                                        "Command execution tool not allowed by project policy"
+                                            .into(),
+                                    );
+                                    messages.push(serde_json::json!({ "role": "user", "content": "Error: command execution is disabled for this project" }));
+                                    continue;
+                                }
+
+                                let output_res = tokio::process::Command::new(&argv[0])
+                                    .args(&argv[1..])
+                                    .current_dir(&project.root_path)
+                                    .output()
+                                    .await;
+
+                                match output_res {
+                                    Ok(output) => {
+                                        let exit_code = output.status.code().unwrap_or(-1);
+                                        let stdout = String::from_utf8_lossy(&output.stdout);
+                                        let stderr = String::from_utf8_lossy(&output.stderr);
+                                        let excerpt =
+                                            format!("STDOUT:\n{}\nSTDERR:\n{}", stdout, stderr);
+                                        let trimmed_excerpt = if excerpt.len() > 1000 {
+                                            format!("{}...\n(truncated)", &excerpt[..1000])
+                                        } else {
+                                            excerpt
+                                        };
+
+                                        commands_executed.push(ReviewCommand {
+                                            argv: argv.clone(),
+                                            judge: JudgeDecision::Allow,
+                                            exit: exit_code,
+                                            excerpt: trimmed_excerpt.clone(),
+                                        });
+
+                                        if exit_code == 0 {
+                                            checks.push(format!("Passed: {}", argv.join(" ")));
+                                        } else {
+                                            risks.push(format!(
+                                                "Command failed (exit {}): {}",
+                                                exit_code,
+                                                argv.join(" ")
+                                            ));
+                                        }
+
+                                        messages.push(serde_json::json!({
+                                            "role": "user",
+                                            "content": format!("Command '{}' exited with {}:\n{}", argv.join(" "), exit_code, trimmed_excerpt)
+                                        }));
+                                    }
+                                    Err(e) => {
+                                        commands_executed.push(ReviewCommand {
+                                            argv: argv.clone(),
+                                            judge: JudgeDecision::Allow,
+                                            exit: -1,
+                                            excerpt: format!("Failed to spawn command: {}", e),
+                                        });
+                                        risks.push(format!(
+                                            "Failed to execute command {}: {}",
+                                            argv.join(" "),
+                                            e
+                                        ));
+                                        messages.push(serde_json::json!({ "role": "user", "content": format!("Failed to execute command: {}", e) }));
+                                    }
+                                }
+                            }
+                            JudgeResult::Deny => {
+                                commands_executed.push(ReviewCommand {
+                                    argv: argv.clone(),
+                                    judge: JudgeDecision::Deny,
+                                    exit: -1,
+                                    excerpt: "Command denied by Judge security policy".into(),
+                                });
+                                risks.push(format!(
+                                    "Denied unsafe command execution: {}",
+                                    argv.join(" ")
+                                ));
+                                messages.push(serde_json::json!({ "role": "user", "content": "Command denied by Judge security policy" }));
+                            }
+                            JudgeResult::Pause => {
+                                final_status = TaskStatus::Blocked;
+                                commands_executed.push(ReviewCommand {
+                                    argv: argv.clone(),
+                                    judge: JudgeDecision::Pause,
+                                    exit: -1,
+                                    excerpt: "Command execution paused pending approval".into(),
+                                });
+                                risks.push("Command requires human approval".into());
+                                messages.push(serde_json::json!({ "role": "user", "content": "Command paused pending human approval" }));
+                                should_stop = true;
+                            }
+                        }
+                    }
+                    _ => {
+                        messages.push(serde_json::json!({ "role": "user", "content": format!("Unknown or unhandled tool: {}", tool_call.name) }));
+                    }
+                }
+
+                if should_stop {
+                    break;
+                }
+            }
+
+            if should_stop {
+                break;
+            }
+        }
+
+        if run.step_count >= max_steps && final_status != TaskStatus::Blocked {
+            risks.push("Step budget exhausted (max_steps)".into());
+        }
+
         if cancel_token.is_cancelled() {
             return Err(anyhow!("Task execution cancelled by user"));
         }
 
-        run.step_count += 1;
-        store.emit_event(TaskEvent {
-            task_id: task.id.clone(),
-            ts: Utc::now().timestamp_millis() as u64,
-            kind: "step".into(),
-            payload: serde_json::json!({ "step": run.step_count, "description": "Generating proposed changes" }),
-        });
+        // Generate ReviewPacket from proposed/ tree vs live root
+        let proposed_dir = store.get_task_proposed_dir(&project.root_path, &task.id);
+        let mut rel_proposed_files = Vec::new();
+        let _ = list_dir_relative(&proposed_dir, &proposed_dir, &mut rel_proposed_files);
 
-        // Write proposed file into staging
-        let _proposed_path = store.write_proposed_file(
-            &project.root_path,
-            &task.id,
-            sample_rel_path,
-            &proposed_content,
-        )?;
+        let mut diffs = Vec::new();
+        for rel_path in rel_proposed_files {
+            let proposed_file_path = proposed_dir.join(&rel_path);
+            let proposed_content = fs::read_to_string(&proposed_file_path).unwrap_or_default();
 
-        store.emit_event(TaskEvent {
-            task_id: task.id.clone(),
-            ts: Utc::now().timestamp_millis() as u64,
-            kind: "file".into(),
-            payload: serde_json::json!({ "path": sample_rel_path, "action": "write_proposed" }),
-        });
+            let original_content = if let Ok(live_path) =
+                TaskRuntimeStore::validate_and_resolve_path(&project.root_path, &rel_path)
+            {
+                fs::read_to_string(live_path).unwrap_or_default()
+            } else {
+                "".to_string()
+            };
 
-        // Simulate test/check tool execution with Judge
-        let test_cmd = vec!["cargo".to_string(), "check".to_string()];
-        let judge_eval = Judge::evaluate(&test_cmd);
-
-        store.emit_event(TaskEvent {
-            task_id: task.id.clone(),
-            ts: Utc::now().timestamp_millis() as u64,
-            kind: "judge".into(),
-            payload: serde_json::json!({ "argv": test_cmd, "decision": format!("{:?}", judge_eval) }),
-        });
-
-        match judge_eval {
-            JudgeResult::Allow => {
-                commands_executed.push(ReviewCommand {
-                    argv: test_cmd,
-                    judge: JudgeDecision::Allow,
-                    exit: 0,
-                    excerpt: "Verification check succeeded".into(),
-                });
-                checks.push("Verification check passed".into());
-            }
-            JudgeResult::Pause => {
-                final_status = TaskStatus::Blocked;
-                commands_executed.push(ReviewCommand {
-                    argv: test_cmd,
-                    judge: JudgeDecision::Pause,
-                    exit: -1,
-                    excerpt: "Command execution paused pending approval".into(),
-                });
-                risks.push("Command requires human approval".into());
-            }
-            JudgeResult::Deny => {
-                final_status = TaskStatus::Blocked;
-                commands_executed.push(ReviewCommand {
-                    argv: test_cmd,
-                    judge: JudgeDecision::Deny,
-                    exit: -1,
-                    excerpt: "Command denied by Judge security policy".into(),
-                });
-                risks.push("Denied unsafe command execution".into());
-            }
-        }
-
-        if cancel_token.is_cancelled() {
-            return Err(anyhow!("Task execution cancelled by user"));
-        }
-
-        // Generate ReviewDiff
-        let original_content = if let Ok(live_path) =
-            TaskRuntimeStore::validate_and_resolve_path(&project.root_path, sample_rel_path)
-        {
-            fs::read_to_string(live_path).unwrap_or_default()
-        } else {
-            "".into()
-        };
-
-        let diff = ReviewDiff {
-            path: sample_rel_path.to_string(),
-            unified_diff: format!(
+            let unified_diff = format!(
                 "--- a/{0}\n+++ b/{0}\n@@ -0,0 +1,3 @@\n+{1}",
-                sample_rel_path,
+                rel_path,
                 proposed_content.replace("\n", "\n+")
-            ),
-            original: original_content,
-            proposed: proposed_content,
-        };
+            );
+
+            diffs.push(ReviewDiff {
+                path: rel_path,
+                unified_diff,
+                original: original_content,
+                proposed: proposed_content,
+            });
+        }
 
         let review = ReviewPacket {
             id: format!("rev_{}", Uuid::new_v4().simple()),
             task_id: task.id.clone(),
             run_id: run.id.clone(),
             summary: format!("Proposed changes for task: {}", task.goal),
-            diffs: vec![diff],
+            diffs,
             commands: commands_executed,
             checks,
             risks,
@@ -911,6 +1254,403 @@ impl TaskRunner {
         };
 
         Ok((review, final_status))
+    }
+}
+
+#[cfg(test)]
+pub struct FakeBackend {
+    pub responses: Arc<Mutex<Vec<AgentResponse>>>,
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl AgentBackend for FakeBackend {
+    async fn chat(
+        &self,
+        _messages: &[serde_json::Value],
+        _allowed_tools: &[String],
+    ) -> Result<AgentResponse> {
+        let mut guard = self.responses.lock().await;
+        if guard.is_empty() {
+            Ok(AgentResponse {
+                content: Some("Finished".into()),
+                tool_calls: vec![],
+            })
+        } else {
+            Ok(guard.remove(0))
+        }
+    }
+}
+
+#[cfg(test)]
+mod slice1_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_fake_backend_write_file_and_acceptance() {
+        let temp_dir = std::env::temp_dir().join(format!("ghostlink_slice1_{}", Uuid::new_v4()));
+        let store = Arc::new(TaskRuntimeStore::new(&temp_dir).unwrap());
+
+        let proj_dir =
+            std::env::temp_dir().join(format!("ghostlink_slice1_proj_{}", Uuid::new_v4()));
+        fs::create_dir_all(&proj_dir).unwrap();
+        let root_str = proj_dir.to_string_lossy().to_string();
+
+        let proj = store
+            .create_project(
+                "Slice1 Proj".into(),
+                ProjectKind::Code,
+                root_str.clone(),
+                None,
+                None,
+            )
+            .unwrap();
+        let task = store
+            .create_task(&proj.id, "Create output file".into(), None, None, None)
+            .unwrap();
+
+        let fake_backend = Arc::new(FakeBackend {
+            responses: Arc::new(Mutex::new(vec![
+                AgentResponse {
+                    content: Some("Writing file".into()),
+                    tool_calls: vec![ToolCall {
+                        id: "tc_1".into(),
+                        name: "write_file".into(),
+                        args: serde_json::json!({
+                            "path": "test_output.txt",
+                            "content": "Hello Slice 1"
+                        }),
+                    }],
+                },
+                AgentResponse {
+                    content: Some("All done".into()),
+                    tool_calls: vec![],
+                },
+            ])),
+        });
+
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        let mut run = AgentRun {
+            id: format!("run_{}", Uuid::new_v4().simple()),
+            task_id: task.id.clone(),
+            role: "implementer".into(),
+            model: "mock-model".into(),
+            status: "running".into(),
+            step_count: 0,
+            token_count: 0,
+            started_at: Utc::now().to_rfc3339(),
+            finished_at: None,
+            error: None,
+        };
+
+        let (review, final_status) = TaskRunner::run_loop(
+            store.clone(),
+            fake_backend,
+            task.clone(),
+            &mut run,
+            None,
+            cancel_token,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(final_status, TaskStatus::NeedsReview);
+        assert_eq!(review.diffs.len(), 1);
+        assert_eq!(review.diffs[0].path, "test_output.txt");
+
+        let proposed_file = store
+            .get_task_proposed_dir(&root_str, &task.id)
+            .join("test_output.txt");
+        let live_file = proj_dir.join("test_output.txt");
+
+        assert!(proposed_file.exists());
+        assert!(!live_file.exists());
+
+        store.apply_proposed_changes(&root_str, &task.id).unwrap();
+        assert!(live_file.exists());
+        assert_eq!(fs::read_to_string(live_file).unwrap(), "Hello Slice 1");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+        let _ = fs::remove_dir_all(&proj_dir);
+    }
+
+    #[tokio::test]
+    async fn test_judge_deny_tool_is_not_executed() {
+        let temp_dir = std::env::temp_dir().join(format!("ghostlink_deny_{}", Uuid::new_v4()));
+        let store = Arc::new(TaskRuntimeStore::new(&temp_dir).unwrap());
+
+        let proj_dir = std::env::temp_dir().join(format!("ghostlink_deny_proj_{}", Uuid::new_v4()));
+        fs::create_dir_all(&proj_dir).unwrap();
+
+        let proj = store
+            .create_project(
+                "Deny Proj".into(),
+                ProjectKind::Code,
+                proj_dir.to_string_lossy().to_string(),
+                None,
+                None,
+            )
+            .unwrap();
+        let task = store
+            .create_task(&proj.id, "Try dangerous command".into(), None, None, None)
+            .unwrap();
+
+        let fake_backend = Arc::new(FakeBackend {
+            responses: Arc::new(Mutex::new(vec![AgentResponse {
+                content: Some("Exec rm".into()),
+                tool_calls: vec![ToolCall {
+                    id: "tc_deny".into(),
+                    name: "run_command".into(),
+                    args: serde_json::json!({
+                        "argv": ["rm", "-rf", "/"]
+                    }),
+                }],
+            }])),
+        });
+
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        let mut run = AgentRun {
+            id: format!("run_{}", Uuid::new_v4().simple()),
+            task_id: task.id.clone(),
+            role: "implementer".into(),
+            model: "mock-model".into(),
+            status: "running".into(),
+            step_count: 0,
+            token_count: 0,
+            started_at: Utc::now().to_rfc3339(),
+            finished_at: None,
+            error: None,
+        };
+
+        let (review, _status) = TaskRunner::run_loop(
+            store.clone(),
+            fake_backend,
+            task.clone(),
+            &mut run,
+            None,
+            cancel_token,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(review.commands.len(), 1);
+        assert_eq!(review.commands[0].judge, JudgeDecision::Deny);
+        assert!(review
+            .risks
+            .iter()
+            .any(|r| r.contains("Denied unsafe command")));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+        let _ = fs::remove_dir_all(&proj_dir);
+    }
+
+    #[tokio::test]
+    async fn test_judge_pause_sets_blocked() {
+        let temp_dir = std::env::temp_dir().join(format!("ghostlink_pause_{}", Uuid::new_v4()));
+        let store = Arc::new(TaskRuntimeStore::new(&temp_dir).unwrap());
+
+        let proj_dir =
+            std::env::temp_dir().join(format!("ghostlink_pause_proj_{}", Uuid::new_v4()));
+        fs::create_dir_all(&proj_dir).unwrap();
+
+        let proj = store
+            .create_project(
+                "Pause Proj".into(),
+                ProjectKind::Code,
+                proj_dir.to_string_lossy().to_string(),
+                None,
+                None,
+            )
+            .unwrap();
+        let task = store
+            .create_task(&proj.id, "Try unknown command".into(), None, None, None)
+            .unwrap();
+
+        let fake_backend = Arc::new(FakeBackend {
+            responses: Arc::new(Mutex::new(vec![AgentResponse {
+                content: Some("Exec custom".into()),
+                tool_calls: vec![ToolCall {
+                    id: "tc_pause".into(),
+                    name: "run_command".into(),
+                    args: serde_json::json!({
+                        "argv": ["custom_unknown_binary", "--arg"]
+                    }),
+                }],
+            }])),
+        });
+
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        let mut run = AgentRun {
+            id: format!("run_{}", Uuid::new_v4().simple()),
+            task_id: task.id.clone(),
+            role: "implementer".into(),
+            model: "mock-model".into(),
+            status: "running".into(),
+            step_count: 0,
+            token_count: 0,
+            started_at: Utc::now().to_rfc3339(),
+            finished_at: None,
+            error: None,
+        };
+
+        let (review, final_status) = TaskRunner::run_loop(
+            store.clone(),
+            fake_backend,
+            task.clone(),
+            &mut run,
+            None,
+            cancel_token,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(final_status, TaskStatus::Blocked);
+        assert_eq!(review.commands.len(), 1);
+        assert_eq!(review.commands[0].judge, JudgeDecision::Pause);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+        let _ = fs::remove_dir_all(&proj_dir);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_mid_loop_sets_cancelled() {
+        let temp_dir = std::env::temp_dir().join(format!("ghostlink_cancel_{}", Uuid::new_v4()));
+        let store = Arc::new(TaskRuntimeStore::new(&temp_dir).unwrap());
+
+        let proj_dir =
+            std::env::temp_dir().join(format!("ghostlink_cancel_proj_{}", Uuid::new_v4()));
+        fs::create_dir_all(&proj_dir).unwrap();
+
+        let proj = store
+            .create_project(
+                "Cancel Proj".into(),
+                ProjectKind::Code,
+                proj_dir.to_string_lossy().to_string(),
+                None,
+                None,
+            )
+            .unwrap();
+        let task = store
+            .create_task(&proj.id, "Cancel task".into(), None, None, None)
+            .unwrap();
+
+        let fake_backend = Arc::new(FakeBackend {
+            responses: Arc::new(Mutex::new(vec![AgentResponse {
+                content: Some("Step 1".into()),
+                tool_calls: vec![],
+            }])),
+        });
+
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        cancel_token.cancel();
+
+        let mut run = AgentRun {
+            id: format!("run_{}", Uuid::new_v4().simple()),
+            task_id: task.id.clone(),
+            role: "implementer".into(),
+            model: "mock-model".into(),
+            status: "running".into(),
+            step_count: 0,
+            token_count: 0,
+            started_at: Utc::now().to_rfc3339(),
+            finished_at: None,
+            error: None,
+        };
+
+        let res = TaskRunner::run_loop(
+            store.clone(),
+            fake_backend,
+            task.clone(),
+            &mut run,
+            None,
+            cancel_token,
+        )
+        .await;
+
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("cancelled"));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+        let _ = fs::remove_dir_all(&proj_dir);
+    }
+
+    #[tokio::test]
+    async fn test_budget_max_steps_stops_and_emits_review() {
+        let temp_dir = std::env::temp_dir().join(format!("ghostlink_budget_{}", Uuid::new_v4()));
+        let store = Arc::new(TaskRuntimeStore::new(&temp_dir).unwrap());
+
+        let proj_dir =
+            std::env::temp_dir().join(format!("ghostlink_budget_proj_{}", Uuid::new_v4()));
+        fs::create_dir_all(&proj_dir).unwrap();
+
+        let proj = store
+            .create_project(
+                "Budget Proj".into(),
+                ProjectKind::Code,
+                proj_dir.to_string_lossy().to_string(),
+                None,
+                None,
+            )
+            .unwrap();
+        let budget = TaskBudget {
+            max_steps: 1,
+            ..Default::default()
+        };
+
+        let task = store
+            .create_task(&proj.id, "Budget task".into(), None, Some(budget), None)
+            .unwrap();
+
+        let fake_backend = Arc::new(FakeBackend {
+            responses: Arc::new(Mutex::new(vec![
+                AgentResponse {
+                    content: Some("Step 1".into()),
+                    tool_calls: vec![ToolCall {
+                        id: "tc_1".into(),
+                        name: "read_file".into(),
+                        args: serde_json::json!({ "path": "nonexistent.txt" }),
+                    }],
+                },
+                AgentResponse {
+                    content: Some("Step 2 - should not run".into()),
+                    tool_calls: vec![],
+                },
+            ])),
+        });
+
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        let mut run = AgentRun {
+            id: format!("run_{}", Uuid::new_v4().simple()),
+            task_id: task.id.clone(),
+            role: "implementer".into(),
+            model: "mock-model".into(),
+            status: "running".into(),
+            step_count: 0,
+            token_count: 0,
+            started_at: Utc::now().to_rfc3339(),
+            finished_at: None,
+            error: None,
+        };
+
+        let (review, _status) = TaskRunner::run_loop(
+            store.clone(),
+            fake_backend,
+            task.clone(),
+            &mut run,
+            None,
+            cancel_token,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(run.step_count, 1);
+        assert!(review
+            .risks
+            .iter()
+            .any(|r| r.contains("Step budget exhausted")));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+        let _ = fs::remove_dir_all(&proj_dir);
     }
 }
 
