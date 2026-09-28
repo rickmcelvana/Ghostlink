@@ -174,7 +174,16 @@ export const TaskView: React.FC<TaskViewProps> = ({ task, api: propApi, onRefres
       {/* Embedded ReviewPane when needs_review or review exists */}
       {review && (
         <div className="h-[600px]">
-          <ReviewPane packet={review} api={api} onDecided={onRefresh} />
+
+      {/* Phase B: Child Tasks & Fan-out status chips */}
+      {task.parent_id && (
+        <div className="mt-3 flex items-center gap-2 text-xs text-slate-400 bg-slate-900/50 p-2 rounded border border-slate-800">
+          <Layers className="w-3.5 h-3.5 text-indigo-400" />
+          <span>Child task of parent: <code className="text-indigo-300">{task.parent_id}</code></span>
+        </div>
+      )}
+
+      <ReviewPane packet={review} api={api} onDecided={onRefresh} />
         </div>
       )}
 
