@@ -44,7 +44,11 @@ export const TaskView: React.FC<TaskViewProps> = ({ task, api: propApi, onRefres
 
   // Connect to SSE event stream
   useEffect(() => {
-    const es = new EventSource(`/api/tasks/${task.id}/events`);
+    const token = localStorage.getItem("ghostlink_api_key") || "";
+    const sseUrl = token
+      ? `/api/tasks/${task.id}/events?access_token=${encodeURIComponent(token)}`
+      : `/api/tasks/${task.id}/events`;
+    const es = new EventSource(sseUrl);
     es.onmessage = (e) => {
       try {
         const ev: TaskEvent = JSON.parse(e.data);
