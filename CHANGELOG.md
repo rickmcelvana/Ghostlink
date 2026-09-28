@@ -7,6 +7,10 @@ All notable changes to Ghostlink Studio are documented here.
 ## [Unreleased]
 
 ### Added
+- **Real Task Agent Tool Loop & v2.4 Child Fan-Out**: Replaced stub canned implementer loop with bounded tool loop using in-process `AgentBackend` trait, `Judge` policy enforcement, proposed file staging in `.ghostlink/tasks/<id>/proposed/`, real command execution, child task fan-out APIs (`/api/tasks/:id/children`), budget inheritance, and UI child task representation. (`crates/ghost-link/src/task_runtime.rs`, `crates/ghost-link/src/task_api.rs`, `ghostlink_gui_modern/src/components/TaskView.tsx`, `ghostlink_gui_modern/src/components/ProjectsTab.tsx`)
+
+
+### Added
 - **v2.3 Task Agent Server Engine & Router Extraction** (`crates/ghost-link/src/task_api.rs`, `crates/ghost-link/src/task_runtime.rs`, `crates/ghost-link/src/main.rs`, `ghostlink_gui_modern/src/components/TaskView.tsx`, `docs/TASK_AGENTS.md`):
   Extracted task API handlers from `main.rs` into `task_api.rs` and mounted the router in `main.rs`. Implemented Phase A Task Agent server with atomic JSON storage under `GHOSTLINK_DATA_DIR` (.ghostlink/data), workspace path canonicalization and staging isolation under `.ghostlink/tasks/{task_id}/proposed/`, deterministic `Judge` policy (allowlist/denylist/pause), implementer loop execution with budget limits (`max_steps`, `max_minutes`, `max_tokens`), SSE event stream with `?access_token=` authentication in `TaskView.tsx`, and human decision workflows (accept/reject/request_changes/cancel). Updated `docs/TASK_AGENTS.md` to document implemented v2.3 server capabilities vs planned v2.4 features.
 

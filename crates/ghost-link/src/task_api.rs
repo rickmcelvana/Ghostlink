@@ -1,10 +1,15 @@
+use crate::backend_plugin;
+use crate::task_runtime::{
+    AgentBackend, AgentResponse, ProjectKind, TaskBudget, TaskStatus, ToolCall,
+};
+use crate::BackendState;
+use crate::InferenceEngine;
+use anyhow::Result;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    response::{
-        sse::{Event, Sse},
-        IntoResponse,
-    },
+    response::sse::{Event, Sse},
+    response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
@@ -13,8 +18,132 @@ use std::sync::Arc;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 
-use crate::task_runtime::{self, ProjectKind, TaskBudget, TaskStatus};
-use crate::BackendState;
+pub struct RealAgentBackend {
+    pub state: Arc<std::sync::Mutex<BackendState>>,
+}
+
+#[async_trait::async_trait]
+impl AgentBackend for RealAgentBackend {
+    async fn chat(
+        &self,
+        messages: &[serde_json::Value],
+        _allowed_tools: &[String],
+    ) -> Result<AgentResponse> {
+        let (
+            model,
+            native_engine_client,
+            ollama_client,
+            vllm_client,
+            settings,
+            plugin_registry,
+            inference_backend,
+        ) = {
+            let guard = self.state.lock().unwrap();
+            (
+                guard.current_model.clone(),
+                guard.native_engine_client.clone(),
+                guard.ollama_client.clone(),
+                guard.vllm_client.clone(),
+                guard.settings.clone(),
+                guard.plugin_registry.clone(),
+                guard.inference_backend,
+            )
+        };
+
+        let mut prompt = String::new();
+        for msg in messages {
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+            let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            if !prompt.is_empty() {
+                prompt.push('\n');
+            }
+            prompt.push_str(role);
+            prompt.push_str(": ");
+            prompt.push_str(content);
+        }
+
+        if let Some(plugin) = plugin_registry.get(&settings.inference_backend) {
+            let res = plugin
+                .generate(backend_plugin::PluginGenerationRequest {
+                    model,
+                    prompt,
+                    temperature: 0.7,
+                    top_p: 0.9,
+                    top_k: 40,
+                    penalty: 1.1,
+                    max_tokens: 1024,
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            return Ok(AgentResponse {
+                content: Some(res.text),
+                tool_calls: vec![],
+            });
+        }
+
+        match inference_backend {
+            InferenceEngine::Ollama => {
+                let res_text = ollama_client
+                    .generate(&model, &prompt, 0.7, 0.9, 40, 1.1, 1024)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                Ok(AgentResponse {
+                    content: Some(res_text),
+                    tool_calls: vec![],
+                })
+            }
+            InferenceEngine::Vllm => {
+                let res_text = vllm_client
+                    .generate(&model, &prompt, 0.7, 0.9, 40, 1.1, 1024)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                Ok(AgentResponse {
+                    content: Some(res_text),
+                    tool_calls: vec![],
+                })
+            }
+            InferenceEngine::Native => {
+                let gen = native_engine_client
+                    .generate(
+                        &model,
+                        &prompt,
+                        1024,
+                        0.7,
+                        0.9,
+                        40,
+                        1.1,
+                        &settings.native_engine,
+                        &[],
+                        None,
+                        false,
+                        None,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+                let mut tool_calls = Vec::new();
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&gen.text) {
+                    if let Some(tc) = v.get("tool_call") {
+                        if let (Some(name), Some(args)) =
+                            (tc.get("name").and_then(|n| n.as_str()), tc.get("args"))
+                        {
+                            tool_calls.push(ToolCall {
+                                id: format!("tc_{}", uuid::Uuid::new_v4().simple()),
+                                name: name.to_string(),
+                                args: args.clone(),
+                            });
+                        }
+                    }
+                }
+
+                Ok(AgentResponse {
+                    content: Some(gen.text),
+                    tool_calls,
+                })
+            }
+        }
+    }
+}
 
 #[derive(Deserialize)]
 pub struct CreateProjectReq {
@@ -207,8 +336,13 @@ async fn handle_spawn_task(
     let cancel_token = CancellationToken::new();
     store.register_cancel_token(task.id.clone(), cancel_token.clone());
 
-    match task_runtime::TaskRunner::spawn_implementer(
+    let backend = Arc::new(RealAgentBackend {
+        state: Arc::clone(&state),
+    });
+
+    match crate::task_runtime::TaskRunner::spawn_implementer(
         store,
+        backend,
         task,
         role,
         model,
@@ -355,6 +489,20 @@ async fn handle_get_task_events(
     Sse::new(sse_stream).keep_alive(axum::response::sse::KeepAlive::default())
 }
 
+async fn handle_get_task_children(
+    State(state): State<Arc<std::sync::Mutex<BackendState>>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let store = Arc::clone(&state.lock().unwrap().task_store);
+    match store.list_child_tasks(&id) {
+        Ok(children) => Ok(Json(serde_json::to_value(children).unwrap())),
+        Err(e) => Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )),
+    }
+}
+
 pub fn router() -> Router<Arc<std::sync::Mutex<BackendState>>> {
     Router::new()
         .route(
@@ -370,6 +518,7 @@ pub fn router() -> Router<Arc<std::sync::Mutex<BackendState>>> {
             post(handle_create_project_task).get(handle_list_project_tasks),
         )
         .route("/api/tasks/:id", get(handle_get_task))
+        .route("/api/tasks/:id/children", get(handle_get_task_children))
         .route("/api/tasks/:id/spawn", post(handle_spawn_task))
         .route("/api/tasks/:id/cancel", post(handle_cancel_task))
         .route("/api/tasks/:id/events", get(handle_get_task_events))

@@ -1240,8 +1240,13 @@ export class GhostlinkAPI {
     return res.data;
   }
 
-  async createTask(projectId: string, data: { goal: string; acceptance_criteria?: string; budget?: Partial<TaskBudget>; model?: string }): Promise<Task> {
+  async createTask(projectId: string, data: { goal: string; acceptance_criteria?: string; budget?: Partial<TaskBudget>; model?: string; parent_id?: string }): Promise<Task> {
     const res = await this.http.post(`/api/projects/${projectId}/tasks`, data);
+    return res.data;
+  }
+
+    async listTaskChildren(id: string): Promise<Task[]> {
+    const res = await this.http.get(`/api/tasks/${id}/children`);
     return res.data;
   }
 
