@@ -63,17 +63,55 @@ describe('ReviewPane', () => {
     expect(screen.getByText('src/lib.rs')).toBeInTheDocument();
   });
 
-  it('calls decideReview with accept when Accept button is clicked', async () => {
+  it('calls decideReview with accept when Accept button is clicked and shows loading state', async () => {
+    let resolveReview: any;
+    mockApi.decideReview.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveReview = resolve;
+        })
+    );
     const onDecided = vi.fn();
     render(<ReviewPane packet={mockPacket} api={mockApi} onDecided={onDecided} />);
 
     const acceptBtn = screen.getByRole('button', { name: /accept proposed changes/i });
+    expect(acceptBtn).toHaveAttribute('aria-label', 'Accept proposed changes');
+    expect(acceptBtn).toHaveAttribute('title', 'Accept proposed changes and apply to project root');
+
     fireEvent.click(acceptBtn);
+
+    expect(acceptBtn).toBeDisabled();
+    expect(acceptBtn).toHaveAttribute('aria-busy', 'true');
+    expect(acceptBtn).toHaveAttribute('aria-label', 'Accepting proposed changes...');
+
+    resolveReview({ status: 'accepted', task_id: 'task_1' });
 
     await waitFor(() => {
       expect(mockApi.decideReview).toHaveBeenCalledWith('rev_1234567890', {
         decision: 'accept',
         note: undefined,
+      });
+      expect(onDecided).toHaveBeenCalled();
+    });
+  });
+
+  it('shows note input and calls decideReview with request_changes and note', async () => {
+    const onDecided = vi.fn();
+    render(<ReviewPane packet={mockPacket} api={mockApi} onDecided={onDecided} />);
+
+    const reqBtn = screen.getByRole('button', { name: /request changes/i });
+    fireEvent.click(reqBtn);
+
+    const noteInput = screen.getByRole('textbox', { name: /note for requested changes/i });
+    expect(noteInput).toBeInTheDocument();
+
+    fireEvent.change(noteInput, { target: { value: 'Please update comments' } });
+    fireEvent.click(reqBtn);
+
+    await waitFor(() => {
+      expect(mockApi.decideReview).toHaveBeenCalledWith('rev_1234567890', {
+        decision: 'request_changes',
+        note: 'Please update comments',
       });
       expect(onDecided).toHaveBeenCalled();
     });
@@ -93,6 +131,14 @@ describe('ReviewPane', () => {
       });
       expect(onDecided).toHaveBeenCalled();
     });
+  });
+
+  it('renders diff file selection button with accessible aria-label and title', () => {
+    render(<ReviewPane packet={mockPacket} api={mockApi} />);
+
+    const diffBtn = screen.getByRole('button', { name: /view diff for src\/lib.rs/i });
+    expect(diffBtn).toBeInTheDocument();
+    expect(diffBtn).toHaveAttribute('title', 'View diff for src/lib.rs');
   });
 
   it('renders commands list with judge status badges', () => {

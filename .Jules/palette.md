@@ -21,3 +21,7 @@
 ## 2026-09-26 - Descriptive Tooltips and Explicit ARIA Labels on Empty-State Suggestion Chips
 **Learning:** Empty-state suggestion chips often present concise text prompts for visual compactness, which may lack full intent context for screen reader users or mouse hoverers.
 **Action:** Always pair prompt suggestion chip buttons with explicit `aria-label={s.label}` and native `title={s.label}` tooltips so screen reader users and mouse hoverers hear and see the complete action intent.
+
+## 2026-10-02 - Specific Action-State Tracking on Multi-Choice Decision Toolbars
+**Learning:** In review panes or decision toolbars with multiple choices (e.g., Accept, Request Changes, Reject), using a single boolean `isSubmitting` hides which specific action is processing. Tracking specific `activeAction` state enables rendering action-specific `aria-busy`, spinning icon animations, and dynamic `aria-label` / `title` tooltips (e.g., 'Accepting proposed changes...' vs 'Accept proposed changes') so screen reader users and mouse hoverers receive real-time contextual feedback.
+**Action:** Track targeted decision action names (`'accept' | 'request_changes' | 'reject'`) during async operations to dynamically reflect active `aria-label`, `aria-busy`, and visual loading spinners on decision buttons.

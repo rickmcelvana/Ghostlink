@@ -50,7 +50,7 @@ export const ReviewPane: React.FC<ReviewPaneProps> = ({ packet, api: propApi, on
   const api = propApi || new GhostlinkAPI(resolveApiBase());
 
   const [selectedDiffIndex, setSelectedDiffIndex] = useState<number>(0);
-  const [deciding, setDeciding] = useState<boolean>(false);
+  const [activeAction, setActiveAction] = useState<'accept' | 'request_changes' | 'reject' | null>(null);
   const [note, setNote] = useState<string>('');
   const [showNoteInput, setShowNoteNoteInput] = useState<boolean>(false);
 
@@ -58,7 +58,7 @@ export const ReviewPane: React.FC<ReviewPaneProps> = ({ packet, api: propApi, on
   const currentDiff: ReviewDiff | undefined = packet.diffs[selectedDiffIndex];
 
   const handleDecide = async (decision: 'accept' | 'request_changes' | 'reject') => {
-    setDeciding(true);
+    setActiveAction(decision);
     try {
       await api.decideReview(packet.id, { decision, note: note.trim() || undefined });
       addToast({
@@ -72,9 +72,11 @@ export const ReviewPane: React.FC<ReviewPaneProps> = ({ packet, api: propApi, on
         type: 'error',
       });
     } finally {
-      setDeciding(false);
+      setActiveAction(null);
     }
   };
+
+  const isDeciding = activeAction !== null;
 
   return (
     <div className="flex flex-col h-full bg-slate-900 border border-slate-800 rounded-xl overflow-hidden shadow-2xl">
@@ -94,6 +96,7 @@ export const ReviewPane: React.FC<ReviewPaneProps> = ({ packet, api: propApi, on
             <input
               type="text"
               placeholder="Note for request changes..."
+              aria-label="Note for requested changes"
               value={note}
               onChange={(e) => setNote(e.target.value)}
               className="px-3 py-1.5 bg-slate-900 border border-slate-700 rounded-lg text-xs text-slate-200 focus:outline-none focus:ring-2 focus:ring-amber-500"
@@ -101,12 +104,22 @@ export const ReviewPane: React.FC<ReviewPaneProps> = ({ packet, api: propApi, on
           )}
           <button
             onClick={() => handleDecide('accept')}
-            disabled={deciding}
-            aria-label="Accept proposed changes"
-            title="Accept proposed changes and apply to project root"
+            disabled={isDeciding}
+            aria-busy={activeAction === 'accept'}
+            aria-label={activeAction === 'accept' ? 'Accepting proposed changes...' : 'Accept proposed changes'}
+            title={
+              activeAction === 'accept'
+                ? 'Accepting proposed changes...'
+                : 'Accept proposed changes and apply to project root'
+            }
             className="flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-bold bg-green-600 hover:bg-green-500 text-white transition disabled:opacity-50"
           >
-            <Check size={14} aria-hidden="true" /> Accept
+            {activeAction === 'accept' ? (
+              <RefreshCw size={14} className="animate-spin" aria-hidden="true" />
+            ) : (
+              <Check size={14} aria-hidden="true" />
+            )}
+            Accept
           </button>
           <button
             onClick={() => {
@@ -116,21 +129,43 @@ export const ReviewPane: React.FC<ReviewPaneProps> = ({ packet, api: propApi, on
                 handleDecide('request_changes');
               }
             }}
-            disabled={deciding}
-            aria-label="Request changes"
-            title="Request changes and requeue task with note"
+            disabled={isDeciding}
+            aria-busy={activeAction === 'request_changes'}
+            aria-label={
+              activeAction === 'request_changes' ? 'Requesting changes...' : 'Request changes'
+            }
+            title={
+              activeAction === 'request_changes'
+                ? 'Requesting changes...'
+                : 'Request changes and requeue task with note'
+            }
             className="flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-bold bg-amber-600 hover:bg-amber-500 text-white transition disabled:opacity-50"
           >
-            <RefreshCw size={14} aria-hidden="true" /> Request Changes
+            <RefreshCw
+              size={14}
+              className={activeAction === 'request_changes' ? 'animate-spin' : ''}
+              aria-hidden="true"
+            />
+            Request Changes
           </button>
           <button
             onClick={() => handleDecide('reject')}
-            disabled={deciding}
-            aria-label="Reject proposed changes"
-            title="Reject proposed changes and delete staging tree"
+            disabled={isDeciding}
+            aria-busy={activeAction === 'reject'}
+            aria-label={activeAction === 'reject' ? 'Rejecting proposed changes...' : 'Reject proposed changes'}
+            title={
+              activeAction === 'reject'
+                ? 'Rejecting proposed changes...'
+                : 'Reject proposed changes and delete staging tree'
+            }
             className="flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-bold bg-rose-700 hover:bg-rose-600 text-white transition disabled:opacity-50"
           >
-            <X size={14} aria-hidden="true" /> Reject
+            {activeAction === 'reject' ? (
+              <RefreshCw size={14} className="animate-spin" aria-hidden="true" />
+            ) : (
+              <X size={14} aria-hidden="true" />
+            )}
+            Reject
           </button>
         </div>
       </div>
@@ -152,6 +187,8 @@ export const ReviewPane: React.FC<ReviewPaneProps> = ({ packet, api: propApi, on
                   <button
                     key={diff.path}
                     onClick={() => setSelectedDiffIndex(idx)}
+                    aria-label={`View diff for ${diff.path}`}
+                    title={`View diff for ${diff.path}`}
                     className={`w-full text-left px-3 py-2 rounded-lg text-xs font-mono transition flex items-center justify-between ${
                       selectedDiffIndex === idx
                         ? 'bg-indigo-600/20 text-indigo-300 border border-indigo-500/30'
