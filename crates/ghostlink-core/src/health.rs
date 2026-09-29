@@ -595,11 +595,12 @@ impl FaultDetector {
 
     /// Detect failed nodes based on heartbeat timeouts
     ///
-    /// OPTIMIZATION: Acquires the cluster metrics lock once and mutates status in-place
-    /// instead of acquiring locks repeatedly (up to 3N times) and deep-cloning `NodeMetrics`
-    /// (including heap-allocated latency history vectors) on every node check.
+    /// OPTIMIZATION: Fast path iterates directly over `metrics.values_mut()` under lock
+    /// when all cluster nodes have registered metrics (`metrics.len() == node_count`).
+    /// This eliminates `nodes_snapshot()` atomic loading overhead and $N$ per-node HashMap
+    /// key lookups. If any cluster node lacks a metrics entry, falls back to snapshot-based
+    /// inspection to initialize and mark missing nodes as failed.
     pub fn detect_failures(&self) -> Vec<String> {
-        let nodes_snapshot = self.cluster.nodes_snapshot();
         let now = Instant::now();
         let mut failed_nodes = Vec::new();
 
@@ -609,34 +610,42 @@ impl FaultDetector {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
 
-        for node in nodes_snapshot.iter() {
-            if let Some(m) = metrics.get_mut(&node.id) {
+        let total_nodes = self.cluster.node_count();
+        if metrics.len() == total_nodes {
+            // Fast path: all cluster nodes have metrics entries.
+            // Iterate directly over metrics values without snapshot loading or key lookups.
+            for m in metrics.values_mut() {
                 if now.saturating_duration_since(m.last_heartbeat) >= m.heartbeat_timeout {
-                    // Any node whose heartbeat has timed out should be marked
-                    // Failed, not just ones currently Active. This used to
-                    // check `status == Active`, so a node already marked
-                    // Degraded (e.g. by NetworkHealthMonitor) that then went
-                    // completely silent would never be detected as failed
-                    // here, and would never be reported in `failed_nodes`.
                     if m.status != NodeStatus::Failed {
                         m.status = NodeStatus::Failed;
-                        failed_nodes.push(node.id.clone());
+                        failed_nodes.push(m.name.clone());
                     }
                 }
-            } else {
-                // No metrics for this node - insert entry with Failed status so
-                // it is only reported once on initial failure detection.
-                let mut m = crate::cluster::NodeMetrics::new(
-                    node.vram_gb,
-                    node.system_memory_gb,
-                    node.compute_capability.clone(),
-                    Duration::from_secs(5),
-                );
-                m.name = node.id.clone();
-                m.gpu_name = node.gpu_name.clone();
-                m.status = NodeStatus::Failed;
-                metrics.insert(node.id.clone(), m);
-                failed_nodes.push(node.id.clone());
+            }
+        } else {
+            // Fallback path: inspect nodes_snapshot if any registered node lacks a metrics entry
+            let nodes_snapshot = self.cluster.nodes_snapshot();
+            for node in nodes_snapshot.iter() {
+                if let Some(m) = metrics.get_mut(&node.id) {
+                    if now.saturating_duration_since(m.last_heartbeat) >= m.heartbeat_timeout {
+                        if m.status != NodeStatus::Failed {
+                            m.status = NodeStatus::Failed;
+                            failed_nodes.push(node.id.clone());
+                        }
+                    }
+                } else {
+                    let mut m = crate::cluster::NodeMetrics::new(
+                        node.vram_gb,
+                        node.system_memory_gb,
+                        node.compute_capability.clone(),
+                        Duration::from_secs(5),
+                    );
+                    m.name = node.id.clone();
+                    m.gpu_name = node.gpu_name.clone();
+                    m.status = NodeStatus::Failed;
+                    metrics.insert(node.id.clone(), m);
+                    failed_nodes.push(node.id.clone());
+                }
             }
         }
 
