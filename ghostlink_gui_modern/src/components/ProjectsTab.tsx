@@ -1,6 +1,6 @@
 import { resolveApiBase } from '../config';
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { Plus, FolderGit2 } from 'lucide-react';
+import { Plus, FolderGit2, Loader2 } from 'lucide-react';
 import { Project, Task, GhostlinkAPI } from '../api';
 import { useAppStore } from '../store';
 import { TaskView } from './TaskView';
@@ -25,11 +25,13 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({ api: propApi }) => {
   const setUnreadNeedsReviewCount = useAppStore((state) => state.setUnreadNeedsReviewCount);
 
   const [showNewProjModal, setShowNewProjModal] = useState<boolean>(false);
+  const [isCreatingProj, setIsCreatingProj] = useState<boolean>(false);
   const [projName, setProjName] = useState<string>('');
   const [projRootPath, setProjRootPath] = useState<string>('');
   const [projKind] = useState<'code' | 'work'>('code');
 
   const [showNewTaskModal, setShowNewTaskModal] = useState<boolean>(false);
+  const [isCreatingTask, setIsCreatingTask] = useState<boolean>(false);
   const [taskGoal, setTaskGoal] = useState<string>('');
   const [taskAcceptance, setTaskAcceptance] = useState<string>('');
 
@@ -69,7 +71,8 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({ api: propApi }) => {
 
   const handleCreateProject = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!projName.trim() || !projRootPath.trim()) return;
+    if (!projName.trim() || !projRootPath.trim() || isCreatingProj) return;
+    setIsCreatingProj(true);
     try {
       const created = await api.createProject({
         name: projName.trim(),
@@ -84,12 +87,15 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({ api: propApi }) => {
       setActiveProject(created);
     } catch (err: any) {
       addToast({ message: err.response?.data?.error || err.message || 'Project creation failed', type: 'error' });
+    } finally {
+      setIsCreatingProj(false);
     }
   };
 
   const handleCreateTask = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!activeProject || !taskGoal.trim()) return;
+    if (!activeProject || !taskGoal.trim() || isCreatingTask) return;
+    setIsCreatingTask(true);
     try {
       const created = await api.createTask(activeProject.id, {
         goal: taskGoal.trim(),
@@ -103,6 +109,8 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({ api: propApi }) => {
       setActiveTask(created);
     } catch (err: any) {
       addToast({ message: err.response?.data?.error || err.message || 'Task creation failed', type: 'error' });
+    } finally {
+      setIsCreatingTask(false);
     }
   };
 
@@ -221,8 +229,14 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({ api: propApi }) => {
       {/* New Project Modal */}
       {showNewProjModal && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <form onSubmit={handleCreateProject} className="bg-slate-900 border border-slate-800 rounded-xl p-6 w-full max-w-md space-y-4 shadow-2xl">
-            <h3 className="text-base font-bold text-slate-100">Create New Project</h3>
+          <form
+            onSubmit={handleCreateProject}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="new-proj-modal-title"
+            className="bg-slate-900 border border-slate-800 rounded-xl p-6 w-full max-w-md space-y-4 shadow-2xl"
+          >
+            <h3 id="new-proj-modal-title" className="text-base font-bold text-slate-100">Create New Project</h3>
             <div>
               <label htmlFor="proj-name-input" className="block text-xs text-slate-400 mb-1">Project Name</label>
               <input
@@ -251,15 +265,21 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({ api: propApi }) => {
               <button
                 type="button"
                 onClick={() => setShowNewProjModal(false)}
-                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs rounded-lg font-bold"
+                disabled={isCreatingProj}
+                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs rounded-lg font-bold disabled:opacity-50"
               >
                 Cancel
               </button>
               <button
                 type="submit"
-                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs rounded-lg font-bold"
+                disabled={isCreatingProj}
+                aria-busy={isCreatingProj}
+                aria-label={isCreatingProj ? 'Creating project...' : 'Create project'}
+                title={isCreatingProj ? 'Creating project...' : 'Create project'}
+                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs rounded-lg font-bold flex items-center gap-1.5 disabled:opacity-50"
               >
-                Create Project
+                {isCreatingProj && <Loader2 size={14} className="animate-spin" aria-hidden="true" />}
+                {isCreatingProj ? 'Creating...' : 'Create Project'}
               </button>
             </div>
           </form>
@@ -269,8 +289,14 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({ api: propApi }) => {
       {/* New Task Modal */}
       {showNewTaskModal && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <form onSubmit={handleCreateTask} className="bg-slate-900 border border-slate-800 rounded-xl p-6 w-full max-w-md space-y-4 shadow-2xl">
-            <h3 className="text-base font-bold text-slate-100">Create Task for {activeProject?.name}</h3>
+          <form
+            onSubmit={handleCreateTask}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="new-task-modal-title"
+            className="bg-slate-900 border border-slate-800 rounded-xl p-6 w-full max-w-md space-y-4 shadow-2xl"
+          >
+            <h3 id="new-task-modal-title" className="text-base font-bold text-slate-100">Create Task for {activeProject?.name}</h3>
             <div>
               <label htmlFor="task-goal-input" className="block text-xs text-slate-400 mb-1">Task Goal</label>
               <textarea
@@ -298,15 +324,21 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({ api: propApi }) => {
               <button
                 type="button"
                 onClick={() => setShowNewTaskModal(false)}
-                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs rounded-lg font-bold"
+                disabled={isCreatingTask}
+                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs rounded-lg font-bold disabled:opacity-50"
               >
                 Cancel
               </button>
               <button
                 type="submit"
-                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs rounded-lg font-bold"
+                disabled={isCreatingTask}
+                aria-busy={isCreatingTask}
+                aria-label={isCreatingTask ? 'Creating task...' : 'Create task'}
+                title={isCreatingTask ? 'Creating task...' : 'Create task'}
+                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs rounded-lg font-bold flex items-center gap-1.5 disabled:opacity-50"
               >
-                Create Task
+                {isCreatingTask && <Loader2 size={14} className="animate-spin" aria-hidden="true" />}
+                {isCreatingTask ? 'Creating...' : 'Create Task'}
               </button>
             </div>
           </form>

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import { ProjectsTab } from './ProjectsTab';
 import { useAppStore } from '../store';
 
@@ -81,6 +81,51 @@ describe('ProjectsTab', () => {
     await waitFor(() => {
       expect(screen.getByText('needs_review')).toBeInTheDocument();
       expect(useAppStore.getState().unreadNeedsReviewCount).toBe(1);
+    });
+  });
+
+  it('shows accessible loading state when creating a project', async () => {
+    let resolveCreate: any;
+    const createPromise = new Promise((resolve) => {
+      resolveCreate = resolve;
+    });
+    mockApi.createProject.mockImplementation(() => createPromise);
+
+    render(<ProjectsTab api={mockApi} />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Core System')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'New Project' }));
+
+    const dialog = screen.getByRole('dialog', { name: 'Create New Project' });
+    expect(dialog).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText('Project Name'), { target: { value: 'New Test Project' } });
+    fireEvent.change(screen.getByLabelText(/Root Path/), { target: { value: '/workspace/test' } });
+
+    const submitBtn = screen.getByRole('button', { name: 'Create project' });
+    fireEvent.click(submitBtn);
+
+    expect(submitBtn).toHaveAttribute('aria-busy', 'true');
+    expect(submitBtn).toHaveAttribute('aria-label', 'Creating project...');
+    expect(submitBtn).toBeDisabled();
+
+    resolveCreate({
+      id: 'proj_2',
+      name: 'New Test Project',
+      kind: 'code',
+      root_path: '/workspace/test',
+      created_at: '2026-08-10T12:00:00Z',
+    });
+
+    await waitFor(() => {
+      expect(mockApi.createProject).toHaveBeenCalledWith({
+        name: 'New Test Project',
+        root_path: '/workspace/test',
+        kind: 'code',
+      });
     });
   });
 });

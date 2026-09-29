@@ -25,3 +25,7 @@
 ## 2026-10-02 - Specific Action-State Tracking on Multi-Choice Decision Toolbars
 **Learning:** In review panes or decision toolbars with multiple choices (e.g., Accept, Request Changes, Reject), using a single boolean `isSubmitting` hides which specific action is processing. Tracking specific `activeAction` state enables rendering action-specific `aria-busy`, spinning icon animations, and dynamic `aria-label` / `title` tooltips (e.g., 'Accepting proposed changes...' vs 'Accept proposed changes') so screen reader users and mouse hoverers receive real-time contextual feedback.
 **Action:** Track targeted decision action names (`'accept' | 'request_changes' | 'reject'`) during async operations to dynamically reflect active `aria-label`, `aria-busy`, and visual loading spinners on decision buttons.
+
+## 2026-10-02 - Async Creation Modals Need Busy States and Dialog Role Association
+**Learning:** Modal creation forms in dashboard tab views that lack submission state tracking allow users to inadvertently submit duplicate creation requests while leaving screen reader users unaware that background resource creation is processing.
+**Action:** Always wrap modal submission buttons in async creation forms with state tracking (`isSubmitting`), `aria-busy`, spinning `Loader2` feedback, dynamic `aria-label`/`title` tooltips, and bind the modal form overlay with `role="dialog"`, `aria-modal="true"`, and `aria-labelledby`.
