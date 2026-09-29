@@ -615,11 +615,11 @@ impl FaultDetector {
             // Fast path: all cluster nodes have metrics entries.
             // Iterate directly over metrics values without snapshot loading or key lookups.
             for m in metrics.values_mut() {
-                if now.saturating_duration_since(m.last_heartbeat) >= m.heartbeat_timeout {
-                    if m.status != NodeStatus::Failed {
-                        m.status = NodeStatus::Failed;
-                        failed_nodes.push(m.name.clone());
-                    }
+                if now.saturating_duration_since(m.last_heartbeat) >= m.heartbeat_timeout
+                    && m.status != NodeStatus::Failed
+                {
+                    m.status = NodeStatus::Failed;
+                    failed_nodes.push(m.name.clone());
                 }
             }
         } else {
@@ -627,11 +627,11 @@ impl FaultDetector {
             let nodes_snapshot = self.cluster.nodes_snapshot();
             for node in nodes_snapshot.iter() {
                 if let Some(m) = metrics.get_mut(&node.id) {
-                    if now.saturating_duration_since(m.last_heartbeat) >= m.heartbeat_timeout {
-                        if m.status != NodeStatus::Failed {
-                            m.status = NodeStatus::Failed;
-                            failed_nodes.push(node.id.clone());
-                        }
+                    if now.saturating_duration_since(m.last_heartbeat) >= m.heartbeat_timeout
+                        && m.status != NodeStatus::Failed
+                    {
+                        m.status = NodeStatus::Failed;
+                        failed_nodes.push(node.id.clone());
                     }
                 } else {
                     let mut m = crate::cluster::NodeMetrics::new(
