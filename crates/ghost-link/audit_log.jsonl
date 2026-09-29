@@ -1,2 +1,4 @@
 {"event":"auth","status":"FAILED","ip":"127.0.0.1","time":"2026-09-28T18:08:41.939584146+00:00","detail":"POST /api/projects"}
 {"event":"auth","status":"FAILED","ip":"127.0.0.1","time":"2026-09-28T18:08:41.939795839+00:00","detail":"GET /api/projects"}
+{"event":"auth","status":"FAILED","ip":"127.0.0.1","time":"2026-09-29T10:31:53.318971719+00:00","detail":"POST /api/projects"}
+{"event":"auth","status":"FAILED","ip":"127.0.0.1","time":"2026-09-29T10:31:53.319286442+00:00","detail":"GET /api/projects"}
