@@ -4336,9 +4336,15 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
     /// `axum::serve`'s graceful shutdown lets the process exit. Without this, a
     /// `cmd /C npx ...`-spawned server's child processes (see mcp::client) would
     /// otherwise be orphaned when Ghostlink exits.
+    /// Waits for Ctrl+C, then force-tears-down every connected MCP server and
+    /// stops any running ggml-rpc-server contributor before `axum::serve`'s
+    /// graceful shutdown lets the process exit.
+    /// Note: OnceLock background listeners (allowlist proxy, auth port) cannot
+    /// be restarted in-process once bound; process restart is required to rebind.
     async fn mcp_shutdown_on_ctrl_c(mcp_registry: Arc<mcp::McpRegistry>) {
         let _ = tokio::signal::ctrl_c().await;
         mcp_registry.shutdown_all().await;
+        rpc_cluster::stop_contributing();
     }
 
     fn chat_exec_micro_batch() -> usize {

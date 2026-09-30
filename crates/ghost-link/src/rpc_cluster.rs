@@ -436,6 +436,70 @@ pub fn get_rpc_server_bin() -> String {
 /// `ggml-rpc-server` binds `bind_host:port` directly, exactly as before
 /// either existed: no proxy, no extra hop, no behavior change for the
 /// default case.
+/// Validates that internal (+1000) and auth (+2000) ports derived from `rpc_port`
+/// do not overflow `u16::MAX` and do not collide with `rpc_port` or each other.
+pub fn validate_derived_ports(rpc_port: u16) -> Result<(u16, u16), String> {
+    let internal_port = rpc_port
+        .checked_add(RPC_INTERNAL_PORT_OFFSET)
+        .ok_or_else(|| {
+            format!("Derived internal RPC port overflows u16 range from base port {rpc_port}")
+        })?;
+    let auth_port = rpc_port.checked_add(RPC_AUTH_PORT_OFFSET).ok_or_else(|| {
+        format!("Derived auth RPC port overflows u16 range from base port {rpc_port}")
+    })?;
+
+    if internal_port == rpc_port {
+        return Err(format!(
+            "Derived internal RPC port {internal_port} collides with base rpc_port"
+        ));
+    }
+    if auth_port == rpc_port || auth_port == internal_port {
+        return Err(format!(
+            "Derived auth RPC port {auth_port} collides with rpc_port or internal port"
+        ));
+    }
+
+    Ok((internal_port, auth_port))
+}
+
+fn warn_unauthenticated_rpc(
+    use_proxy: bool,
+    spawn_host: &str,
+    spawn_port: u16,
+    bind_host: &str,
+    port: u16,
+    allowed_peers_len: usize,
+    secret_is_empty: bool,
+) {
+    if !use_proxy {
+        tracing::warn!(
+            "rpc_cluster: starting ggml-rpc-server on {spawn_host}:{spawn_port} \u{2014} this \
+             exposes local compute (GPU/CPU) to the network with NO AUTHENTICATION (an upstream \
+             llama.cpp limitation, not Ghostlink's), NO IP ALLOWLIST (rpc_allowed_peers is \
+             empty), and NO SHARED-SECRET HANDSHAKE (rpc_shared_secret is empty). Only enable \
+             contribute_compute on a network you trust, the same assumption UDP/mDNS discovery \
+             already makes. Set rpc_allowed_peers and/or rpc_shared_secret in settings to \
+             restrict which hosts may submit compute jobs."
+        );
+    } else {
+        tracing::warn!(
+            "rpc_cluster: starting ggml-rpc-server on loopback ({spawn_host}:{spawn_port}), \
+             fronted by an allowlist proxy on {bind_host}:{port} restricted to {allowed_peers_len} \
+             rpc_allowed_peers entries{} \u{2014} ggml-rpc-server itself still has NO \
+             AUTHENTICATION of its own (an upstream llama.cpp limitation).",
+            if secret_is_empty {
+                ", with NO rpc_shared_secret handshake required \u{2014} a device already \
+                 inside an allowlisted range isn't stopped by IP allowlisting alone"
+                    .to_string()
+            } else {
+                ", and requiring a live rpc_shared_secret handshake admission before splicing \
+                 any connection through"
+                    .to_string()
+            }
+        );
+    }
+}
+
 pub fn ensure_contributing(
     bind_host: &str,
     port: u16,
@@ -449,22 +513,34 @@ pub fn ensure_contributing(
         Err(poisoned) => poisoned.into_inner(),
     };
 
-    let use_proxy = !allowed_peers.is_empty() || !shared_secret.is_empty();
+    let trimmed_secret = shared_secret.trim();
+    if !shared_secret.is_empty() && trimmed_secret.is_empty() {
+        tracing::error!("rpc_cluster: rpc_shared_secret is whitespace-only; treating as unset.");
+    }
+
+    let (internal_port, _auth_port) = match validate_derived_ports(port) {
+        Ok(ports) => ports,
+        Err(err) => {
+            tracing::error!("rpc_cluster: invalid derived ports for rpc_port {port}: {err}");
+            return;
+        }
+    };
+
+    let use_proxy = !allowed_peers.is_empty() || !trimmed_secret.is_empty();
     let (spawn_host, spawn_port): (String, u16) = if !use_proxy {
         (bind_host.to_string(), port)
     } else {
-        let internal_port = port.saturating_add(RPC_INTERNAL_PORT_OFFSET);
         maybe_start_allowlist_proxy(
             bind_host,
             port,
             internal_port,
             allowed_peers,
-            shared_secret,
+            trimmed_secret,
             rt_handle,
         );
         ("127.0.0.1".to_string(), internal_port)
     };
-    maybe_start_auth_port(bind_host, port, shared_secret, rt_handle);
+    maybe_start_auth_port(bind_host, port, trimmed_secret, rt_handle);
 
     sup.spawn_host = spawn_host.clone();
     sup.spawn_port = spawn_port;
@@ -495,34 +571,15 @@ pub fn ensure_contributing(
 
     sup.last_spawn_attempt = Some(Instant::now());
     let bin = get_rpc_server_bin();
-    if !use_proxy {
-        tracing::warn!(
-            "rpc_cluster: starting ggml-rpc-server on {spawn_host}:{spawn_port} \u{2014} this \
-             exposes local compute (GPU/CPU) to the network with NO AUTHENTICATION (an upstream \
-             llama.cpp limitation, not Ghostlink's), NO IP ALLOWLIST (rpc_allowed_peers is \
-             empty), and NO SHARED-SECRET HANDSHAKE (rpc_shared_secret is empty). Only enable \
-             contribute_compute on a network you trust, the same assumption UDP/mDNS discovery \
-             already makes. Set rpc_allowed_peers and/or rpc_shared_secret in settings to \
-             restrict which hosts may submit compute jobs."
-        );
-    } else {
-        tracing::warn!(
-            "rpc_cluster: starting ggml-rpc-server on loopback ({spawn_host}:{spawn_port}), \
-             fronted by an allowlist proxy on {bind_host}:{port} restricted to {} \
-             rpc_allowed_peers entries{} \u{2014} ggml-rpc-server itself still has NO \
-             AUTHENTICATION of its own (an upstream llama.cpp limitation).",
-            allowed_peers.len(),
-            if shared_secret.is_empty() {
-                ", with NO rpc_shared_secret handshake required \u{2014} a device already \
-                 inside an allowlisted range isn't stopped by IP allowlisting alone"
-                    .to_string()
-            } else {
-                ", and requiring a live rpc_shared_secret handshake admission before splicing \
-                 any connection through"
-                    .to_string()
-            }
-        );
-    }
+    warn_unauthenticated_rpc(
+        use_proxy,
+        &spawn_host,
+        spawn_port,
+        bind_host,
+        port,
+        allowed_peers.len(),
+        trimmed_secret.is_empty(),
+    );
 
     // ggml-rpc-server's own stdout/stderr (connection/tensor-transfer activity
     // logged by upstream llama.cpp) is discarded by default — matches every
@@ -602,7 +659,6 @@ pub fn ensure_contributing(
 /// `contribute_compute` currently takes effect on next restart, same as
 /// other settings that affect process launch), kept for that follow-up and
 /// for tests.
-#[allow(dead_code)]
 pub fn stop_contributing() {
     let handle = supervisor_handle();
     let mut sup = match handle.lock() {
@@ -787,11 +843,21 @@ async fn serve_rpc_allowlist_proxy(
 static RPC_AUTH_PORT_STARTED: OnceLock<()> = OnceLock::new();
 
 fn maybe_start_auth_port(bind_host: &str, rpc_port: u16, secret: &str, rt_handle: &Handle) {
-    if secret.is_empty() || RPC_AUTH_PORT_STARTED.get().is_some() {
+    let trimmed_secret = secret.trim();
+    if !secret.is_empty() && trimmed_secret.is_empty() {
+        tracing::error!("rpc_cluster: rpc_shared_secret is whitespace-only; treating as unset.");
+    }
+    if trimmed_secret.is_empty() || RPC_AUTH_PORT_STARTED.get().is_some() {
         return;
     }
 
-    let auth_port = rpc_port.saturating_add(RPC_AUTH_PORT_OFFSET);
+    let (_internal_port, auth_port) = match validate_derived_ports(rpc_port) {
+        Ok(ports) => ports,
+        Err(err) => {
+            tracing::error!("rpc_cluster: cannot start auth port, invalid derived ports: {err}");
+            return;
+        }
+    };
     let addr_str = format!("{bind_host}:{auth_port}");
     let addr: SocketAddr = match addr_str.parse::<SocketAddr>() {
         Ok(addr) => addr,
@@ -804,7 +870,7 @@ fn maybe_start_auth_port(bind_host: &str, rpc_port: u16, secret: &str, rt_handle
             return;
         }
     };
-    let secret = secret.to_string();
+    let secret = trimmed_secret.to_string();
 
     if RPC_AUTH_PORT_STARTED.set(()).is_ok() {
         rt_handle.spawn(async move {
@@ -2309,5 +2375,64 @@ mod tests {
         assert!(ip_allowed(&loopback_v6, &allowlist));
         assert!(ip_allowed(&in_cidr_v6, &allowlist));
         assert!(!ip_allowed(&out_v6, &allowlist));
+    }
+
+    #[test]
+    fn whitespace_only_secret_is_treated_as_empty() {
+        let loopback_ip: IpAddr = "127.0.0.1".parse().unwrap();
+        // Secret with only spaces or tabs is treated as empty
+        assert!(validate_non_loopback_rpc_security(&loopback_ip, "   \t  ", &[]).is_ok());
+
+        // For non-loopback, whitespace secret is rejected as empty
+        let public_ip: IpAddr = "192.168.1.100".parse().unwrap();
+        let allowlist = vec!["192.168.1.0/24".to_string()];
+        assert!(validate_non_loopback_rpc_security(&public_ip, "   ", &allowlist).is_err());
+    }
+
+    #[test]
+    fn validate_non_loopback_rpc_security_rejects_whitespace_secret() {
+        let public_ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let allowlist = vec!["10.0.0.0/8".to_string()];
+        assert!(validate_non_loopback_rpc_security(&public_ip, "  \n\t  ", &allowlist).is_err());
+    }
+
+    #[test]
+    fn validate_non_loopback_rpc_security_accepts_loopback_with_empty_secret() {
+        let loopback_ip: IpAddr = "127.0.0.1".parse().unwrap();
+        assert!(validate_non_loopback_rpc_security(&loopback_ip, "", &[]).is_ok());
+        assert!(validate_non_loopback_rpc_security(&loopback_ip, "  ", &[]).is_ok());
+    }
+
+    #[test]
+    fn validate_non_loopback_rpc_security_rejects_non_loopback_without_allowlist() {
+        let public_ip: IpAddr = "172.16.0.10".parse().unwrap();
+        assert!(validate_non_loopback_rpc_security(&public_ip, "valid_secret", &[]).is_err());
+    }
+
+    #[test]
+    fn derived_ports_reject_overflow_or_collision() {
+        // High port that would overflow internal_port (+1000) or auth_port (+2000)
+        assert!(validate_derived_ports(64600).is_err());
+        assert!(validate_derived_ports(63536).is_err());
+        assert!(validate_derived_ports(65000).is_err());
+    }
+
+    #[test]
+    fn derived_ports_accept_default_rpc_50052_style_values() {
+        let (internal, auth) = validate_derived_ports(50052).unwrap();
+        assert_eq!(internal, 51052);
+        assert_eq!(auth, 52052);
+
+        let (internal_small, auth_small) = validate_derived_ports(8000).unwrap();
+        assert_eq!(internal_small, 9000);
+        assert_eq!(auth_small, 10000);
+    }
+
+    #[test]
+    fn stop_contributing_is_idempotent() {
+        stop_contributing();
+        stop_contributing();
+        stop_contributing();
+        assert!(!is_contributing_healthy());
     }
 }
