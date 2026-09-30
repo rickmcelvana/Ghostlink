@@ -7,6 +7,8 @@ All notable changes to Ghostlink Studio are documented here.
 ## [Unreleased]
 
 ### Fixed
+- **Phase 1 RPC Contributor Hardening, Secret Trimming, Derived-Port Validation, and Graceful Process Shutdown** (`crates/ghost-link/src/rpc_cluster.rs`, `crates/ghost-link/src/main.rs`):
+  Trimmed `rpc_shared_secret` input whitespace across security validation and auth-port initialization, treating whitespace-only secrets as unset to prevent running `handle_auth_handshake` with whitespace keys. Implemented `validate_derived_ports` to enforce bounds and prevent port collisions between base `rpc_port`, internal loopback proxy (+1000), and auth handshake listener (+2000). Deduplicated unauthenticated `ggml-rpc-server` startup tracing warnings into `warn_unauthenticated_rpc`. Un-suppressed `stop_contributing()` and wired contributor process cleanup into server process shutdown on SIGINT/SIGTERM/Ctrl+C in `main.rs` (`mcp_shutdown_on_ctrl_c`), ensuring idempotent cleanup of supervised `ggml-rpc-server` child processes.
 - **Gateway & Studio EventSource Auth Alignment**: Studio EventSource and control-plane now share jwt_secret.txt and accept ?access_token= on task SSE only.
 
 ### Added
