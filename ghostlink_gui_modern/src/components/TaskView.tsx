@@ -1,6 +1,6 @@
 import { resolveApiBase } from "../config";
 import React, { useState, useEffect } from "react";
-import { Play, Square, Shield, Clock, Layers, KeyRound } from "lucide-react";
+import { Play, Square, Shield, Clock, Layers, KeyRound, Loader2 } from "lucide-react";
 import { Task, ReviewPacket, TaskEvent, GhostlinkAPI } from "../api";
 import { useAppStore } from "../store";
 import { ReviewPane } from "./ReviewPane";
@@ -16,6 +16,7 @@ export const TaskView: React.FC<TaskViewProps> = ({ task, api: propApi, onRefres
 
   const [review, setReview] = useState<ReviewPacket | null>(null);
   const [spawning, setSpawning] = useState<boolean>(false);
+  const [cancelling, setCancelling] = useState<boolean>(false);
   const [brief, setBrief] = useState<string>("");
 
   const taskEvents = useAppStore((state) => state.taskEvents);
@@ -86,6 +87,7 @@ export const TaskView: React.FC<TaskViewProps> = ({ task, api: propApi, onRefres
   };
 
   const handleCancel = async () => {
+    setCancelling(true);
     try {
       await api.cancelTask(task.id);
       addToast({
@@ -98,6 +100,8 @@ export const TaskView: React.FC<TaskViewProps> = ({ task, api: propApi, onRefres
         message: err.response?.data?.error || err.message || "Failed to cancel task",
         type: "error",
       });
+    } finally {
+      setCancelling(false);
     }
   };
 
@@ -153,8 +157,10 @@ export const TaskView: React.FC<TaskViewProps> = ({ task, api: propApi, onRefres
           {task.status !== "running" && task.status !== "needs_review" && (
             <div className="flex items-center gap-2">
               <input
+                id="custom-task-brief"
                 type="text"
                 placeholder="Optional custom brief..."
+                aria-label="Custom task brief"
                 value={brief}
                 onChange={(e) => setBrief(e.target.value)}
                 className="px-3 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-xs text-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500"
@@ -162,22 +168,27 @@ export const TaskView: React.FC<TaskViewProps> = ({ task, api: propApi, onRefres
               <button
                 onClick={handleSpawn}
                 disabled={spawning}
-                aria-label="Spawn Implementer Run"
-                title="Spawn an implementer agent run for this task"
+                aria-busy={spawning}
+                aria-label={spawning ? "Spawning implementer run..." : "Spawn Implementer Run"}
+                title={spawning ? "Spawning implementer run..." : "Spawn an implementer agent run for this task"}
                 className="flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-bold bg-indigo-600 hover:bg-indigo-500 text-white transition disabled:opacity-50"
               >
-                <Play size={14} aria-hidden="true" /> Spawn Run
+                {spawning ? <Loader2 size={14} className="animate-spin" aria-hidden="true" /> : <Play size={14} aria-hidden="true" />}
+                {spawning ? 'Spawning...' : 'Spawn Run'}
               </button>
             </div>
           )}
           {task.status === "running" && (
             <button
               onClick={handleCancel}
-              aria-label="Cancel Task"
-              title="Cancel the active task run"
-              className="flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-bold bg-rose-700 hover:bg-rose-600 text-white transition"
+              disabled={cancelling}
+              aria-busy={cancelling}
+              aria-label={cancelling ? "Cancelling task..." : "Cancel Task"}
+              title={cancelling ? "Cancelling task..." : "Cancel the active task run"}
+              className="flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-bold bg-rose-700 hover:bg-rose-600 text-white transition disabled:opacity-50"
             >
-              <Square size={14} aria-hidden="true" /> Cancel
+              {cancelling ? <Loader2 size={14} className="animate-spin" aria-hidden="true" /> : <Square size={14} aria-hidden="true" />}
+              {cancelling ? 'Cancelling...' : 'Cancel'}
             </button>
           )}
         </div>

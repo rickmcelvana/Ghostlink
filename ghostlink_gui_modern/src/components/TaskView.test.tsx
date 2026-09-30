@@ -67,4 +67,26 @@ describe('TaskView', () => {
       '/api/tasks/task_1/events?access_token=key_secret%2B123'
     );
   });
+
+  it('renders custom brief input with explicit aria-label and spawn button with aria attributes when task is idle', () => {
+    const idleTask: Task = { ...sampleTask, status: 'created' };
+    render(<TaskView task={idleTask} api={mockApi} />);
+
+    const briefInput = screen.getByLabelText('Custom task brief');
+    expect(briefInput).toBeInTheDocument();
+
+    const spawnBtn = screen.getByRole('button', { name: 'Spawn Implementer Run' });
+    expect(spawnBtn).toBeInTheDocument();
+    expect(spawnBtn).toHaveAttribute('aria-busy', 'false');
+    expect(spawnBtn).toHaveAttribute('title', 'Spawn an implementer agent run for this task');
+  });
+
+  it('renders cancel button with proper accessibility attributes when task is running', () => {
+    render(<TaskView task={sampleTask} api={mockApi} />);
+
+    const cancelBtn = screen.getByRole('button', { name: 'Cancel Task' });
+    expect(cancelBtn).toBeInTheDocument();
+    expect(cancelBtn).toHaveAttribute('aria-busy', 'false');
+    expect(cancelBtn).toHaveAttribute('title', 'Cancel the active task run');
+  });
 });
