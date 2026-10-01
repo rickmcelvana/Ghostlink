@@ -56,6 +56,7 @@ Before running shell commands or file mutations, the runtime passes the request 
 - **Task API Server Handlers (`crates/ghost-link/src/task_api.rs`)**: Axum routes for `/api/projects`, `/api/tasks`, `/api/reviews`, and EventSource SSE event streaming with RBAC (`Viewer` read-only vs `Operator` mutation) and `?access_token=` authentication. Studio EventSource and control-plane now share jwt_secret.txt and accept ?access_token= on task SSE only.
 
 ### Implemented v2.4 Capabilities:
+- **Studio Chat Agent Mode & GUI Wiring**: Agent Mode toggle in Studio Chat, workspace `root_path` validation, `POST /api/chat/agent` dispatch (or create project/task fallback), live task card SSE event streams, and inline `ReviewPane` decisions with `request_changes` respawning. Shared authenticated `GhostlinkAPI` client propagation across `ProjectsTab` and `TaskView` with base URL EventSource resolution and polling fallback.
 - **Bounded Agent Tool Loop**: Real bounded tool-calling loop using in-process `AgentBackend` and OpenAI-compatible inference with deterministic `Judge` policy evaluation, staged file mutations in `.ghostlink/tasks/<id>/proposed/`, real shell tool execution, and budget controls (`max_steps`, `max_tokens`, `max_minutes`).
 - **v2.4 Child Fan-Out Trees**: Hierarchical child task creation (`parent_id`), budget inheritance, parent accept blocking (`check_parent_accept_allowed`), child task listing (`/api/tasks/:id/children`), and `planner` vs `implementer` role enforcement.
 - Per-role model routing across heterogeneous cluster nodes.

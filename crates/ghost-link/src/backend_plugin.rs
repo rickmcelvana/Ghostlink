@@ -47,6 +47,7 @@ pub struct PluginGenerationResult {
 /// Implemented by a custom inference backend. Object-safe (via `async-trait`)
 /// so instances can be stored as `Arc<dyn InferenceBackendPlugin>` in the
 /// registry.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait InferenceBackendPlugin: Send + Sync {
     /// The name a request selects this plugin with (`inference_backend` in

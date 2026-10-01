@@ -1,5 +1,4 @@
-import { resolveApiBase } from '../config';
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { Plus, FolderGit2, Loader2 } from 'lucide-react';
 import { Project, Task, GhostlinkAPI } from '../api';
 import { useAppStore } from '../store';
@@ -9,9 +8,8 @@ interface ProjectsTabProps {
   api?: GhostlinkAPI;
 }
 
-export const ProjectsTab: React.FC<ProjectsTabProps> = ({ api: propApi }) => {
-  const fallbackApi = useMemo(() => new GhostlinkAPI(resolveApiBase()), []);
-  const api = useMemo(() => propApi || fallbackApi, [propApi, fallbackApi]);
+export const ProjectsTab: React.FC<ProjectsTabProps> = ({ api }) => {
+  const activeApi = api!;
 
   const projects = useAppStore((state) => state.projects);
   const setProjects = useAppStore((state) => state.setProjects);
@@ -37,7 +35,7 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({ api: propApi }) => {
 
   const fetchProjects = useCallback(async () => {
     try {
-      const list = await api.listProjects();
+      const list = await activeApi.listProjects();
       setProjects(list);
       if (list.length > 0 && !activeProject) {
         setActiveProject(list[0]);
@@ -50,7 +48,7 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({ api: propApi }) => {
   const fetchTasks = useCallback(async () => {
     if (!activeProject) return;
     try {
-      const list = await api.listProjectTasks(activeProject.id);
+      const list = await activeApi.listProjectTasks(activeProject.id);
       setTasks(list);
       const needsReview = list.filter((t) => t.status === 'needs_review').length;
       setUnreadNeedsReviewCount(needsReview);
@@ -74,7 +72,7 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({ api: propApi }) => {
     if (!projName.trim() || !projRootPath.trim() || isCreatingProj) return;
     setIsCreatingProj(true);
     try {
-      const created = await api.createProject({
+      const created = await activeApi.createProject({
         name: projName.trim(),
         root_path: projRootPath.trim(),
         kind: projKind,
@@ -97,7 +95,7 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({ api: propApi }) => {
     if (!activeProject || !taskGoal.trim() || isCreatingTask) return;
     setIsCreatingTask(true);
     try {
-      const created = await api.createTask(activeProject.id, {
+      const created = await activeApi.createTask(activeProject.id, {
         goal: taskGoal.trim(),
         acceptance_criteria: taskAcceptance.trim() || undefined,
       });
@@ -214,7 +212,7 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({ api: propApi }) => {
       {/* Main Panel: Task Detail or Empty State */}
       <div className="flex-1 min-h-0 bg-slate-950">
         {activeTask ? (
-          <TaskView task={activeTask} api={api} onRefresh={fetchTasks} />
+          <TaskView task={activeTask} api={activeApi} onRefresh={fetchTasks} />
         ) : (
           <div className="h-full flex flex-col items-center justify-center text-slate-500 space-y-3 p-6 text-center">
             <FolderGit2 size={48} className="text-slate-700" aria-hidden="true" />

@@ -9,6 +9,8 @@ describe('GhostlinkAPI', () => {
   const mockAxiosInstance = {
     get: vi.fn(),
     post: vi.fn(),
+    patch: vi.fn(),
+    put: vi.fn(),
     delete: vi.fn(),
     defaults: { baseURL: 'http://127.0.0.1:8003' },
     interceptors: {
@@ -568,6 +570,150 @@ describe('GhostlinkAPI', () => {
       
       expect(result.progress).toBe(0.5);
       expect(result.status).toBe('downloading');
+    });
+  });
+  describe("Projects & Tasks Operations", () => {
+    it("should list projects", async () => {
+      mockAxiosInstance.get.mockResolvedValue({ data: [{ id: "p1", name: "Project 1", kind: "code", root_path: ".", allowed_tools: [], created_at: "2026-01-01" }] });
+      const projects = await api.listProjects();
+      expect(projects).toHaveLength(1);
+      expect(projects[0].name).toBe("Project 1");
+      expect(mockAxiosInstance.get).toHaveBeenCalledWith("/api/projects");
+    });
+
+    it("should create project", async () => {
+      mockAxiosInstance.post.mockResolvedValue({ data: { id: "p1", name: "New Project", kind: "code", root_path: ".", allowed_tools: [], created_at: "2026-01-01" } });
+      const proj = await api.createProject({ name: "New Project", root_path: "." });
+      expect(proj.id).toBe("p1");
+      expect(mockAxiosInstance.post).toHaveBeenCalledWith("/api/projects", { name: "New Project", root_path: "." });
+    });
+
+    it("should get project by id", async () => {
+      mockAxiosInstance.get.mockResolvedValue({ data: { id: "p1", name: "Project 1" } });
+      const proj = await api.getProject("p1");
+      expect(proj.id).toBe("p1");
+      expect(mockAxiosInstance.get).toHaveBeenCalledWith("/api/projects/p1");
+    });
+
+    it("should update project", async () => {
+      mockAxiosInstance.patch.mockResolvedValue({ data: { id: "p1", name: "Updated Project" } });
+      const proj = await api.updateProject("p1", { name: "Updated Project" });
+      expect(proj.name).toBe("Updated Project");
+      expect(mockAxiosInstance.patch).toHaveBeenCalledWith("/api/projects/p1", { name: "Updated Project" });
+    });
+
+    it("should list project tasks", async () => {
+      mockAxiosInstance.get.mockResolvedValue({ data: [{ id: "t1", project_id: "p1", goal: "Task 1", status: "queued" }] });
+      const tasks = await api.listProjectTasks("p1");
+      expect(tasks).toHaveLength(1);
+      expect(tasks[0].id).toBe("t1");
+      expect(mockAxiosInstance.get).toHaveBeenCalledWith("/api/projects/p1/tasks");
+    });
+
+    it("should create task", async () => {
+      mockAxiosInstance.post.mockResolvedValue({ data: { id: "t1", project_id: "p1", goal: "My Goal", status: "queued" } });
+      const task = await api.createTask("p1", { goal: "My Goal" });
+      expect(task.id).toBe("t1");
+      expect(mockAxiosInstance.post).toHaveBeenCalledWith("/api/projects/p1/tasks", { goal: "My Goal" });
+    });
+
+    it("should list task children", async () => {
+      mockAxiosInstance.get.mockResolvedValue({ data: [{ id: "child-1", parent_id: "t1" }] });
+      const children = await api.listTaskChildren("t1");
+      expect(children).toHaveLength(1);
+      expect(mockAxiosInstance.get).toHaveBeenCalledWith("/api/tasks/t1/children");
+    });
+
+    it("should get task details", async () => {
+      mockAxiosInstance.get.mockResolvedValue({ data: { id: "t1", goal: "Goal" } });
+      const task = await api.getTask("t1");
+      expect(task.id).toBe("t1");
+      expect(mockAxiosInstance.get).toHaveBeenCalledWith("/api/tasks/t1");
+    });
+
+    it("should spawn task", async () => {
+      mockAxiosInstance.post.mockResolvedValue({ data: { id: "run-1", task_id: "t1", status: "running" } });
+      const run = await api.spawnTask("t1", { brief: "Custom brief" });
+      expect(run.id).toBe("run-1");
+      expect(mockAxiosInstance.post).toHaveBeenCalledWith("/api/tasks/t1/spawn", { brief: "Custom brief" });
+    });
+
+    it("should cancel task", async () => {
+      mockAxiosInstance.post.mockResolvedValue({ data: { id: "t1", status: "cancelled" } });
+      const task = await api.cancelTask("t1");
+      expect(task.status).toBe("cancelled");
+      expect(mockAxiosInstance.post).toHaveBeenCalledWith("/api/tasks/t1/cancel");
+    });
+
+    it("should get task review packet", async () => {
+      mockAxiosInstance.get.mockResolvedValue({ data: { id: "rev-1", task_id: "t1", summary: "Summary" } });
+      const rev = await api.getTaskReview("t1");
+      expect(rev.id).toBe("rev-1");
+      expect(mockAxiosInstance.get).toHaveBeenCalledWith("/api/tasks/t1/review");
+    });
+
+    it("should decide review", async () => {
+      mockAxiosInstance.post.mockResolvedValue({ data: { status: "accepted", task_id: "t1" } });
+      const res = await api.decideReview("rev-1", { decision: "accept" });
+      expect(res.status).toBe("accepted");
+      expect(mockAxiosInstance.post).toHaveBeenCalledWith("/api/reviews/rev-1/decide", { decision: "accept" });
+    });
+
+    it("should start chat agent via POST /api/chat/agent when present", async () => {
+      const mockResult = {
+        project: { id: "p1", name: "Studio Chat Project" },
+        task: { id: "t1", goal: "Fix bug" },
+        run: { id: "r1", status: "running" },
+      };
+      mockAxiosInstance.post.mockResolvedValue({ data: mockResult });
+
+      const res = await api.startChatAgent({ prompt: "Fix bug", root_path: "." });
+
+      expect(res.project.id).toBe("p1");
+      expect(res.task.id).toBe("t1");
+      expect(mockAxiosInstance.post).toHaveBeenCalledWith("/api/chat/agent", { prompt: "Fix bug", root_path: "." });
+    });
+
+    it("should fallback to create project + task + spawn when /api/chat/agent is 404", async () => {
+      const err404: any = new Error("Not Found");
+      err404.response = { status: 404 };
+
+      mockAxiosInstance.post.mockRejectedValueOnce(err404);
+      mockAxiosInstance.get.mockResolvedValueOnce({ data: [] });
+      mockAxiosInstance.post.mockResolvedValueOnce({ data: { id: "proj-new", name: "Studio Chat Project", root_path: "." } });
+      mockAxiosInstance.post.mockResolvedValueOnce({ data: { id: "task-new", goal: "Fix bug", project_id: "proj-new" } });
+      mockAxiosInstance.post.mockResolvedValueOnce({ data: { id: "run-new", task_id: "task-new", status: "running" } });
+
+      const res = await api.startChatAgent({ prompt: "Fix bug", root_path: "." });
+
+      expect(res.project.id).toBe("proj-new");
+      expect(res.task.id).toBe("task-new");
+      expect(res.run.id).toBe("run-new");
+    });
+
+    it("surfaces 401/403 authorization errors for project listing instead of swallowing them", async () => {
+      const err401: any = new Error("Unauthorized");
+      err401.response = { status: 401, data: { error: "Unauthorized" } };
+      mockAxiosInstance.get.mockRejectedValue(err401);
+
+      await expect(api.listProjects()).rejects.toThrow();
+    });
+
+    it("surfaces 401/403 authorization errors for task listing instead of swallowing them", async () => {
+      const err403: any = new Error("Forbidden");
+      err403.response = { status: 403, data: { error: "Forbidden" } };
+      mockAxiosInstance.get.mockRejectedValue(err403);
+
+      await expect(api.listProjectTasks("p1")).rejects.toThrow();
+    });
+  });
+
+  describe("Circuit Breaker", () => {
+    it("resets circuit breaker state to closed/0", () => {
+      api.resetCircuitBreaker();
+      const state = api.getCircuitBreakerState();
+      expect(state.state).toBe("closed");
+      expect(state.failures).toBe(0);
     });
   });
 });

@@ -1,4 +1,3 @@
-import { resolveApiBase } from "../config";
 import React, { useState, useEffect } from "react";
 import { Play, Square, Shield, Clock, Layers, KeyRound, Loader2 } from "lucide-react";
 import { Task, ReviewPacket, TaskEvent, GhostlinkAPI } from "../api";
@@ -7,12 +6,11 @@ import { ReviewPane } from "./ReviewPane";
 
 interface TaskViewProps {
   task: Task;
-  api?: GhostlinkAPI;
+  api: GhostlinkAPI;
   onRefresh?: () => void;
 }
 
-export const TaskView: React.FC<TaskViewProps> = ({ task, api: propApi, onRefresh }) => {
-  const api = React.useMemo(() => propApi || new GhostlinkAPI(resolveApiBase()), [propApi]);
+export const TaskView: React.FC<TaskViewProps> = ({ task, api, onRefresh }) => {
 
   const [review, setReview] = useState<ReviewPacket | null>(null);
   const [spawning, setSpawning] = useState<boolean>(false);
@@ -45,17 +43,47 @@ export const TaskView: React.FC<TaskViewProps> = ({ task, api: propApi, onRefres
     };
   }, [task.id, task.status, api]);
 
+  const [sseConnected, setSseConnected] = useState<boolean>(false);
+
+  // Polling fallback until SSE connects
+  useEffect(() => {
+    let interval: any = null;
+    if (!sseConnected && task.status === "running") {
+      interval = setInterval(() => {
+        if (onRefresh) onRefresh();
+      }, 3000);
+    }
+    return () => {
+      if (interval) clearInterval(interval);
+    };
+  }, [sseConnected, task.status, onRefresh]);
+
   // Connect to SSE event stream
   useEffect(() => {
     if (!apiKey) return;
 
-    const sseUrl = `/api/tasks/${task.id}/events?access_token=${encodeURIComponent(apiKey)}`;
+    const baseUrl = api.getApiBaseUrl ? api.getApiBaseUrl() : "";
+    const sseUrl = `${baseUrl}/api/tasks/${task.id}/events?access_token=${encodeURIComponent(apiKey)}`;
     const es = new EventSource(sseUrl);
+
+    es.onopen = () => {
+      setSseConnected(true);
+    };
+
+    es.onerror = () => {
+      setSseConnected(false);
+    };
+
     es.onmessage = (e) => {
       try {
         const ev: TaskEvent = JSON.parse(e.data);
         addTaskEvent(ev);
-        if (["needs_review", "accepted", "rejected", "cancelled", "blocked"].includes(ev.kind) && onRefresh) {
+        if (
+          ["needs_review", "accepted", "rejected", "cancelled", "blocked", "review_ready", "error"].includes(
+            ev.kind
+          ) &&
+          onRefresh
+        ) {
           onRefresh();
         }
       } catch {
@@ -65,7 +93,7 @@ export const TaskView: React.FC<TaskViewProps> = ({ task, api: propApi, onRefres
     return () => {
       es.close();
     };
-  }, [task.id, apiKey, addTaskEvent, onRefresh]);
+  }, [task.id, apiKey, api, addTaskEvent, onRefresh]);
 
   const handleSpawn = async () => {
     setSpawning(true);
