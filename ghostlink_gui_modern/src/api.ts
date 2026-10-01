@@ -1,3 +1,4 @@
+import { resolveApiBase } from "./config";
 
 export interface Project {
   id: string;
@@ -181,11 +182,40 @@ export class GhostlinkAPI {
       }
       return config;
     });
+
+    this.http.interceptors.response.use(
+      (response) => {
+        this.recordSuccess();
+        return response;
+      },
+      (error) => {
+        this.recordFailure();
+        return Promise.reject(error);
+      }
+    );
   }
 
   /** Reads the API key/token currently set for this app session. */
   getApiKey(): string {
     return this.apiKey;
+  }
+
+  getApiBaseUrl(): string {
+    return this.http.defaults.baseURL || resolveApiBase();
+  }
+
+  private recordSuccess(): void {
+    this.circuitBreaker.failures = 0;
+    this.circuitBreaker.successes += 1;
+    this.circuitBreaker.state = "closed";
+  }
+
+  private recordFailure(): void {
+    this.circuitBreaker.failures += 1;
+    this.circuitBreaker.lastFailureTime = Date.now();
+    if (this.circuitBreaker.failures >= 5) {
+      this.circuitBreaker.state = "open";
+    }
   }
 
   /** Sets the in-memory API key (or JWT) used to authenticate every request from
@@ -1273,6 +1303,49 @@ export class GhostlinkAPI {
   async decideReview(reviewId: string, data: { decision: 'accept' | 'request_changes' | 'reject'; note?: string }): Promise<{ status: string; task_id: string }> {
     const res = await this.http.post(`/api/reviews/${reviewId}/decide`, data);
     return res.data;
+  }
+
+  async startChatAgent(payload: { prompt: string; root_path?: string; model?: string; project_id?: string }): Promise<{ project: Project; task: Task; run: AgentRun }> {
+    try {
+      const res = await this.http.post("/api/chat/agent", payload);
+      return res.data;
+    } catch (error: any) {
+      const is404 = error?.response?.status === 404 || this.isNotFound(error);
+      if (is404) {
+        let project: Project;
+        if (payload.project_id) {
+          project = await this.getProject(payload.project_id);
+        } else {
+          const root = payload.root_path || ".";
+          const projects = await this.listProjects();
+          const existing = projects.find((p) => p.root_path === root);
+          if (existing) {
+            project = existing;
+          } else {
+            project = await this.createProject({
+              name: "Studio Chat Project",
+              kind: "code",
+              root_path: root,
+              default_model: payload.model,
+            });
+          }
+        }
+
+        const task = await this.createTask(project.id, {
+          goal: payload.prompt,
+          model: payload.model,
+        });
+
+        const run = await this.spawnTask(task.id, {
+          role: "implementer",
+          model: payload.model,
+          brief: payload.prompt,
+        });
+
+        return { project, task, run };
+      }
+      throw error;
+    }
   }
 
 }

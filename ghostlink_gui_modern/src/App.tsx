@@ -289,7 +289,7 @@ function App() {
       case 8:
         return <EditorTab api={api} />;
       case 9:
-        return <ProjectsTab />;
+        return <ProjectsTab api={api} />;
       default:
         return null;
     }

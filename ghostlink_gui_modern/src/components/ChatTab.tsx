@@ -37,7 +37,8 @@ import {
   ChatMessage,
   Thread,
   } from "../store";
-import { GhostlinkAPI } from "../api";
+import { GhostlinkAPI, Task, ReviewPacket, TaskEvent } from "../api";
+import { ReviewPane } from "./ReviewPane";
 import { useInferenceEngines } from "../hooks/useInferenceEngines";
 
 type Message = ChatMessage;
@@ -120,6 +121,130 @@ const SUGGESTIONS = [
   { text: "Show performance metrics overview", label: "Ask about performance metrics overview" },
 ];
 
+
+const TaskChatMessageCard: React.FC<{ taskId: string; api: GhostlinkAPI }> = ({ taskId, api }) => {
+  const [task, setTask] = useState<Task | null>(null);
+  const [review, setReview] = useState<ReviewPacket | null>(null);
+  const [events, setEvents] = useState<TaskEvent[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  const apiKey = api.getApiKey?.() || "";
+
+  const refreshTaskAndReview = useCallback(async () => {
+    try {
+      const fetchedTask = await api.getTask(taskId);
+      setTask(fetchedTask);
+      if (["needs_review", "accepted", "rejected", "blocked"].includes(fetchedTask.status)) {
+        try {
+          const rev = await api.getTaskReview(taskId);
+          setReview(rev);
+        } catch {
+          setReview(null);
+        }
+      }
+    } catch (err: any) {
+      setError(err.message || "Failed to fetch task details");
+    }
+  }, [api, taskId]);
+
+  useEffect(() => {
+    refreshTaskAndReview();
+  }, [refreshTaskAndReview]);
+
+  useEffect(() => {
+    if (!apiKey) return;
+
+    const baseUrl = api.getApiBaseUrl ? api.getApiBaseUrl() : "";
+    const sseUrl = `${baseUrl}/api/tasks/${taskId}/events?access_token=${encodeURIComponent(apiKey)}`;
+    const es = new EventSource(sseUrl);
+
+    es.onmessage = (e) => {
+      try {
+        const ev: TaskEvent = JSON.parse(e.data);
+        setEvents((prev) => [...prev, ev]);
+        if (
+          ["needs_review", "accepted", "rejected", "cancelled", "blocked", "review_ready", "error"].includes(
+            ev.kind
+          )
+        ) {
+          refreshTaskAndReview();
+        }
+      } catch {
+        /* parse error */
+      }
+    };
+
+    return () => {
+      es.close();
+    };
+  }, [taskId, apiKey, api, refreshTaskAndReview]);
+
+  const handleReviewDecided = async () => {
+    await refreshTaskAndReview();
+  };
+
+  if (error) {
+    return (
+      <div className="p-3 bg-rose-500/10 border border-rose-500/20 rounded-xl text-rose-400 text-xs">
+        Failed to load agent task execution ({error}).
+      </div>
+    );
+  }
+
+  if (!task) {
+    return (
+      <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl flex items-center gap-2 text-slate-400 text-xs">
+        <Loader className="animate-spin" size={14} /> Loading Task Agent...
+      </div>
+    );
+  }
+
+  return (
+    <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-3 my-2 shadow-xl">
+      <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+        <div className="flex items-center gap-2">
+          <Sparkles size={14} className="text-indigo-400" />
+          <span className="font-bold text-xs text-slate-200">Agent Task #{task.id.slice(0, 8)}</span>
+        </div>
+        <span
+          className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
+            task.status === "needs_review"
+              ? "bg-amber-500/20 text-amber-400 border border-amber-500/30"
+              : task.status === "running"
+              ? "bg-indigo-500/20 text-indigo-400 border border-indigo-500/30 animate-pulse"
+              : task.status === "accepted"
+              ? "bg-green-500/20 text-green-400 border border-green-500/30"
+              : task.status === "rejected"
+              ? "bg-rose-500/20 text-rose-400 border border-rose-500/30"
+              : "bg-slate-800 text-slate-400 border border-slate-700"
+          }`}
+        >
+          {task.status}
+        </span>
+      </div>
+
+      <p className="text-xs text-slate-300 font-medium">{task.goal}</p>
+
+      {events.length > 0 && (
+        <div className="bg-slate-950 rounded-lg p-2.5 max-h-36 overflow-y-auto font-mono text-[11px] space-y-1 border border-slate-800">
+          {events.slice(-5).map((ev, idx) => (
+            <div key={idx} className="flex items-start gap-2 text-slate-400">
+              <span className="text-indigo-400 font-bold uppercase">{ev.kind}</span>
+              <span className="truncate">{JSON.stringify(ev.payload)}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {review && (
+        <div className="mt-3">
+          <ReviewPane packet={review} api={api} onDecided={handleReviewDecided} />
+        </div>
+      )}
+    </div>
+  );
+};
+
 export const ChatTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
   const {
     currentModel, models, setCurrentModel, mcpServers, setMcpServers,
@@ -152,6 +277,8 @@ export const ChatTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
   // Knobs & presets
   const [showKnobs, setShowKnobs] = useState(false);
   const [showPromptLibrary, setShowPromptLibrary] = useState(false);
+  const [agentMode, setAgentMode] = useState<boolean>(false);
+  const [agentRootPath, setAgentRootPath] = useState<string>(".");
   const [showToolSelector, setShowToolSelector] = useState(false);
   const [selectedPresetId, setSelectedPresetId] = useState("default");
 
@@ -406,6 +533,54 @@ export const ChatTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
       .join("\n");
     const messageText = (attachmentsBlock ? `${attachmentsBlock}\n${input}` : input).trim();
     if (!messageText || loading) return;
+
+    if (agentMode) {
+      if (!agentRootPath.trim()) {
+        addToast({ type: "error", message: "Workspace root path is required for Agent Mode." });
+        return;
+      }
+
+      setAttachments([]);
+      setInput("");
+      setError(null);
+
+      const userMessage: Message = {
+        role: "user",
+        content: messageText,
+        id: Date.now().toString(),
+        timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+      };
+
+      setMessages((prev) => [...prev, userMessage]);
+      setLoading(true);
+
+      try {
+        const result = await api.startChatAgent({
+          prompt: messageText,
+          root_path: agentRootPath.trim(),
+          model: currentModel === "none" ? undefined : currentModel,
+        });
+
+        const assistantMessage: Message = {
+          role: "assistant",
+          content: `Task agent spawned for goal: ${result.task.goal}`,
+          id: (Date.now() + 1).toString(),
+          timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+          taskId: result.task.id,
+          agentRootPath: agentRootPath.trim(),
+        };
+
+        setMessages((prev) => [...prev, assistantMessage]);
+      } catch (err: any) {
+        addToast({
+          type: "error",
+          message: err.response?.data?.error || err.message || "Failed to start agent task",
+        });
+      } finally {
+        setLoading(false);
+      }
+      return;
+    }
 
     setAttachments([]);
 
@@ -1058,18 +1233,22 @@ export const ChatTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
                               : "bg-slate-900/60 border-slate-800/80 text-slate-200 shadow-md"
                           }`}
                         >
-                          <div className={MARKDOWN_PROSE_CLASSES}>
-                            <ReactMarkdown
-                              remarkPlugins={[remarkGfm]}
-                              rehypePlugins={[rehypeHighlight]}
-                              components={{
-                                code: CodeBlock,
-                                table: MarkdownTable,
-                              }}
-                            >
-                              {m.content}
-                            </ReactMarkdown>
-                          </div>
+                          {m.taskId ? (
+                            <TaskChatMessageCard taskId={m.taskId} api={api} />
+                          ) : (
+                            <div className={MARKDOWN_PROSE_CLASSES}>
+                              <ReactMarkdown
+                                remarkPlugins={[remarkGfm]}
+                                rehypePlugins={[rehypeHighlight]}
+                                components={{
+                                  code: CodeBlock,
+                                  table: MarkdownTable,
+                                }}
+                              >
+                                {m.content}
+                              </ReactMarkdown>
+                            </div>
+                          )}
 
                           {/* Controls Footer */}
                           <div className="flex items-center gap-2 mt-3 pt-2 border-t border-slate-800/40 text-xs text-slate-500">
@@ -1277,6 +1456,40 @@ export const ChatTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
               </div>
             )}
 
+            <div className="flex items-center gap-3 px-4 py-2 bg-slate-900/80 border-b border-slate-800 text-xs rounded-t-2xl">
+              <button
+                type="button"
+                onClick={() => setAgentMode(!agentMode)}
+                className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg font-bold transition ${
+                  agentMode
+                    ? "bg-indigo-600 text-white shadow"
+                    : "bg-slate-800 text-slate-400 hover:text-slate-200"
+                }`}
+                title={agentMode ? "Agent Mode Active" : "Enable Agent Mode"}
+                aria-label={agentMode ? "Disable Agent Mode" : "Enable Agent Mode"}
+              >
+                <Bot size={14} aria-hidden="true" />
+                <span>Agent Mode</span>
+              </button>
+
+              {agentMode && (
+                <div className="flex items-center gap-2 flex-1 min-w-0">
+                  <label htmlFor="agent-root-path-input" className="text-slate-400 shrink-0 font-medium">
+                    Root Path:
+                  </label>
+                  <input
+                    id="agent-root-path-input"
+                    type="text"
+                    required
+                    value={agentRootPath}
+                    onChange={(e) => setAgentRootPath(e.target.value)}
+                    placeholder="Workspace root path (e.g. .)"
+                    className="px-2 py-1 bg-slate-950 border border-slate-700 rounded text-slate-200 text-xs focus:outline-none focus:ring-1 focus:ring-indigo-500 flex-1 max-w-xs"
+                    aria-label="Workspace root path"
+                  />
+                </div>
+              )}
+            </div>
             <div
               onDragOver={(e) => {
                 e.preventDefault();

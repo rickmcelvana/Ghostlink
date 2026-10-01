@@ -38,7 +38,8 @@ describe('TaskView', () => {
     }) as any;
 
     mockApi = {
-      getApiKey: vi.fn().mockReturnValue(''),
+      getApiKey: vi.fn(),
+      getApiBaseUrl: vi.fn().mockReturnValue("").mockReturnValue(''),
       getTaskReview: vi.fn().mockResolvedValue(null),
       spawnTask: vi.fn().mockResolvedValue({}),
       cancelTask: vi.fn().mockResolvedValue({}),

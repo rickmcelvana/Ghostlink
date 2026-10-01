@@ -729,8 +729,121 @@ async fn handle_get_task_children(
     }
 }
 
+#[derive(Deserialize)]
+pub struct StartChatAgentReq {
+    pub prompt: String,
+    pub root_path: Option<String>,
+    pub model: Option<String>,
+    pub project_id: Option<String>,
+}
+
+async fn handle_start_chat_agent(
+    State(state): State<Arc<std::sync::Mutex<BackendState>>>,
+    Json(payload): Json<StartChatAgentReq>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    if payload.prompt.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "prompt is required" })),
+        ));
+    }
+
+    let (store, current_model) = {
+        let guard = state.lock().unwrap();
+        (Arc::clone(&guard.task_store), guard.current_model.clone())
+    };
+
+    let project = if let Some(proj_id) = payload.project_id {
+        match store.get_project(&proj_id) {
+            Ok(p) => p,
+            Err(e) => {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": e.to_string() })),
+                ))
+            }
+        }
+    } else {
+        let root = payload.root_path.clone().unwrap_or_else(|| ".".to_string());
+        let projects = store.list_projects().unwrap_or_default();
+        if let Some(existing) = projects.into_iter().find(|p| p.root_path == root) {
+            existing
+        } else {
+            match store.create_project(
+                "Studio Chat Project".to_string(),
+                ProjectKind::Code,
+                root,
+                None,
+                payload.model.clone(),
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({ "error": e.to_string() })),
+                    ))
+                }
+            }
+        }
+    };
+
+    let task = match store.create_task(
+        &project.id,
+        payload.prompt.clone(),
+        None,
+        Some(TaskBudget::default()),
+        None,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            ))
+        }
+    };
+
+    let model = payload
+        .model
+        .or(project.default_model.clone())
+        .unwrap_or(current_model);
+
+    let cancel_token = CancellationToken::new();
+    store.register_cancel_token(task.id.clone(), cancel_token.clone());
+
+    let backend = Arc::new(RealAgentBackend {
+        state: Arc::clone(&state),
+    });
+
+    match crate::task_runtime::TaskRunner::spawn_implementer(
+        store,
+        backend,
+        task.clone(),
+        "implementer".to_string(),
+        model,
+        Some(payload.prompt),
+        cancel_token,
+    )
+    .await
+    {
+        Ok(run) => Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "project": project,
+                "task": task,
+                "run": run,
+            })),
+        )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )),
+    }
+}
+
 pub fn router() -> Router<Arc<std::sync::Mutex<BackendState>>> {
     Router::new()
+        .route("/api/chat/agent", post(handle_start_chat_agent))
         .route(
             "/api/projects",
             post(handle_create_project).get(handle_list_projects),

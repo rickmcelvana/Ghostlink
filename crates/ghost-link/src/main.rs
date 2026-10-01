@@ -12309,6 +12309,10 @@ mod tests {
             "reading PQC state is a GET, distinct from POST .../pqc/enable which is Owner-only"
         );
         assert_eq!(
+            required_role(&Method::POST, "/api/chat/agent"),
+            auth::Role::Operator
+        );
+        assert_eq!(
             required_role(&Method::POST, "/api/models/load"),
             auth::Role::Operator
         );

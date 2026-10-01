@@ -185,6 +185,8 @@ export interface ChatMessage {
   compareGroupId?: string;
   truncatedBefore?: boolean;
   isDivider?: boolean;
+  taskId?: string;
+  agentRootPath?: string;
 }
 
 export interface SystemPromptPreset {
