@@ -749,6 +749,7 @@ pub struct AgentResponse {
     pub tool_calls: Vec<ToolCall>,
 }
 
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait AgentBackend: Send + Sync {
     async fn chat(
