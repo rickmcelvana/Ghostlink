@@ -59,5 +59,5 @@ Before running shell commands or file mutations, the runtime passes the request 
 - **Bounded Agent Tool Loop**: Real bounded tool-calling loop using in-process `AgentBackend` and OpenAI-compatible inference with deterministic `Judge` policy evaluation, staged file mutations in `.ghostlink/tasks/<id>/proposed/`, real shell tool execution, and budget controls (`max_steps`, `max_tokens`, `max_minutes`).
 - **v2.4 Child Fan-Out Trees**: Hierarchical child task creation (`parent_id`), budget inheritance, parent accept blocking (`check_parent_accept_allowed`), child task listing (`/api/tasks/:id/children`), and `planner` vs `implementer` role enforcement.
 - Per-role model routing across heterogeneous cluster nodes.
-- Git worktree management for parallel agents.
+- Per-task proposed/ staging directory isolation for parallel agents.
 - Agent skills, voice interfaces, or cloud model routing.

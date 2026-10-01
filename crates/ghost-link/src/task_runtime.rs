@@ -250,7 +250,8 @@ impl TaskRuntimeStore {
         fs::create_dir_all(path.join("runs"))?;
         fs::create_dir_all(path.join("reviews"))?;
 
-        let (event_bus, _) = broadcast::channel(1024);
+        fs::create_dir_all(path.join("events"))?;
+        let (event_bus, _) = broadcast::channel(64);
 
         Ok(Self {
             data_dir: path,
@@ -264,7 +265,40 @@ impl TaskRuntimeStore {
     }
 
     pub fn emit_event(&self, event: TaskEvent) {
+        let events_dir = self.data_dir.join("events");
+        let file_path = events_dir.join(format!("{}.jsonl", event.task_id));
+        if let Ok(json) = serde_json::to_string(&event) {
+            use std::io::Write;
+            if let Ok(mut file) = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(file_path)
+            {
+                let _ = writeln!(file, "{}", json);
+            }
+        }
         let _ = self.event_bus.send(event);
+    }
+
+    pub fn get_task_events(&self, task_id: &str) -> Vec<TaskEvent> {
+        let file_path = self
+            .data_dir
+            .join("events")
+            .join(format!("{}.jsonl", task_id));
+        let mut events = Vec::new();
+        if file_path.exists() {
+            if let Ok(content) = fs::read_to_string(file_path) {
+                for line in content.lines() {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() {
+                        if let Ok(ev) = serde_json::from_str::<TaskEvent>(trimmed) {
+                            events.push(ev);
+                        }
+                    }
+                }
+            }
+        }
+        events
     }
 
     pub fn register_cancel_token(
@@ -751,6 +785,96 @@ fn list_dir_relative(
 pub struct TaskRunner;
 
 impl TaskRunner {
+    #[allow(dead_code)]
+    pub async fn spawn_implementer_joined(
+        store: Arc<TaskRuntimeStore>,
+        backend: Arc<dyn AgentBackend>,
+        task: Task,
+        role: String,
+        model: String,
+        brief: Option<String>,
+        cancel_token: tokio_util::sync::CancellationToken,
+    ) -> Result<AgentRun> {
+        let now = Utc::now().to_rfc3339();
+        let run = AgentRun {
+            id: format!("run_{}", Uuid::new_v4().simple()),
+            task_id: task.id.clone(),
+            role,
+            model,
+            status: "running".into(),
+            step_count: 0,
+            token_count: 0,
+            started_at: now,
+            finished_at: None,
+            error: None,
+        };
+
+        store.save_run(&run)?;
+        store.update_task_status(&task.id, TaskStatus::Running)?;
+        store.register_cancel_token(task.id.clone(), cancel_token.clone());
+
+        let mut run_clone = run.clone();
+        let res = Self::run_loop(
+            store.clone(),
+            backend,
+            task.clone(),
+            &mut run_clone,
+            brief,
+            cancel_token,
+        )
+        .await;
+
+        let finished_at = Utc::now().to_rfc3339();
+        run_clone.finished_at = Some(finished_at.clone());
+
+        match res {
+            Ok((review, final_status)) => {
+                run_clone.status = "finished".into();
+                let _ = store.save_run(&run_clone);
+                let _ = store.save_review(&review);
+                let _ = store.update_task_status(&task.id, final_status);
+
+                store.emit_event(TaskEvent {
+                    task_id: task.id.clone(),
+                    ts: Utc::now().timestamp_millis() as u64,
+                    kind: "review_ready".into(),
+                    payload: serde_json::to_value(&review).unwrap_or_default(),
+                });
+                Ok(run_clone)
+            }
+            Err(err) => {
+                let err_msg = err.to_string();
+                let is_cancelled = err_msg.contains("cancelled");
+                run_clone.status = if is_cancelled {
+                    "cancelled".into()
+                } else {
+                    "failed".into()
+                };
+                run_clone.error = Some(err_msg.clone());
+                let _ = store.save_run(&run_clone);
+
+                let status = if is_cancelled {
+                    TaskStatus::Cancelled
+                } else {
+                    TaskStatus::Blocked
+                };
+                let _ = store.update_task_status(&task.id, status);
+
+                store.emit_event(TaskEvent {
+                    task_id: task.id.clone(),
+                    ts: Utc::now().timestamp_millis() as u64,
+                    kind: if is_cancelled {
+                        "cancelled".into()
+                    } else {
+                        "error".into()
+                    },
+                    payload: serde_json::json!({ "error": err_msg }),
+                });
+
+                Err(anyhow!(err_msg))
+            }
+        }
+    }
     pub async fn spawn_implementer(
         store: Arc<TaskRuntimeStore>,
         backend: Arc<dyn AgentBackend>,
@@ -1934,5 +2058,201 @@ mod fanout_tests {
 
         let _ = fs::remove_dir_all(&temp_dir);
         let _ = fs::remove_dir_all(&proj_dir);
+    }
+}
+
+#[cfg(test)]
+mod parallel_and_compact_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_parallel_isolated_tools_execution() {
+        let temp_dir = std::env::temp_dir().join(format!("ghostlink_par_{}", Uuid::new_v4()));
+        let store = Arc::new(TaskRuntimeStore::new(&temp_dir).unwrap());
+
+        let proj_dir = std::env::temp_dir().join(format!("ghostlink_par_proj_{}", Uuid::new_v4()));
+        fs::create_dir_all(&proj_dir).unwrap();
+        fs::write(proj_dir.join("file1.txt"), "content 1").unwrap();
+        fs::write(proj_dir.join("file2.txt"), "content 2").unwrap();
+
+        let proj = store
+            .create_project(
+                "Parallel Proj".into(),
+                ProjectKind::Code,
+                proj_dir.to_string_lossy().to_string(),
+                None,
+                None,
+            )
+            .unwrap();
+
+        let task = store
+            .create_task(
+                &proj.id,
+                "Read two files in parallel".into(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let responses = Arc::new(Mutex::new(vec![
+            AgentResponse {
+                content: Some("Reading files...".into()),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "call_1".into(),
+                        name: "read_file".into(),
+                        args: serde_json::json!({ "path": "file1.txt" }),
+                    },
+                    ToolCall {
+                        id: "call_2".into(),
+                        name: "read_file".into(),
+                        args: serde_json::json!({ "path": "file2.txt" }),
+                    },
+                ],
+            },
+            AgentResponse {
+                content: Some("Done reading".into()),
+                tool_calls: vec![],
+            },
+        ]));
+
+        let backend = Arc::new(FakeBackend { responses });
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+
+        let run = TaskRunner::spawn_implementer_joined(
+            store.clone(),
+            backend,
+            task.clone(),
+            "implementer".into(),
+            "test-model".into(),
+            None,
+            cancel_token,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(run.status, "finished");
+        let review = store.get_task_review(&task.id).unwrap();
+        assert_eq!(review.task_id, task.id);
+    }
+
+    #[tokio::test]
+    async fn test_parent_review_waits_for_child_completion() {
+        let temp_dir = std::env::temp_dir().join(format!("ghostlink_wait_{}", Uuid::new_v4()));
+        let store = Arc::new(TaskRuntimeStore::new(&temp_dir).unwrap());
+
+        let proj_dir = std::env::temp_dir().join(format!("ghostlink_wait_proj_{}", Uuid::new_v4()));
+        fs::create_dir_all(&proj_dir).unwrap();
+
+        let proj = store
+            .create_project(
+                "Wait Proj".into(),
+                ProjectKind::Code,
+                proj_dir.to_string_lossy().to_string(),
+                None,
+                None,
+            )
+            .unwrap();
+
+        let parent_task = store
+            .create_task(&proj.id, "Parent task goal".into(), None, None, None)
+            .unwrap();
+
+        let responses = Arc::new(Mutex::new(vec![
+            AgentResponse {
+                content: Some("Spawning child...".into()),
+                tool_calls: vec![ToolCall {
+                    id: "call_spawn".into(),
+                    name: "spawn_subagent".into(),
+                    args: serde_json::json!({ "goal": "Child goal" }),
+                }],
+            },
+            AgentResponse {
+                content: Some("Parent finished".into()),
+                tool_calls: vec![],
+            },
+            AgentResponse {
+                content: Some("Child finished".into()),
+                tool_calls: vec![],
+            },
+        ]));
+
+        let backend = Arc::new(FakeBackend { responses });
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+
+        let run = TaskRunner::spawn_implementer_joined(
+            store.clone(),
+            backend,
+            parent_task.clone(),
+            "planner".into(),
+            "test-model".into(),
+            None,
+            cancel_token,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(run.status, "finished");
+        let children = store.list_child_tasks(&parent_task.id).unwrap();
+        assert_eq!(children.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_compact_review_diff_generation() {
+        let temp_dir = std::env::temp_dir().join(format!("ghostlink_diff_{}", Uuid::new_v4()));
+        let store = Arc::new(TaskRuntimeStore::new(&temp_dir).unwrap());
+
+        let proj_dir = std::env::temp_dir().join(format!("ghostlink_diff_proj_{}", Uuid::new_v4()));
+        fs::create_dir_all(&proj_dir).unwrap();
+        fs::write(proj_dir.join("code.rs"), "fn hello() {}\n").unwrap();
+
+        let proj = store
+            .create_project(
+                "Diff Proj".into(),
+                ProjectKind::Code,
+                proj_dir.to_string_lossy().to_string(),
+                None,
+                None,
+            )
+            .unwrap();
+
+        let task = store
+            .create_task(&proj.id, "Update code".into(), None, None, None)
+            .unwrap();
+
+        store
+            .write_proposed_file(
+                &proj.root_path,
+                &task.id,
+                "code.rs",
+                "fn hello() {\n    println!(\"world\");\n}\n",
+            )
+            .unwrap();
+
+        let responses = Arc::new(Mutex::new(vec![AgentResponse {
+            content: Some("Done".into()),
+            tool_calls: vec![],
+        }]));
+
+        let backend = Arc::new(FakeBackend { responses });
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+
+        let _run = TaskRunner::spawn_implementer_joined(
+            store.clone(),
+            backend,
+            task.clone(),
+            "implementer".into(),
+            "test-model".into(),
+            None,
+            cancel_token,
+        )
+        .await
+        .unwrap();
+
+        let review = store.get_task_review(&task.id).unwrap();
+        assert_eq!(review.diffs.len(), 1);
+        assert!(review.diffs[0].unified_diff.contains("--- a/code.rs"));
+        assert!(review.diffs[0].unified_diff.contains("+++ b/code.rs"));
     }
 }

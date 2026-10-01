@@ -674,23 +674,45 @@ async fn handle_get_task_events(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let store = Arc::clone(&state.lock().unwrap().task_store);
+    let historical_events = store.get_task_events(&id);
     let rx = store.subscribe_events();
-    let stream = tokio_stream::wrappers::BroadcastStream::new(rx);
-    let sse_stream = stream.filter_map(move |msg| {
-        if let Ok(event) = msg {
-            if event.task_id == id {
-                if let Ok(json) = serde_json::to_string(&event) {
-                    return Some(Ok::<_, std::convert::Infallible>(
-                        Event::default()
-                            .id(format!("{}_{}", event.task_id, event.ts))
-                            .data(json),
-                    ));
+
+    let (tx, rx_stream) =
+        tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(128);
+
+    tokio::spawn(async move {
+        // Replay historical events from JSONL
+        for event in historical_events {
+            if let Ok(json) = serde_json::to_string(&event) {
+                let sse_ev = Event::default()
+                    .id(format!("{}_{}", event.task_id, event.ts))
+                    .data(json);
+                if tx.send(Ok(sse_ev)).await.is_err() {
+                    return;
                 }
             }
         }
-        None
+
+        // Stream live tail events from broadcast
+        let mut bcast_stream = tokio_stream::wrappers::BroadcastStream::new(rx);
+        while let Some(msg) = bcast_stream.next().await {
+            if let Ok(event) = msg {
+                if event.task_id == id {
+                    if let Ok(json) = serde_json::to_string(&event) {
+                        let sse_ev = Event::default()
+                            .id(format!("{}_{}", event.task_id, event.ts))
+                            .data(json);
+                        if tx.send(Ok(sse_ev)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
     });
-    Sse::new(sse_stream).keep_alive(axum::response::sse::KeepAlive::default())
+
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx_stream);
+    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
 }
 
 async fn handle_get_task_children(
