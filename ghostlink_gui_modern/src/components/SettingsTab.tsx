@@ -35,6 +35,7 @@ export const SettingsTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
   const [settings, setSettings] = useState<SettingsType | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [resetting, setResetting] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState('');
   const [validationErrors, setValidationErrors] = useState<Record<string, string>>({});
@@ -129,7 +130,7 @@ export const SettingsTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
     if (!window.confirm('Are you sure you want to reset all settings to defaults? This will overwrite your current configuration.')) {
       return;
     }
-    setSaving(true);
+    setResetting(true);
     const result = await api.resetSettings();
     if (result.success && result.settings) {
       setSettings(result.settings);
@@ -140,7 +141,7 @@ export const SettingsTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
       const errMsg = result.error || 'Reset failed';
       addToast({ type: 'error', message: `Failed to reset settings: ${errMsg}` });
     }
-    setSaving(false);
+    setResetting(false);
   };
 
   useEffect(() => {
@@ -424,19 +425,25 @@ export const SettingsTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
           )}
           <button
             onClick={handleReset}
-            disabled={saving}
-            title="Reset all settings to defaults"
+            disabled={saving || resetting}
+            aria-busy={resetting}
+            aria-label={resetting ? 'Resetting settings to defaults...' : 'Reset all settings to defaults'}
+            title={resetting ? 'Resetting settings to defaults...' : 'Reset all settings to defaults'}
             className="flex items-center gap-2 px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl text-sm transition disabled:opacity-50 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
           >
-            <RotateCcw size={14} aria-hidden="true" /> Reset
+            {resetting ? <Loader2 size={14} className="animate-spin" aria-hidden="true" /> : <RotateCcw size={14} aria-hidden="true" />}
+            {resetting ? 'Resetting...' : 'Reset'}
           </button>
           <button
             onClick={handleSave}
-            disabled={saving}
-            title="Save changes to settings.json"
+            disabled={saving || resetting}
+            aria-busy={saving}
+            aria-label={saving ? 'Saving changes to settings.json...' : 'Save changes to settings.json'}
+            title={saving ? 'Saving changes to settings.json...' : 'Save changes to settings.json'}
             className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-xl text-sm font-bold transition shadow-lg shadow-blue-500/20 disabled:opacity-50 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
           >
-            <Save size={14} aria-hidden="true" /> {saving ? 'Saving...' : 'Save'}
+            {saving ? <Loader2 size={14} className="animate-spin" aria-hidden="true" /> : <Save size={14} aria-hidden="true" />}
+            {saving ? 'Saving...' : 'Save'}
           </button>
         </div>
       </div>
