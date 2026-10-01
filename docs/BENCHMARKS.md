@@ -1151,6 +1151,1182 @@ yet backed by measurement on this project:
 
 ---
 
+
+
+## KV cache microbenches
+
+- **Date**: 2026-03-31
+- **OS / CPU**: Linux 6.8.0 x86_64, Intel(R) Xeon(R) CPU @ 2.30GHz (4 cores)
+- **Rust / Build**: rustc 1.94.0, release build
+- **Command**: kv_cache/initialize/small
+                        time:   [190.30 µs 192.26 µs 193.87 µs]
+                        change: [-2.9907% +1.1902% +5.3370%] (p = 0.59 > 0.05)
+                        No change in performance detected.
+Found 5 outliers among 100 measurements (5.00%)
+  3 (3.00%) low severe
+  1 (1.00%) high mild
+  1 (1.00%) high severe
+kv_cache/write_kv_fill_256/small
+                        time:   [221.72 µs 225.04 µs 228.01 µs]
+                        change: [-3.9143% +3.8564% +12.432%] (p = 0.34 > 0.05)
+                        No change in performance detected.
+Found 10 outliers among 100 measurements (10.00%)
+  10 (10.00%) low severe
+kv_cache/write_kv_batch_64/small
+                        time:   [22.926 µs 23.221 µs 23.493 µs]
+                        change: [-10.892% -5.3673% +0.5704%] (p = 0.08 > 0.05)
+                        No change in performance detected.
+Found 8 outliers among 100 measurements (8.00%)
+  7 (7.00%) low severe
+  1 (1.00%) high mild
+kv_cache/read_kv_mid/small
+                        time:   [82.459 ns 82.512 ns 82.566 ns]
+                        change: [-3.1302% -3.0307% -2.9343%] (p = 0.00 < 0.05)
+                        Performance has improved.
+kv_cache/read_range_1/small
+                        time:   [86.005 ns 86.072 ns 86.137 ns]
+                        change: [-1.7028% -1.2138% -0.9174%] (p = 0.00 < 0.05)
+                        Change within noise threshold.
+Found 5 outliers among 100 measurements (5.00%)
+  2 (2.00%) low mild
+  2 (2.00%) high mild
+  1 (1.00%) high severe
+kv_cache/read_range_64/small
+                        time:   [5.5372 µs 5.5956 µs 5.6652 µs]
+                        change: [+3.9191% +5.7114% +7.5567%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
+kv_cache/read_range_1024/small
+                        time:   [138.87 µs 139.79 µs 140.65 µs]
+                        change: [+2.5985% +3.2229% +3.8554%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 24 outliers among 100 measurements (24.00%)
+  6 (6.00%) low mild
+  13 (13.00%) high mild
+  5 (5.00%) high severe
+kv_cache/decode_step_256/small
+                        time:   [3.0426 ms 3.0541 ms 3.0661 ms]
+                        change: [-3.0511% -2.5755% -2.1022%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+kv_cache/concurrent_4_readers_256/small
+                        time:   [29.691 µs 29.926 µs 30.193 µs]
+                        change: [+10.496% +15.082% +20.439%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 24 outliers among 100 measurements (24.00%)
+  19 (19.00%) high mild
+  5 (5.00%) high severe
+kv_cache/initialize/default
+                        time:   [199.08 µs 204.30 µs 211.16 µs]
+                        change: [+0.7658% +4.7528% +8.6017%] (p = 0.02 < 0.05)
+                        Change within noise threshold.
+Found 5 outliers among 100 measurements (5.00%)
+  2 (2.00%) low mild
+  1 (1.00%) high mild
+  2 (2.00%) high severe
+kv_cache/write_kv_fill_256/default
+                        time:   [230.96 µs 235.83 µs 239.93 µs]
+                        change: [-1.5464% +1.3502% +4.5756%] (p = 0.40 > 0.05)
+                        No change in performance detected.
+kv_cache/write_kv_batch_64/default
+                        time:   [23.202 µs 23.603 µs 23.996 µs]
+                        change: [-14.376% -12.169% -9.9916%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 4 outliers among 100 measurements (4.00%)
+  2 (2.00%) low mild
+  2 (2.00%) high mild
+kv_cache/read_kv_mid/default
+                        time:   [81.193 ns 81.268 ns 81.385 ns]
+                        change: [-3.0182% -2.6179% -1.9948%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 17 outliers among 100 measurements (17.00%)
+  4 (4.00%) high mild
+  13 (13.00%) high severe
+kv_cache/read_range_1/default
+                        time:   [81.916 ns 81.966 ns 82.018 ns]
+                        change: [-2.2782% -2.1649% -2.0492%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 5 outliers among 100 measurements (5.00%)
+  2 (2.00%) low mild
+  2 (2.00%) high mild
+  1 (1.00%) high severe
+kv_cache/read_range_64/default
+                        time:   [5.8477 µs 5.9339 µs 6.0292 µs]
+                        change: [+31.421% +34.038% +36.600%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+kv_cache/read_range_1024/default
+                        time:   [136.09 µs 137.07 µs 138.13 µs]
+                        change: [-1.9445% -1.1534% -0.3500%] (p = 0.01 < 0.05)
+                        Change within noise threshold.
+Found 4 outliers among 100 measurements (4.00%)
+  4 (4.00%) high mild
+kv_cache/decode_step_256/default
+                        time:   [3.3062 ms 3.3181 ms 3.3300 ms]
+                        change: [+8.5213% +8.9634% +9.4070%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+kv_cache/concurrent_4_readers_256/default
+                        time:   [28.390 µs 28.527 µs 28.668 µs]
+                        change: [-19.727% -16.794% -13.699%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 5 outliers among 100 measurements (5.00%)
+  1 (1.00%) low mild
+  1 (1.00%) high mild
+  3 (3.00%) high severe
+kv_cache/initialize/wide
+                        time:   [18.180 µs 19.652 µs 20.920 µs]
+                        change: [+16.763% +25.656% +34.179%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 3 outliers among 100 measurements (3.00%)
+  3 (3.00%) high mild
+kv_cache/write_kv_fill_256/wide
+                        time:   [5.7655 ms 5.7918 ms 5.8194 ms]
+                        change: [-3.4544% -2.5479% -1.6662%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 6 outliers among 100 measurements (6.00%)
+  6 (6.00%) high mild
+kv_cache/write_kv_batch_64/wide
+                        time:   [1.3586 ms 1.3606 ms 1.3626 ms]
+                        change: [-0.6507% -0.4416% -0.2465%] (p = 0.00 < 0.05)
+                        Change within noise threshold.
+Found 6 outliers among 100 measurements (6.00%)
+  1 (1.00%) low mild
+  5 (5.00%) high mild
+kv_cache/read_kv_mid/wide
+                        time:   [1.3040 µs 1.3225 µs 1.3430 µs]
+                        change: [-7.1605% -5.8861% -4.4482%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 13 outliers among 100 measurements (13.00%)
+  7 (7.00%) high mild
+  6 (6.00%) high severe
+kv_cache/read_range_1/wide
+                        time:   [1.2851 µs 1.3045 µs 1.3239 µs]
+                        change: [-8.1562% -6.9308% -5.7144%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 13 outliers among 100 measurements (13.00%)
+  5 (5.00%) high mild
+  8 (8.00%) high severe
+kv_cache/read_range_64/wide
+                        time:   [143.43 µs 144.80 µs 146.12 µs]
+                        change: [+5.9715% +6.8764% +7.7859%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+kv_cache/read_range_1024/wide
+                        time:   [32.299 ms 32.450 ms 32.631 ms]
+                        change: [+0.2079% +0.7443% +1.2910%] (p = 0.00 < 0.05)
+                        Change within noise threshold.
+Found 4 outliers among 100 measurements (4.00%)
+  4 (4.00%) high severe
+kv_cache/decode_step_256/wide
+                        time:   [112.58 ms 113.08 ms 113.60 ms]
+                        change: [+3.4193% +3.9335% +4.4432%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 4 outliers among 100 measurements (4.00%)
+  4 (4.00%) high mild
+kv_cache/concurrent_4_readers_256/wide
+                        time:   [1.3696 ms 1.3806 ms 1.3917 ms]
+                        change: [-11.262% -8.6108% -5.8873%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 2 outliers among 100 measurements (2.00%)
+  1 (1.00%) high mild
+  1 (1.00%) high severe
+
+> [!NOTE]
+> These numbers measure isolated KV cache primitive operations and memory copies in . They do not represent end-to-end LLM model inference tokens per second (tok/s).
+
+### Baseline (BEFORE) Measurements
+
+| Workload |  (1024, 4x64) |  (8192, 4x64) |  (2048, 32x128) | Notes |
+|---|---|---|---|---|
+|  | 182.17 µs | 182.50 µs | 13.10 µs | Upfront buffer allocation |
+|  | 208.07 µs | 212.73 µs | 5.73 ms | Sequential fill 256 tokens |
+|  | 23.14 µs | 22.09 µs | 1.37 ms | Batch write 64 tokens under 1 lock |
+|  | 82.54 ns | 81.56 ns | 1.28 µs | Owned read ( Vec alloc) |
+|  | 82.53 ns | 81.68 ns | 1.29 µs | Owned range read 1 token (Vec alloc) |
+|  | 5.43 µs | 5.16 µs | 141.32 µs | Owned range read 64 tokens |
+|  | 137.68 µs | 126.44 µs | 32.59 ms | Owned range read 1024 tokens |
+|  | 3.10 ms | 3.27 ms | 108.89 ms | Write 1 + Read 0..t+1 over 256 steps |
+|  | 29.14 µs | 40.93 µs | 1.36 ms | 4 reader threads looping range(0..256) |
+
+---
+
+
+## KV cache microbenches
+
+- **Date**: 2026-03-31
+- **OS / CPU**: Linux 6.8.0 x86_64, Intel(R) Xeon(R) CPU @ 2.30GHz (4 cores)
+- **Rust / Build**: rustc 1.94.0, release build
+- **Command**: kv_cache/initialize/small
+                        time:   [184.38 µs 186.18 µs 187.79 µs]
+                        change: [-6.4867% -2.3638% +1.6278%] (p = 0.28 > 0.05)
+                        No change in performance detected.
+Found 7 outliers among 100 measurements (7.00%)
+  3 (3.00%) low severe
+  1 (1.00%) low mild
+  1 (1.00%) high mild
+  2 (2.00%) high severe
+kv_cache/write_kv_fill_256/small
+                        time:   [216.27 µs 219.88 µs 223.14 µs]
+                        change: [-10.334% -2.5670% +5.3811%] (p = 0.52 > 0.05)
+                        No change in performance detected.
+Found 10 outliers among 100 measurements (10.00%)
+  10 (10.00%) low severe
+kv_cache/write_kv_batch_64/small
+                        time:   [21.725 µs 22.100 µs 22.449 µs]
+                        change: [-10.843% -5.2802% +0.4396%] (p = 0.08 > 0.05)
+                        No change in performance detected.
+Found 6 outliers among 100 measurements (6.00%)
+  6 (6.00%) low severe
+kv_cache/read_kv_mid/small
+                        time:   [85.133 ns 85.156 ns 85.181 ns]
+                        change: [+3.3751% +3.4926% +3.6267%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 10 outliers among 100 measurements (10.00%)
+  1 (1.00%) low mild
+  3 (3.00%) high mild
+  6 (6.00%) high severe
+kv_cache/read_range_1/small
+                        time:   [84.354 ns 84.411 ns 84.470 ns]
+                        change: [-1.9529% -1.8227% -1.7022%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 5 outliers among 100 measurements (5.00%)
+  1 (1.00%) low severe
+  1 (1.00%) high mild
+  3 (3.00%) high severe
+kv_cache/read_range_64/small
+                        time:   [5.2167 µs 5.3019 µs 5.3950 µs]
+                        change: [-10.579% -9.0968% -7.5337%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 10 outliers among 100 measurements (10.00%)
+  8 (8.00%) high mild
+  2 (2.00%) high severe
+kv_cache/read_range_1024/small
+                        time:   [135.64 µs 136.35 µs 137.08 µs]
+                        change: [-1.2627% -0.5366% +0.3013%] (p = 0.18 > 0.05)
+                        No change in performance detected.
+kv_cache/decode_step_256/small
+                        time:   [2.8531 ms 2.8601 ms 2.8672 ms]
+                        change: [-6.7956% -6.3521% -5.9238%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+kv_cache/concurrent_4_readers_256/small
+                        time:   [28.874 µs 28.994 µs 29.126 µs]
+                        change: [-16.126% -12.516% -8.8299%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 9 outliers among 100 measurements (9.00%)
+  2 (2.00%) low mild
+  2 (2.00%) high mild
+  5 (5.00%) high severe
+kv_cache/initialize/default
+                        time:   [183.67 µs 184.97 µs 186.20 µs]
+                        change: [-10.885% -7.3219% -3.9515%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 4 outliers among 100 measurements (4.00%)
+  2 (2.00%) low severe
+  2 (2.00%) low mild
+kv_cache/write_kv_fill_256/default
+                        time:   [218.89 µs 222.58 µs 225.89 µs]
+                        change: [-6.4576% -3.8892% -1.2478%] (p = 0.01 < 0.05)
+                        Performance has improved.
+kv_cache/write_kv_batch_64/default
+                        time:   [24.371 µs 24.747 µs 25.090 µs]
+                        change: [+2.0365% +4.7862% +7.5012%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 4 outliers among 100 measurements (4.00%)
+  3 (3.00%) low mild
+  1 (1.00%) high mild
+kv_cache/read_kv_mid/default
+                        time:   [81.404 ns 81.455 ns 81.512 ns]
+                        change: [-0.9962% -0.4954% -0.0802%] (p = 0.03 < 0.05)
+                        Change within noise threshold.
+Found 3 outliers among 100 measurements (3.00%)
+  2 (2.00%) high mild
+  1 (1.00%) high severe
+kv_cache/read_range_1/default
+                        time:   [81.649 ns 81.690 ns 81.736 ns]
+                        change: [-0.2913% -0.1824% -0.0713%] (p = 0.00 < 0.05)
+                        Change within noise threshold.
+Found 6 outliers among 100 measurements (6.00%)
+  1 (1.00%) low mild
+  4 (4.00%) high mild
+  1 (1.00%) high severe
+kv_cache/read_range_64/default
+                        time:   [5.6652 µs 5.7611 µs 5.8673 µs]
+                        change: [-7.2487% -5.6236% -3.9157%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 11 outliers among 100 measurements (11.00%)
+  9 (9.00%) high mild
+  2 (2.00%) high severe
+kv_cache/read_range_1024/default
+                        time:   [138.57 µs 139.48 µs 140.45 µs]
+                        change: [+1.6324% +2.5130% +3.4211%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+kv_cache/decode_step_256/default
+                        time:   [3.3431 ms 3.3553 ms 3.3675 ms]
+                        change: [+0.6160% +1.1209% +1.6160%] (p = 0.00 < 0.05)
+                        Change within noise threshold.
+kv_cache/concurrent_4_readers_256/default
+                        time:   [28.640 µs 28.745 µs 28.852 µs]
+                        change: [-0.5555% +0.7369% +1.9376%] (p = 0.26 > 0.05)
+                        No change in performance detected.
+Found 14 outliers among 100 measurements (14.00%)
+  8 (8.00%) low mild
+  2 (2.00%) high mild
+  4 (4.00%) high severe
+kv_cache/initialize/wide
+                        time:   [13.642 µs 13.827 µs 14.016 µs]
+                        change: [-21.380% -15.899% -9.5857%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 4 outliers among 100 measurements (4.00%)
+  3 (3.00%) high mild
+  1 (1.00%) high severe
+kv_cache/write_kv_fill_256/wide
+                        time:   [7.0279 ms 7.4171 ms 7.8156 ms]
+                        change: [+21.539% +28.062% +35.173%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+kv_cache/write_kv_batch_64/wide
+                        time:   [1.3687 ms 1.3706 ms 1.3726 ms]
+                        change: [+0.8879% +1.0856% +1.3192%] (p = 0.00 < 0.05)
+                        Change within noise threshold.
+Found 7 outliers among 100 measurements (7.00%)
+  1 (1.00%) low mild
+  4 (4.00%) high mild
+  2 (2.00%) high severe
+kv_cache/read_kv_mid/wide
+                        time:   [1.2896 µs 1.3032 µs 1.3182 µs]
+                        change: [-1.8307% -0.4250% +1.0237%] (p = 0.57 > 0.05)
+                        No change in performance detected.
+Found 5 outliers among 100 measurements (5.00%)
+  3 (3.00%) high mild
+  2 (2.00%) high severe
+kv_cache/read_range_1/wide
+                        time:   [1.2875 µs 1.3039 µs 1.3212 µs]
+                        change: [+0.0948% +1.4491% +2.6988%] (p = 0.03 < 0.05)
+                        Change within noise threshold.
+Found 11 outliers among 100 measurements (11.00%)
+  8 (8.00%) high mild
+  3 (3.00%) high severe
+kv_cache/read_range_64/wide
+                        time:   [138.96 µs 139.64 µs 140.39 µs]
+                        change: [-3.6662% -2.8680% -2.0638%] (p = 0.00 < 0.05)
+                        Performance has improved.
+kv_cache/read_range_1024/wide
+                        time:   [32.449 ms 32.501 ms 32.553 ms]
+                        change: [-0.4199% +0.1564% +0.6533%] (p = 0.59 > 0.05)
+                        No change in performance detected.
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
+kv_cache/decode_step_256/wide
+                        time:   [111.31 ms 111.58 ms 111.86 ms]
+                        change: [-1.8344% -1.3219% -0.8056%] (p = 0.00 < 0.05)
+                        Change within noise threshold.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+kv_cache/concurrent_4_readers_256/wide
+                        time:   [1.3594 ms 1.3643 ms 1.3696 ms]
+                        change: [-1.0249% +0.1821% +1.4888%] (p = 0.78 > 0.05)
+                        No change in performance detected.
+Found 3 outliers among 100 measurements (3.00%)
+  1 (1.00%) high mild
+  2 (2.00%) high severe
+
+> [!NOTE]
+> These numbers measure isolated KV cache primitive operations and memory copies in . They do not represent end-to-end LLM model inference tokens per second (tok/s).
+
+### Baseline (BEFORE) Measurements
+
+| Workload |  (1024, 4x64) |  (8192, 4x64) |  (2048, 32x128) | Notes |
+|---|---|---|---|---|
+|  | 182.17 µs | 182.50 µs | 13.10 µs | Upfront buffer allocation |
+|  | 208.07 µs | 212.73 µs | 5.73 ms | Sequential fill 256 tokens |
+|  | 23.14 µs | 22.09 µs | 1.37 ms | Batch write 64 tokens under 1 lock |
+|  | 82.54 ns | 81.56 ns | 1.28 µs | Owned read ( Vec alloc) |
+|  | 82.53 ns | 81.68 ns | 1.29 µs | Owned range read 1 token (Vec alloc) |
+|  | 5.43 µs | 5.16 µs | 141.32 µs | Owned range read 64 tokens |
+|  | 137.68 µs | 126.44 µs | 32.59 ms | Owned range read 1024 tokens |
+|  | 3.10 ms | 3.27 ms | 108.89 ms | Write 1 + Read 0..t+1 over 256 steps |
+|  | 29.14 µs | 40.93 µs | 1.36 ms | 4 reader threads looping range(0..256) |
+
+---
+
+## KV cache microbenches
+
+- **Date**: 2026-03-31
+- **OS / CPU**: Linux 6.8.0 x86_64, Intel(R) Xeon(R) CPU @ 2.30GHz (4 cores)
+- **Rust / Build**: rustc 1.94.0, release build
+- **Command**: kv_cache/initialize/small
+                        time:   [185.09 µs 186.81 µs 188.28 µs]
+                        change: [-3.6780% +0.4235% +4.7030%] (p = 0.85 > 0.05)
+                        No change in performance detected.
+Found 8 outliers among 100 measurements (8.00%)
+  3 (3.00%) low severe
+  2 (2.00%) low mild
+  1 (1.00%) high mild
+  2 (2.00%) high severe
+kv_cache/write_kv_fill_256/small
+                        time:   [222.41 µs 226.12 µs 229.35 µs]
+                        change: [-5.5736% +1.9935% +10.197%] (p = 0.63 > 0.05)
+                        No change in performance detected.
+Found 10 outliers among 100 measurements (10.00%)
+  10 (10.00%) low severe
+kv_cache/write_kv_batch_64/small
+                        time:   [22.454 µs 22.944 µs 23.387 µs]
+                        change: [-3.0935% +2.7183% +9.2967%] (p = 0.39 > 0.05)
+                        No change in performance detected.
+Found 11 outliers among 100 measurements (11.00%)
+  7 (7.00%) low severe
+  4 (4.00%) high mild
+kv_cache/read_kv_mid/small
+                        time:   [81.503 ns 81.561 ns 81.621 ns]
+                        change: [-4.5783% -4.4468% -4.3237%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 8 outliers among 100 measurements (8.00%)
+  2 (2.00%) low severe
+  2 (2.00%) low mild
+  3 (3.00%) high mild
+  1 (1.00%) high severe
+kv_cache/read_range_1/small
+                        time:   [81.922 ns 81.983 ns 82.048 ns]
+                        change: [-2.8955% -2.7810% -2.6637%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 5 outliers among 100 measurements (5.00%)
+  1 (1.00%) low mild
+  3 (3.00%) high mild
+  1 (1.00%) high severe
+kv_cache/read_range_64/small
+                        time:   [5.2140 µs 5.3147 µs 5.4200 µs]
+                        change: [+0.3599% +2.5255% +4.6647%] (p = 0.02 < 0.05)
+                        Change within noise threshold.
+kv_cache/read_range_1024/small
+                        time:   [183.54 µs 201.23 µs 217.01 µs]
+                        change: [+12.969% +19.828% +27.476%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 24 outliers among 100 measurements (24.00%)
+  2 (2.00%) high mild
+  22 (22.00%) high severe
+kv_cache/decode_step_256/small
+                        time:   [2.8818 ms 2.8896 ms 2.8980 ms]
+                        change: [+0.6534% +1.0320% +1.4225%] (p = 0.00 < 0.05)
+                        Change within noise threshold.
+Found 12 outliers among 100 measurements (12.00%)
+  11 (11.00%) high mild
+  1 (1.00%) high severe
+kv_cache/concurrent_4_readers_256/small
+                        time:   [28.336 µs 28.469 µs 28.611 µs]
+                        change: [-2.0874% -0.6571% +0.7792%] (p = 0.40 > 0.05)
+                        No change in performance detected.
+Found 3 outliers among 100 measurements (3.00%)
+  1 (1.00%) high mild
+  2 (2.00%) high severe
+kv_cache/initialize/default
+                        time:   [189.59 µs 191.90 µs 193.78 µs]
+                        change: [-0.6266% +2.0315% +4.9476%] (p = 0.17 > 0.05)
+                        No change in performance detected.
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) low mild
+kv_cache/write_kv_fill_256/default
+                        time:   [221.18 µs 225.07 µs 228.41 µs]
+                        change: [-1.8865% +0.4207% +2.7711%] (p = 0.72 > 0.05)
+                        No change in performance detected.
+kv_cache/write_kv_batch_64/default
+                        time:   [22.894 µs 23.165 µs 23.418 µs]
+                        change: [-6.6284% -4.5757% -2.3955%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 5 outliers among 100 measurements (5.00%)
+  4 (4.00%) low mild
+  1 (1.00%) high mild
+kv_cache/read_kv_mid/default
+                        time:   [81.024 ns 81.064 ns 81.106 ns]
+                        change: [-0.6803% -0.5909% -0.5103%] (p = 0.00 < 0.05)
+                        Change within noise threshold.
+Found 4 outliers among 100 measurements (4.00%)
+  2 (2.00%) low severe
+  2 (2.00%) high mild
+kv_cache/read_range_1/default
+                        time:   [81.963 ns 82.042 ns 82.120 ns]
+                        change: [+0.1222% +0.2346% +0.3404%] (p = 0.00 < 0.05)
+                        Change within noise threshold.
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
+kv_cache/read_range_64/default
+                        time:   [5.1243 µs 5.2454 µs 5.3689 µs]
+                        change: [-13.243% -11.237% -9.2579%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 6 outliers among 100 measurements (6.00%)
+  5 (5.00%) high mild
+  1 (1.00%) high severe
+kv_cache/read_range_1024/default
+                        time:   [134.50 µs 135.19 µs 135.99 µs]
+                        change: [-3.4019% -2.6092% -1.8103%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 6 outliers among 100 measurements (6.00%)
+  6 (6.00%) high mild
+kv_cache/decode_step_256/default
+                        time:   [3.2053 ms 3.2144 ms 3.2238 ms]
+                        change: [-4.6356% -4.2003% -3.7736%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 8 outliers among 100 measurements (8.00%)
+  8 (8.00%) high mild
+kv_cache/concurrent_4_readers_256/default
+                        time:   [29.104 µs 29.185 µs 29.271 µs]
+                        change: [+0.0841% +1.3996% +2.7056%] (p = 0.04 < 0.05)
+                        Change within noise threshold.
+Found 9 outliers among 100 measurements (9.00%)
+  3 (3.00%) low mild
+  1 (1.00%) high mild
+  5 (5.00%) high severe
+kv_cache/initialize/wide
+                        time:   [13.384 µs 13.550 µs 13.718 µs]
+                        change: [-6.3104% -2.3699% +0.7731%] (p = 0.23 > 0.05)
+                        No change in performance detected.
+Found 3 outliers among 100 measurements (3.00%)
+  2 (2.00%) high mild
+  1 (1.00%) high severe
+kv_cache/write_kv_fill_256/wide
+                        time:   [5.8282 ms 5.8581 ms 5.8903 ms]
+                        change: [-25.046% -21.019% -16.660%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 8 outliers among 100 measurements (8.00%)
+  4 (4.00%) high mild
+  4 (4.00%) high severe
+kv_cache/write_kv_batch_64/wide
+                        time:   [1.4204 ms 1.4401 ms 1.4666 ms]
+                        change: [+5.3967% +6.6115% +8.0318%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 4 outliers among 100 measurements (4.00%)
+  2 (2.00%) high mild
+  2 (2.00%) high severe
+kv_cache/read_kv_mid/wide
+                        time:   [1.3938 µs 1.4151 µs 1.4372 µs]
+                        change: [+8.4980% +10.427% +12.282%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 4 outliers among 100 measurements (4.00%)
+  4 (4.00%) high mild
+kv_cache/read_range_1/wide
+                        time:   [1.3508 µs 1.3638 µs 1.3793 µs]
+                        change: [+6.9245% +8.8998% +10.906%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 8 outliers among 100 measurements (8.00%)
+  4 (4.00%) high mild
+  4 (4.00%) high severe
+kv_cache/read_range_64/wide
+                        time:   [135.19 µs 136.25 µs 137.43 µs]
+                        change: [-3.2872% -2.4511% -1.5418%] (p = 0.00 < 0.05)
+                        Performance has improved.
+kv_cache/read_range_1024/wide
+                        time:   [33.219 ms 33.311 ms 33.408 ms]
+                        change: [+2.1672% +2.4942% +2.8119%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 7 outliers among 100 measurements (7.00%)
+  7 (7.00%) high mild
+kv_cache/decode_step_256/wide
+                        time:   [112.18 ms 112.49 ms 112.79 ms]
+                        change: [+0.4339% +0.8086% +1.1918%] (p = 0.00 < 0.05)
+                        Change within noise threshold.
+Found 2 outliers among 100 measurements (2.00%)
+  1 (1.00%) low mild
+  1 (1.00%) high mild
+kv_cache/concurrent_4_readers_256/wide
+                        time:   [1.5851 ms 1.6613 ms 1.7263 ms]
+                        change: [+4.7282% +8.0187% +11.463%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+
+> [!NOTE]
+> These numbers measure isolated KV cache primitive operations and memory copies in . They do not represent end-to-end LLM model inference tokens per second (tok/s).
+
+### Baseline (BEFORE) Measurements
+
+| Workload |  (1024, 4x64) |  (8192, 4x64) |  (2048, 32x128) | Notes |
+|---|---|---|---|---|
+|  | 182.17 µs | 182.50 µs | 13.10 µs | Upfront buffer allocation |
+|  | 208.07 µs | 212.73 µs | 5.73 ms | Sequential fill 256 tokens |
+|  | 23.14 µs | 22.09 µs | 1.37 ms | Batch write 64 tokens under 1 lock |
+|  | 82.54 ns | 81.56 ns | 1.28 µs | Owned read ( Vec alloc) |
+|  | 82.53 ns | 81.68 ns | 1.29 µs | Owned range read 1 token (Vec alloc) |
+|  | 5.43 µs | 5.16 µs | 141.32 µs | Owned range read 64 tokens |
+|  | 137.68 µs | 126.44 µs | 32.59 ms | Owned range read 1024 tokens |
+|  | 3.10 ms | 3.27 ms | 108.89 ms | Write 1 + Read 0..t+1 over 256 steps |
+|  | 29.14 µs | 40.93 µs | 1.36 ms | 4 reader threads looping range(0..256) |
+
+
+---
+
+## KV cache microbenches
+
+- **Date**: 2026-03-31
+- **OS / CPU**: Linux 6.8.0 x86_64, Intel(R) Xeon(R) CPU @ 2.30GHz (4 cores)
+- **Rust / Build**: rustc 1.94.0, release build
+- **Command**: kv_cache/initialize/small
+                        time:   [187.26 µs 189.36 µs 191.11 µs]
+                        change: [-4.1266% -0.0746% +4.1839%] (p = 0.98 > 0.05)
+                        No change in performance detected.
+Found 5 outliers among 100 measurements (5.00%)
+  3 (3.00%) low severe
+  1 (1.00%) high mild
+  1 (1.00%) high severe
+kv_cache/write_kv_fill_256/small
+                        time:   [218.52 µs 221.34 µs 223.67 µs]
+                        change: [-8.7989% -1.0379% +7.0616%] (p = 0.80 > 0.05)
+                        No change in performance detected.
+Found 10 outliers among 100 measurements (10.00%)
+  10 (10.00%) low severe
+kv_cache/write_kv_batch_64/small
+                        time:   [23.906 µs 24.248 µs 24.557 µs]
+                        change: [+1.1048% +7.4267% +14.200%] (p = 0.03 < 0.05)
+                        Performance has regressed.
+Found 9 outliers among 100 measurements (9.00%)
+  7 (7.00%) low severe
+  2 (2.00%) high mild
+kv_cache/read_kv_mid/small
+                        time:   [83.222 ns 83.311 ns 83.429 ns]
+                        change: [+2.0299% +2.1523% +2.2951%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 7 outliers among 100 measurements (7.00%)
+  1 (1.00%) low mild
+  3 (3.00%) high mild
+  3 (3.00%) high severe
+kv_cache/read_range_1/small
+                        time:   [84.613 ns 84.700 ns 84.825 ns]
+                        change: [+3.0866% +3.2240% +3.3658%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 3 outliers among 100 measurements (3.00%)
+  1 (1.00%) low severe
+  1 (1.00%) high mild
+  1 (1.00%) high severe
+kv_cache/read_range_64/small
+                        time:   [5.2444 µs 5.3845 µs 5.5577 µs]
+                        change: [+13.056% +17.964% +23.260%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+kv_cache/read_range_1024/small
+                        time:   [136.55 µs 137.77 µs 138.91 µs]
+                        change: [-22.229% -17.231% -11.937%] (p = 0.00 < 0.05)
+                        Performance has improved.
+kv_cache/decode_step_256/small
+                        time:   [3.1402 ms 3.1527 ms 3.1656 ms]
+                        change: [+8.6062% +9.1058% +9.6460%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+kv_cache/concurrent_4_readers_256/small
+                        time:   [28.680 µs 28.780 µs 28.889 µs]
+                        change: [-1.1275% +0.2566% +1.5159%] (p = 0.73 > 0.05)
+                        No change in performance detected.
+Found 4 outliers among 100 measurements (4.00%)
+  2 (2.00%) high mild
+  2 (2.00%) high severe
+kv_cache/initialize/default
+                        time:   [189.45 µs 191.34 µs 192.98 µs]
+                        change: [-2.2167% +0.6411% +3.5228%] (p = 0.66 > 0.05)
+                        No change in performance detected.
+Found 4 outliers among 100 measurements (4.00%)
+  1 (1.00%) low severe
+  3 (3.00%) low mild
+kv_cache/write_kv_fill_256/default
+                        time:   [230.82 µs 235.05 µs 238.65 µs]
+                        change: [+0.7315% +3.5531% +6.2202%] (p = 0.01 < 0.05)
+                        Change within noise threshold.
+kv_cache/write_kv_batch_64/default
+                        time:   [24.556 µs 24.926 µs 25.263 µs]
+                        change: [+2.2248% +4.5399% +6.8976%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 11 outliers among 100 measurements (11.00%)
+  1 (1.00%) low severe
+  9 (9.00%) low mild
+  1 (1.00%) high mild
+kv_cache/read_kv_mid/default
+                        time:   [81.335 ns 81.395 ns 81.458 ns]
+                        change: [+0.3549% +0.4377% +0.5260%] (p = 0.00 < 0.05)
+                        Change within noise threshold.
+Found 8 outliers among 100 measurements (8.00%)
+  3 (3.00%) low mild
+  5 (5.00%) high mild
+kv_cache/read_range_1/default
+                        time:   [81.759 ns 81.798 ns 81.840 ns]
+                        change: [-0.2934% -0.1883% -0.0876%] (p = 0.00 < 0.05)
+                        Change within noise threshold.
+Found 10 outliers among 100 measurements (10.00%)
+  2 (2.00%) low severe
+  1 (1.00%) low mild
+  5 (5.00%) high mild
+  2 (2.00%) high severe
+kv_cache/read_range_64/default
+                        time:   [4.7031 µs 4.8133 µs 4.9222 µs]
+                        change: [-12.377% -9.9637% -7.3597%] (p = 0.00 < 0.05)
+                        Performance has improved.
+kv_cache/read_range_1024/default
+                        time:   [155.25 µs 166.07 µs 179.37 µs]
+                        change: [+18.246% +27.101% +36.890%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+kv_cache/decode_step_256/default
+                        time:   [2.9634 ms 2.9733 ms 2.9834 ms]
+                        change: [-7.9156% -7.4987% -7.1001%] (p = 0.00 < 0.05)
+                        Performance has improved.
+kv_cache/concurrent_4_readers_256/default
+                        time:   [28.865 µs 28.942 µs 29.021 µs]
+                        change: [-1.7802% -0.4085% +1.0237%] (p = 0.57 > 0.05)
+                        No change in performance detected.
+Found 4 outliers among 100 measurements (4.00%)
+  1 (1.00%) high mild
+  3 (3.00%) high severe
+kv_cache/initialize/wide
+                        time:   [14.060 µs 14.246 µs 14.428 µs]
+                        change: [+0.9798% +3.3571% +5.7229%] (p = 0.00 < 0.05)
+                        Change within noise threshold.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high severe
+kv_cache/write_kv_fill_256/wide
+                        time:   [5.8738 ms 5.8949 ms 5.9172 ms]
+                        change: [-0.0117% +0.6293% +1.2621%] (p = 0.06 > 0.05)
+                        No change in performance detected.
+Found 4 outliers among 100 measurements (4.00%)
+  4 (4.00%) high mild
+kv_cache/write_kv_batch_64/wide
+                        time:   [1.3906 ms 1.3930 ms 1.3957 ms]
+                        change: [-5.8322% -4.5558% -3.4568%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+kv_cache/read_kv_mid/wide
+                        time:   [1.3254 µs 1.3397 µs 1.3561 µs]
+                        change: [-7.7173% -6.0901% -4.5330%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 9 outliers among 100 measurements (9.00%)
+  6 (6.00%) high mild
+  3 (3.00%) high severe
+kv_cache/read_range_1/wide
+                        time:   [1.3264 µs 1.3416 µs 1.3592 µs]
+                        change: [-6.2086% -4.4601% -2.7535%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 10 outliers among 100 measurements (10.00%)
+  8 (8.00%) high mild
+  2 (2.00%) high severe
+kv_cache/read_range_64/wide
+                        time:   [136.83 µs 137.54 µs 138.28 µs]
+                        change: [-1.5973% -0.7945% +0.0468%] (p = 0.06 > 0.05)
+                        No change in performance detected.
+Found 11 outliers among 100 measurements (11.00%)
+  11 (11.00%) high mild
+kv_cache/read_range_1024/wide
+                        time:   [32.320 ms 32.374 ms 32.430 ms]
+                        change: [-3.1283% -2.8143% -2.4939%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
+kv_cache/decode_step_256/wide
+                        time:   [114.83 ms 119.19 ms 124.01 ms]
+                        change: [+2.3239% +5.9632% +10.268%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 15 outliers among 100 measurements (15.00%)
+  15 (15.00%) high severe
+kv_cache/concurrent_4_readers_256/wide
+                        time:   [1.3874 ms 1.3947 ms 1.4020 ms]
+                        change: [-10.250% -7.3692% -4.4935%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 4 outliers among 100 measurements (4.00%)
+  2 (2.00%) high mild
+  2 (2.00%) high severe
+
+> [!NOTE]
+> These numbers measure isolated KV cache primitive operations and memory copies in . They do not represent end-to-end LLM model inference tokens per second (tok/s).
+
+### Baseline (BEFORE) Measurements
+
+| Workload |  (1024, 4x64) |  (8192, 4x64) |  (2048, 32x128) | Notes |
+|---|---|---|---|---|
+|  | 182.17 µs | 182.50 µs | 13.10 µs | Upfront buffer allocation |
+|  | 208.07 µs | 212.73 µs | 5.73 ms | Sequential fill 256 tokens |
+|  | 23.14 µs | 22.09 µs | 1.37 ms | Batch write 64 tokens under 1 lock |
+|  | 82.54 ns | 81.56 ns | 1.28 µs | Owned read ( Vec alloc) |
+|  | 82.53 ns | 81.68 ns | 1.29 µs | Owned range read 1 token (Vec alloc) |
+|  | 5.43 µs | 5.16 µs | 141.32 µs | Owned range read 64 tokens |
+|  | 137.68 µs | 126.44 µs | 32.59 ms | Owned range read 1024 tokens |
+|  | 3.10 ms | 3.27 ms | 108.89 ms | Write 1 + Read 0..t+1 over 256 steps |
+|  | 29.14 µs | 40.93 µs | 1.36 ms | 4 reader threads looping range(0..256) |
+
+
+---
+
+## KV cache microbenches
+
+- **Date**: 2026-03-31
+- **OS / CPU**: Linux 6.8.0 x86_64, Intel(R) Xeon(R) CPU @ 2.30GHz (4 cores)
+- **Rust / Build**: rustc 1.94.0,  release build
+- **Command**: kv_cache/initialize/small
+                        time:   [176.32 µs 177.25 µs 178.14 µs]
+                        change: [-3.4925% +1.5403% +6.8888%] (p = 0.57 > 0.05)
+                        No change in performance detected.
+Found 7 outliers among 50 measurements (14.00%)
+  1 (2.00%) low severe
+  4 (8.00%) high mild
+  2 (4.00%) high severe
+kv_cache/write_kv_fill_256/small
+                        time:   [195.29 µs 197.32 µs 198.99 µs]
+                        change: [-11.287% +0.3456% +14.596%] (p = 0.96 > 0.05)
+                        No change in performance detected.
+Found 7 outliers among 50 measurements (14.00%)
+  7 (14.00%) low severe
+kv_cache/write_kv_batch_64/small
+                        time:   [21.713 µs 21.913 µs 22.090 µs]
+                        change: [-11.180% -2.1556% +7.2646%] (p = 0.65 > 0.05)
+                        No change in performance detected.
+Found 5 outliers among 50 measurements (10.00%)
+  4 (8.00%) low severe
+  1 (2.00%) high mild
+kv_cache/read_kv_mid/small
+                        time:   [82.806 ns 82.882 ns 82.967 ns]
+                        change: [-11.634% -11.525% -11.382%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 4 outliers among 50 measurements (8.00%)
+  3 (6.00%) high mild
+  1 (2.00%) high severe
+kv_cache/with_read_kv_mid_zero_copy/small
+                        time:   [21.881 ns 21.894 ns 21.910 ns]
+                        change: [-0.7151% -0.3840% -0.1342%] (p = 0.00 < 0.05)
+                        Change within noise threshold.
+Found 3 outliers among 50 measurements (6.00%)
+  1 (2.00%) low mild
+  1 (2.00%) high mild
+  1 (2.00%) high severe
+kv_cache/read_range_1/small
+                        time:   [117.34 ns 119.25 ns 121.12 ns]
+                        change: [+24.184% +25.850% +27.393%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+kv_cache/with_read_range_1_zero_copy/small
+                        time:   [21.910 ns 21.922 ns 21.935 ns]
+                        change: [+0.0430% +0.1457% +0.2782%] (p = 0.01 < 0.05)
+                        Change within noise threshold.
+Found 3 outliers among 50 measurements (6.00%)
+  1 (2.00%) low mild
+  1 (2.00%) high mild
+  1 (2.00%) high severe
+kv_cache/read_range_into_1_caller_buf/small
+                        time:   [57.816 ns 57.850 ns 57.887 ns]
+                        change: [+7.1090% +7.2823% +7.4519%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 4 outliers among 50 measurements (8.00%)
+  1 (2.00%) low severe
+  2 (4.00%) high mild
+  1 (2.00%) high severe
+kv_cache/read_range_64/small
+                        time:   [5.0489 µs 5.1637 µs 5.3000 µs]
+                        change: [-4.2276% -0.8992% +2.4935%] (p = 0.61 > 0.05)
+                        No change in performance detected.
+kv_cache/with_read_range_64_zero_copy/small
+                        time:   [21.906 ns 21.925 ns 21.944 ns]
+                        change: [-0.1187% +0.0256% +0.1772%] (p = 0.75 > 0.05)
+                        No change in performance detected.
+Found 2 outliers among 50 measurements (4.00%)
+  1 (2.00%) low severe
+  1 (2.00%) high severe
+kv_cache/read_range_into_64_caller_buf/small
+                        time:   [4.8477 µs 5.0045 µs 5.1743 µs]
+                        change: [-27.941% -23.140% -17.477%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 7 outliers among 50 measurements (14.00%)
+  5 (10.00%) high mild
+  2 (4.00%) high severe
+kv_cache/read_range_1024/small
+                        time:   [136.27 µs 136.77 µs 137.37 µs]
+                        change: [-2.3722% -1.3800% -0.3460%] (p = 0.01 < 0.05)
+                        Change within noise threshold.
+kv_cache/with_read_range_1024_zero_copy/small
+                        time:   [21.881 ns 21.897 ns 21.915 ns]
+                        change: [-0.2367% -0.1320% -0.0264%] (p = 0.02 < 0.05)
+                        Change within noise threshold.
+Found 4 outliers among 50 measurements (8.00%)
+  1 (2.00%) low mild
+  2 (4.00%) high mild
+  1 (2.00%) high severe
+kv_cache/read_range_into_1024_caller_buf/small
+                        time:   [138.23 µs 140.18 µs 142.39 µs]
+                        change: [-3.7205% -2.6046% -1.4424%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 19 outliers among 50 measurements (38.00%)
+  8 (16.00%) low severe
+  11 (22.00%) high severe
+kv_cache/decode_step_256/small
+                        time:   [2.8656 ms 2.8766 ms 2.8887 ms]
+                        change: [-1.6625% -1.0681% -0.4511%] (p = 0.00 < 0.05)
+                        Change within noise threshold.
+Found 10 outliers among 50 measurements (20.00%)
+  8 (16.00%) high mild
+  2 (4.00%) high severe
+kv_cache/decode_step_256_zero_copy/small
+                        time:   [203.02 µs 206.33 µs 209.14 µs]
+                        change: [-12.352% -0.6410% +13.041%] (p = 0.92 > 0.05)
+                        No change in performance detected.
+Found 7 outliers among 50 measurements (14.00%)
+  7 (14.00%) low severe
+kv_cache/concurrent_4_readers_256/small
+                        time:   [25.037 µs 25.187 µs 25.347 µs]
+                        change: [-0.7948% +0.7168% +2.2380%] (p = 0.36 > 0.05)
+                        No change in performance detected.
+Found 4 outliers among 50 measurements (8.00%)
+  1 (2.00%) low mild
+  1 (2.00%) high mild
+  2 (4.00%) high severe
+kv_cache/concurrent_4_readers_256_zero_copy/small
+                        time:   [342.43 ns 343.49 ns 344.42 ns]
+                        change: [+0.4106% +1.3237% +2.3211%] (p = 0.01 < 0.05)
+                        Change within noise threshold.
+Found 5 outliers among 50 measurements (10.00%)
+  2 (4.00%) low mild
+  1 (2.00%) high mild
+  2 (4.00%) high severe
+
+kv_cache/initialize/default
+                        time:   [174.12 µs 176.18 µs 177.95 µs]
+                        change: [-5.1652% -2.0553% +1.2245%] (p = 0.22 > 0.05)
+                        No change in performance detected.
+Found 3 outliers among 50 measurements (6.00%)
+  1 (2.00%) low severe
+  2 (4.00%) low mild
+kv_cache/write_kv_fill_256/default
+                        time:   [198.59 µs 200.39 µs 201.95 µs]
+                        change: [-5.3406% -3.6055% -1.8093%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 3 outliers among 50 measurements (6.00%)
+  3 (6.00%) low mild
+kv_cache/write_kv_batch_64/default
+                        time:   [22.842 µs 23.304 µs 23.668 µs]
+                        change: [-7.1501% -3.5978% -0.3055%] (p = 0.05 > 0.05)
+                        No change in performance detected.
+kv_cache/read_kv_mid/default
+                        time:   [80.894 ns 80.944 ns 81.004 ns]
+                        change: [-4.5388% -4.3978% -4.2423%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 50 measurements (2.00%)
+  1 (2.00%) high mild
+kv_cache/with_read_kv_mid_zero_copy/default
+                        time:   [21.862 ns 21.871 ns 21.882 ns]
+                        change: [-0.3764% -0.2769% -0.1897%] (p = 0.00 < 0.05)
+                        Change within noise threshold.
+Found 2 outliers among 50 measurements (4.00%)
+  1 (2.00%) low severe
+  1 (2.00%) high mild
+kv_cache/read_range_1/default
+                        time:   [81.597 ns 81.674 ns 81.752 ns]
+                        change: [-3.5407% -3.3989% -3.2536%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 5 outliers among 50 measurements (10.00%)
+  1 (2.00%) low severe
+  2 (4.00%) high mild
+  2 (4.00%) high severe
+kv_cache/with_read_range_1_zero_copy/default
+                        time:   [21.882 ns 21.898 ns 21.917 ns]
+                        change: [-0.2513% -0.1148% +0.0314%] (p = 0.12 > 0.05)
+                        No change in performance detected.
+Found 4 outliers among 50 measurements (8.00%)
+  1 (2.00%) low mild
+  2 (4.00%) high mild
+  1 (2.00%) high severe
+kv_cache/read_range_into_1_caller_buf/default
+                        time:   [74.732 ns 75.916 ns 76.925 ns]
+                        change: [+18.327% +24.141% +29.328%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+kv_cache/read_range_64/default
+                        time:   [4.2799 µs 4.4867 µs 4.6969 µs]
+                        change: [-19.458% -16.392% -13.194%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 5 outliers among 50 measurements (10.00%)
+  4 (8.00%) high mild
+  1 (2.00%) high severe
+kv_cache/with_read_range_64_zero_copy/default
+                        time:   [21.858 ns 21.865 ns 21.874 ns]
+                        change: [-0.6819% -0.3723% -0.1630%] (p = 0.00 < 0.05)
+                        Change within noise threshold.
+Found 2 outliers among 50 measurements (4.00%)
+  1 (2.00%) high mild
+  1 (2.00%) high severe
+kv_cache/read_range_into_64_caller_buf/default
+                        time:   [4.1988 µs 4.3845 µs 4.5850 µs]
+                        change: [-18.437% -15.078% -11.391%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 6 outliers among 50 measurements (12.00%)
+  6 (12.00%) high mild
+kv_cache/read_range_1024/default
+                        time:   [141.40 µs 143.13 µs 145.54 µs]
+                        change: [+4.6574% +6.6138% +8.5650%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+kv_cache/with_read_range_1024_zero_copy/default
+                        time:   [21.895 ns 21.912 ns 21.930 ns]
+                        change: [-0.2131% -0.0572% +0.0924%] (p = 0.50 > 0.05)
+                        No change in performance detected.
+Found 3 outliers among 50 measurements (6.00%)
+  2 (4.00%) high mild
+  1 (2.00%) high severe
+kv_cache/read_range_into_1024_caller_buf/default
+                        time:   [143.91 µs 145.27 µs 147.15 µs]
+                        change: [+6.4486% +7.7155% +8.9216%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+kv_cache/decode_step_256/default
+                        time:   [2.8613 ms 2.8650 ms 2.8688 ms]
+                        change: [-10.216% -9.8813% -9.5440%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 4 outliers among 50 measurements (8.00%)
+  1 (2.00%) low mild
+  3 (6.00%) high mild
+kv_cache/decode_step_256_zero_copy/default
+                        time:   [206.71 µs 209.94 µs 214.40 µs]
+                        change: [-0.4845% +1.5705% +3.7690%] (p = 0.15 > 0.05)
+                        No change in performance detected.
+Found 4 outliers among 50 measurements (8.00%)
+  2 (4.00%) low mild
+  1 (2.00%) high mild
+  1 (2.00%) high severe
+kv_cache/concurrent_4_readers_256/default
+                        time:   [25.003 µs 25.107 µs 25.226 µs]
+                        change: [-3.1723% -1.4611% +0.1451%] (p = 0.10 > 0.05)
+                        No change in performance detected.
+Found 2 outliers among 50 measurements (4.00%)
+  1 (2.00%) high mild
+  1 (2.00%) high severe
+kv_cache/concurrent_4_readers_256_zero_copy/default
+                        time:   [403.54 ns 405.77 ns 407.94 ns]
+                        change: [+17.280% +18.098% +18.859%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 5 outliers among 50 measurements (10.00%)
+  1 (2.00%) low severe
+  4 (8.00%) low mild
+
+kv_cache/initialize/wide
+                        time:   [14.286 µs 14.519 µs 14.659 µs]
+                        change: [-6.0658% -2.1036% +2.6367%] (p = 0.40 > 0.05)
+                        No change in performance detected.
+kv_cache/write_kv_fill_256/wide
+                        time:   [5.6523 ms 5.6836 ms 5.7086 ms]
+                        change: [-2.7970% -1.8809% -1.0455%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) low mild
+kv_cache/write_kv_batch_64/wide
+                        time:   [1.3659 ms 1.3729 ms 1.3821 ms]
+                        change: [+0.0977% +0.5428% +1.0366%] (p = 0.04 < 0.05)
+                        Change within noise threshold.
+kv_cache/read_kv_mid/wide
+                        time:   [1.2634 µs 1.3198 µs 1.3656 µs]
+                        change: [-5.7731% -2.1854% +1.5201%] (p = 0.28 > 0.05)
+                        No change in performance detected.
+kv_cache/with_read_kv_mid_zero_copy/wide
+                        time:   [21.866 ns 21.875 ns 21.887 ns]
+                        change: [-0.1945% -0.0652% +0.0389%] (p = 0.34 > 0.05)
+                        No change in performance detected.
+kv_cache/read_range_1/wide
+                        time:   [1.2348 µs 1.2434 µs 1.2556 µs]
+                        change: [-2.7930% -2.2239% -1.6419%] (p = 0.00 < 0.05)
+                        Performance has improved.
+kv_cache/with_read_range_1_zero_copy/wide
+                        time:   [21.916 ns 21.945 ns 21.970 ns]
+                        change: [-0.0042% +0.1586% +0.3144%] (p = 0.10 > 0.05)
+                        No change in performance detected.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) low mild
+kv_cache/read_range_into_1_caller_buf/wide
+                        time:   [1.0985 µs 1.1254 µs 1.1702 µs]
+                        change: [-5.2358% -0.8009% +4.0686%] (p = 0.75 > 0.05)
+                        No change in performance detected.
+kv_cache/read_range_64/wide
+                        time:   [146.16 µs 146.64 µs 147.76 µs]
+                        change: [-3.8714% -1.8465% +0.3581%] (p = 0.13 > 0.05)
+                        No change in performance detected.
+kv_cache/with_read_range_64_zero_copy/wide
+                        time:   [21.856 ns 21.861 ns 21.871 ns]
+                        change: [-0.2152% -0.0640% +0.1231%] (p = 0.52 > 0.05)
+                        No change in performance detected.
+Found 2 outliers among 10 measurements (20.00%)
+  1 (10.00%) low mild
+  1 (10.00%) high severe
+kv_cache/read_range_into_64_caller_buf/wide
+                        time:   [137.84 µs 139.50 µs 140.81 µs]
+                        change: [-7.3485% -6.2496% -4.9442%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) low severe
+kv_cache/read_range_1024/wide
+                        time:   [31.479 ms 31.614 ms 31.712 ms]
+                        change: [-3.6239% -3.1065% -2.5965%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+kv_cache/with_read_range_1024_zero_copy/wide
+                        time:   [21.879 ns 21.886 ns 21.898 ns]
+                        change: [-0.3304% -0.1873% -0.0606%] (p = 0.02 < 0.05)
+                        Change within noise threshold.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) low mild
+kv_cache/read_range_into_1024_caller_buf/wide
+                        time:   [6.3891 ms 6.3955 ms 6.4109 ms]
+                        change: [-4.2544% -3.5022% -2.7037%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
+kv_cache/decode_step_256/wide
+                        time:   [119.72 ms 134.28 ms 148.38 ms]
+                        change: [+11.804% +25.233% +38.088%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+kv_cache/decode_step_256_zero_copy/wide
+                        time:   [5.7357 ms 5.7868 ms 5.8191 ms]
+                        change: [-1.0707% -0.1131% +0.8272%] (p = 0.82 > 0.05)
+                        No change in performance detected.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) low mild
+kv_cache/concurrent_4_readers_256/wide
+                        time:   [1.3215 ms 1.3244 ms 1.3295 ms]
+                        change: [-2.0364% -1.0641% +0.1715%] (p = 0.10 > 0.05)
+                        No change in performance detected.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
+kv_cache/concurrent_4_readers_256_zero_copy/wide
+                        time:   [341.75 ns 344.69 ns 347.29 ns]
+                        change: [+1.2195% +1.9775% +2.8231%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+
+> [!NOTE]
+> These numbers measure isolated KV cache primitive operations and memory copies in . They do not represent end-to-end LLM model inference tokens per second (tok/s).
+
+### Baseline (BEFORE) Measurements
+
+| Workload |  (1024, 4x64) |  (8192, 4x64) |  (2048, 32x128) | Notes |
+|---|---|---|---|---|
+|  | 182.17 µs | 182.50 µs | 13.10 µs | Upfront buffer allocation |
+|  | 208.07 µs | 212.73 µs | 5.73 ms | Sequential fill 256 tokens |
+|  | 23.14 µs | 22.09 µs | 1.37 ms | Batch write 64 tokens under 1 lock |
+|  | 82.54 ns | 81.56 ns | 1.28 µs | Owned read ( Vec alloc) |
+|  | 82.53 ns | 81.68 ns | 1.29 µs | Owned range read 1 token (Vec alloc) |
+|  | 5.43 µs | 5.16 µs | 141.32 µs | Owned range read 64 tokens |
+|  | 137.68 µs | 126.44 µs | 32.59 ms | Owned range read 1024 tokens |
+|  | 3.10 ms | 3.27 ms | 108.89 ms | Write 1 + Read 0..t+1 over 256 steps |
+|  | 29.14 µs | 40.93 µs | 1.36 ms | 4 reader threads looping range(0..256) |
+
+### Optimized (AFTER) Measurements
+
+| Workload |  (1024, 4x64) |  (8192, 4x64) |  (2048, 32x128) | Notes |
+|---|---|---|---|---|
+|  | 173.89 µs | 173.53 µs | 14.68 µs | Upfront buffer allocation |
+|  | 193.21 µs | 204.38 µs | 5.77 ms | Sequential fill 256 tokens |
+|  | 21.84 µs | 22.45 µs | 1.37 ms | Batch write 64 tokens under 1 lock |
+|  | 93.79 ns | 84.79 ns | 1.30 µs | Owned read ( Vec alloc) |
+|  | **21.92 ns** | **21.91 ns** | **21.89 ns** | Zero-copy closure read (no alloc) |
+|  | 94.86 ns | 84.44 ns | 1.28 µs | Owned range read 1 token |
+|  | **21.89 ns** | **21.90 ns** | **21.88 ns** | Zero-copy closure range 1 token |
+|  | **53.90 ns** | **55.46 ns** | **1.12 µs** | Caller-buffer copy range 1 token |
+|  | 5.38 µs | 4.96 µs | 150.34 µs | Owned range read 64 tokens |
+|  | **21.90 ns** | **21.92 ns** | **21.88 ns** | Zero-copy closure range 64 tokens |
+|  | **7.04 µs** | **4.93 µs** | **150.93 µs** | Caller-buffer copy range 64 tokens |
+|  | 137.78 µs | 141.83 µs | 32.54 ms | Owned range read 1024 tokens |
+|  | **21.93 ns** | **21.91 ns** | **21.92 ns** | Zero-copy closure range 1024 tokens |
+|  | 144.55 µs | 138.13 µs | **6.65 ms** | Caller-buffer copy range 1024 tokens |
+|  | 2.90 ms | 3.18 ms | 107.08 ms | Owned decode step loop (256 steps) |
+|  | **202.41 µs** | **197.61 µs** | **5.81 ms** | Zero-copy decode step loop (~15-18x speedup) |
+|  | 25.38 µs | 25.77 µs | 1.35 ms | 4 reader threads looping owned range |
+|  | **341.26 ns** | **340.75 ns** | **340.19 ns** | 4 reader threads zero-copy (~74x-3900x speedup) |
+
+
+---
+
 ## See Also
 
 - [README.md](../README.md) - Project overview, installation, and headline

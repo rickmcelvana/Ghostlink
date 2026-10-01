@@ -17,6 +17,10 @@
 //! all previous positions' KV every decode step; only one write happens per
 //! step), so letting reads proceed concurrently with each other matters.
 //!
+//! Zero-copy read paths (`with_read_kv`, `with_read_range`, `read_range_into`)
+//! allow inspecting or copying cached keys and values directly without owned
+//! heap allocations.
+//!
 //! This module has no current caller in `runtime.rs` — Ghostlink delegates
 //! actual model execution to an external inference engine (llama-server /
 //! Ollama, see `ghost-link::native_engine`) rather than computing attention
@@ -61,6 +65,13 @@ impl Default for KVCacheConfig {
 pub struct KVCacheEntry {
     pub keys: Vec<f32>,
     pub values: Vec<f32>,
+}
+
+/// Borrowed slice view over a contiguous token range's cached keys and values.
+#[derive(Debug, PartialEq)]
+pub struct KVSpan<'a> {
+    pub keys: &'a [f32],
+    pub values: &'a [f32],
 }
 
 struct KvCacheState {
@@ -231,9 +242,12 @@ impl LayerKvCache {
         Ok(())
     }
 
-    /// Reads one token's cached key/value vectors as an owned, fixed-size
-    /// copy (`config.token_width()` floats each — not the whole cache).
-    pub fn read_kv(&self, token_idx: usize) -> Result<KVCacheEntry, String> {
+    /// Inspects one token's cached key/value slices directly under a read lock via a closure.
+    /// Zero heap allocation on this path.
+    pub fn with_read_kv<F, R>(&self, token_idx: usize, f: F) -> Result<R, String>
+    where
+        F: FnOnce(&[f32], &[f32]) -> R,
+    {
         let width = self.config.token_width();
         let state = self
             .state
@@ -248,21 +262,31 @@ impl LayerKvCache {
         }
 
         let start = token_idx * width;
-        Ok(KVCacheEntry {
-            keys: state.keys[start..start + width].to_vec(),
-            values: state.values[start..start + width].to_vec(),
+        let end = start + width;
+        Ok(f(&state.keys[start..end], &state.values[start..end]))
+    }
+
+    /// Reads one token's cached key/value vectors as an owned, fixed-size
+    /// copy (`config.token_width()` floats each — not the whole cache).
+    pub fn read_kv(&self, token_idx: usize) -> Result<KVCacheEntry, String> {
+        self.with_read_kv(token_idx, |keys, values| KVCacheEntry {
+            keys: keys.to_vec(),
+            values: values.to_vec(),
         })
     }
 
-    /// Reads keys/values for a contiguous token range (`[start_token,
-    /// end_token)`) in one call — the shape attention actually wants (all
-    /// prior positions at once), instead of `end_token - start_token`
-    /// separate lock acquisitions and small allocations.
-    pub fn read_range(
+    /// Inspects keys/values for a contiguous token range (`[start_token, end_token)`)
+    /// directly under a read lock via a closure that accepts a `KVSpan`.
+    /// Zero heap allocation on this path.
+    pub fn with_read_range<F, R>(
         &self,
         start_token: usize,
         end_token: usize,
-    ) -> Result<(Vec<f32>, Vec<f32>), String> {
+        f: F,
+    ) -> Result<R, String>
+    where
+        F: FnOnce(KVSpan<'_>) -> R,
+    {
         if start_token > end_token {
             return Err("start_token must be <= end_token".to_string());
         }
@@ -281,10 +305,61 @@ impl LayerKvCache {
 
         let start = start_token * width;
         let end = end_token * width;
-        Ok((
-            state.keys[start..end].to_vec(),
-            state.values[start..end].to_vec(),
-        ))
+        let span = KVSpan {
+            keys: &state.keys[start..end],
+            values: &state.values[start..end],
+        };
+        Ok(f(span))
+    }
+
+    /// Reads keys/values for a contiguous token range (`[start_token,
+    /// end_token)`) in one call — the shape attention actually wants (all
+    /// prior positions at once), instead of `end_token - start_token`
+    /// separate lock acquisitions and small allocations.
+    pub fn read_range(
+        &self,
+        start_token: usize,
+        end_token: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>), String> {
+        self.with_read_range(start_token, end_token, |span| {
+            (span.keys.to_vec(), span.values.to_vec())
+        })
+    }
+
+    /// Copies keys and values for a contiguous token range into pre-allocated
+    /// caller slices `keys_out` and `values_out`.
+    /// Rejects output buffers if they are too small for the requested token range.
+    pub fn read_range_into(
+        &self,
+        start_token: usize,
+        end_token: usize,
+        keys_out: &mut [f32],
+        values_out: &mut [f32],
+    ) -> Result<(), String> {
+        if start_token > end_token {
+            return Err("start_token must be <= end_token".to_string());
+        }
+        let num_tokens = end_token - start_token;
+        let width = self.config.token_width();
+        let required_len = num_tokens * width;
+
+        if keys_out.len() < required_len {
+            return Err(format!(
+                "keys_out buffer too short: expected at least {required_len} elements, got {}",
+                keys_out.len()
+            ));
+        }
+        if values_out.len() < required_len {
+            return Err(format!(
+                "values_out buffer too short: expected at least {required_len} elements, got {}",
+                values_out.len()
+            ));
+        }
+
+        self.with_read_range(start_token, end_token, |span| {
+            keys_out[..required_len].copy_from_slice(span.keys);
+            values_out[..required_len].copy_from_slice(span.values);
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -299,6 +374,7 @@ impl LayerKvCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn small_config() -> KVCacheConfig {
         // Small width keeps test assertions easy to read; 2 heads * 4 dims = 8.
@@ -522,5 +598,189 @@ mod tests {
         // lock is even taken, so entry 0 must still hold its zero-initialized
         // default rather than the batch's (never-applied) value.
         assert_eq!(cache.read_kv(0).unwrap().keys[0], 0.0);
+    }
+
+    #[test]
+    fn with_read_kv_matches_read_kv() {
+        let cache = LayerKvCache::new(small_config());
+        cache.initialize(4).unwrap();
+        let width = cache.config.token_width();
+        let keys = vec![1.5_f32; width];
+        let values = vec![2.5_f32; width];
+        cache.write_kv(1, &keys, &values).unwrap();
+
+        let owned = cache.read_kv(1).unwrap();
+        cache
+            .with_read_kv(1, |k, v| {
+                assert_eq!(k, owned.keys.as_slice());
+                assert_eq!(v, owned.values.as_slice());
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn with_read_range_matches_read_range() {
+        let cache = LayerKvCache::new(small_config());
+        cache.initialize(4).unwrap();
+        let width = cache.config.token_width();
+        for t in 0..4 {
+            let k = vec![t as f32 + 0.1; width];
+            let v = vec![t as f32 + 0.2; width];
+            cache.write_kv(t, &k, &v).unwrap();
+        }
+
+        let (owned_keys, owned_values) = cache.read_range(1, 3).unwrap();
+        cache
+            .with_read_range(1, 3, |span| {
+                assert_eq!(span.keys, owned_keys.as_slice());
+                assert_eq!(span.values, owned_values.as_slice());
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn read_range_into_matches_read_range() {
+        let cache = LayerKvCache::new(small_config());
+        cache.initialize(4).unwrap();
+        let width = cache.config.token_width();
+        for t in 0..4 {
+            let k = vec![t as f32 + 0.1; width];
+            let v = vec![t as f32 + 0.2; width];
+            cache.write_kv(t, &k, &v).unwrap();
+        }
+
+        let (owned_keys, owned_values) = cache.read_range(0, 4).unwrap();
+        let mut keys_out = vec![0.0_f32; 4 * width];
+        let mut values_out = vec![0.0_f32; 4 * width];
+
+        cache
+            .read_range_into(0, 4, &mut keys_out, &mut values_out)
+            .unwrap();
+
+        assert_eq!(keys_out, owned_keys);
+        assert_eq!(values_out, owned_values);
+    }
+
+    #[test]
+    fn read_range_into_rejects_short_output_buffers() {
+        let cache = LayerKvCache::new(small_config());
+        cache.initialize(4).unwrap();
+        let width = cache.config.token_width();
+        let mut short_buf = vec![0.0_f32; width - 1];
+        let mut ok_buf = vec![0.0_f32; width];
+
+        assert!(cache
+            .read_range_into(0, 1, &mut short_buf, &mut ok_buf)
+            .is_err());
+        assert!(cache
+            .read_range_into(0, 1, &mut ok_buf, &mut short_buf)
+            .is_err());
+    }
+
+    #[test]
+    fn concurrent_mixed_readers_and_one_writer_no_corruption() {
+        let config = KVCacheConfig {
+            max_tokens_per_seq: 256,
+            num_heads: 2,
+            hidden_dim_per_head: 4,
+        };
+        let cache = LayerKvCache::new(config);
+        let width = config.token_width();
+        cache.initialize(1).unwrap();
+
+        let initial_keys = vec![1.0_f32; width];
+        let initial_vals = vec![2.0_f32; width];
+        cache.write_kv(0, &initial_keys, &initial_vals).unwrap();
+
+        let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut handles = Vec::new();
+
+        // Writer thread appends tokens
+        let writer_cache = cache.clone();
+        let writer_stop = stop_flag.clone();
+        handles.push(std::thread::spawn(move || {
+            let mut t = 1;
+            while !writer_stop.load(std::sync::atomic::Ordering::Relaxed) && t < 256 {
+                let k = vec![t as f32; width];
+                let v = vec![(t * 10) as f32; width];
+                if writer_cache.write_kv(t, &k, &v).is_ok() {
+                    t += 1;
+                }
+                std::thread::yield_now();
+            }
+        }));
+
+        // 4 Reader threads
+        for _ in 0..4 {
+            let reader_cache = cache.clone();
+            let reader_stop = stop_flag.clone();
+            handles.push(std::thread::spawn(move || {
+                while !reader_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let len = reader_cache.len();
+                    if len > 0 {
+                        reader_cache
+                            .with_read_range(0, len, |span| {
+                                for i in 0..len {
+                                    let token_k = &span.keys[i * width..(i + 1) * width];
+                                    let token_v = &span.values[i * width..(i + 1) * width];
+                                    if i == 0 {
+                                        assert_eq!(token_k[0], 1.0);
+                                        assert_eq!(token_v[0], 2.0);
+                                    } else {
+                                        assert_eq!(token_k[0], i as f32);
+                                        assert_eq!(token_v[0], (i * 10) as f32);
+                                    }
+                                }
+                            })
+                            .unwrap();
+                    }
+                    std::thread::yield_now();
+                }
+            }));
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_random_writes_and_read_range_equals_concatenation(
+            token_count in 1usize..16,
+            seed in 0u64..1000
+        ) {
+            let config = KVCacheConfig {
+                max_tokens_per_seq: 16,
+                num_heads: 2,
+                hidden_dim_per_head: 4,
+            };
+            let cache = LayerKvCache::new(config);
+            let width = config.token_width();
+            cache.initialize(token_count).unwrap();
+
+            let mut expected_keys = Vec::new();
+            let mut expected_values = Vec::new();
+
+            for t in 0..token_count {
+                let k: Vec<f32> = (0..width).map(|i| (seed + t as u64 * 10 + i as u64) as f32).collect();
+                let v: Vec<f32> = (0..width).map(|i| (seed + t as u64 * 100 + i as u64) as f32).collect();
+                cache.write_kv(t, &k, &v).unwrap();
+                expected_keys.extend_from_slice(&k);
+                expected_values.extend_from_slice(&v);
+            }
+
+            let (read_k, read_v) = cache.read_range(0, token_count).unwrap();
+            prop_assert_eq!(read_k, expected_keys.clone());
+            prop_assert_eq!(read_v, expected_values.clone());
+
+            cache.with_read_range(0, token_count, |span| {
+                assert_eq!(span.keys, expected_keys.as_slice());
+                assert_eq!(span.values, expected_values.as_slice());
+            }).unwrap();
+        }
     }
 }
