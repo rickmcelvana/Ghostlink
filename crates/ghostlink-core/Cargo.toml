@@ -85,3 +85,8 @@ harness = false
 name = "tensor_streaming_fabric"
 path = "../../benches/tensor_streaming_fabric.rs"
 harness = false
+
+[[bench]]
+name = "kv_cache"
+path = "../../benches/kv_cache.rs"
+harness = false

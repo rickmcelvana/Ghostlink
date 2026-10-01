@@ -12,6 +12,12 @@ All notable changes to Ghostlink Studio are documented here.
 - **Gateway & Studio EventSource Auth Alignment**: Studio EventSource and control-plane now share jwt_secret.txt and accept ?access_token= on task SSE only.
 
 ### Added
+- **Phase 3 KV Cache Microbenchmarks and Zero-Copy Read Paths** (`crates/ghostlink-core/src/kv_cache.rs`, `benches/kv_cache.rs`, `crates/ghostlink-core/Cargo.toml`, `docs/BENCHMARKS.md`):
+  Added dedicated Criterion benchmark harness target (`benches/kv_cache.rs`) covering small, default, and wide configurations across 7 workloads. Implemented zero-copy read APIs (`with_read_kv`, `with_read_range` using `KVSpan`, `read_range_into`) in `LayerKvCache` to eliminate owned `Vec` allocations during attention read paths, achieving 15-18x speedups on decode-step loops and up to 3900x under reader concurrency.
+
+- **Phase 3 KV Cache Microbenchmarks and Zero-Copy Read Paths** (, , , ):
+  Added dedicated Criterion benchmark harness target () covering small, default, and wide configurations across 7 workloads. Implemented zero-copy read APIs (,  using , ) in  to eliminate owned  allocations during attention read paths, achieving 15-18x speedups on decode-step loops and up to 3900x under reader concurrency.
+
 - **Real Task Agent Tool Loop & v2.4 Child Fan-Out**: Replaced stub canned implementer loop with bounded tool loop using in-process `AgentBackend` trait, `Judge` policy enforcement, proposed file staging in `.ghostlink/tasks/<id>/proposed/`, real command execution, child task fan-out APIs (`/api/tasks/:id/children`), budget inheritance, and UI child task representation. (`crates/ghost-link/src/task_runtime.rs`, `crates/ghost-link/src/task_api.rs`, `ghostlink_gui_modern/src/components/TaskView.tsx`, `ghostlink_gui_modern/src/components/ProjectsTab.tsx`)
 
 
