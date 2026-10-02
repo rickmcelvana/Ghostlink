@@ -41,8 +41,6 @@ describe('API Performance Benchmarks', () => {
     });
 
     it('should measure memory usage for getModels', async () => {
-      let initialHeapUsed, finalHeapUsed;
-      
       try {
         await apiInstance.getModels();
         

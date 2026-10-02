@@ -41,6 +41,8 @@ env:
   CARGO_TERM_COLOR: always
   GHOSTLINK_CI_DIR: /tmp/ghostlink-ci
   GHOSTLINK_PORT: '18014'
+  # The agentic test scripts read GHOSTLINK_URL and default to :8003.
+  GHOSTLINK_URL: 'http://127.0.0.1:18014'
   # The same small real model the repo's Docker fabric uses for smoke tests:
   # large enough to produce real tokens, small enough for a CPU-only runner.
   GHOSTLINK_TEST_MODEL_URL: >-
@@ -88,21 +90,30 @@ jobs:
           echo "GHOSTLINK_LLAMA_SERVER_BIN=$GHOSTLINK_CI_DIR/llama-server" >> "$GITHUB_ENV"
           "$GHOSTLINK_CI_DIR/llama-server" --version
 
+      # `settings.models_dir` defaults to the relative path "models" and has
+      # no env override (main.rs), so the file must land in ./models for
+      # scan_local_models_dir to see it. It is gitignored.
       - name: Provision test model
         run: |
           set -euo pipefail
-          mkdir -p "$GHOSTLINK_CI_DIR/models"
-          curl -fL --retry 3 -o "$GHOSTLINK_CI_DIR/models/stories15M-q4_0.gguf" \
-            "$GHOSTLINK_TEST_MODEL_URL"
-          ls -la "$GHOSTLINK_CI_DIR/models"
+          mkdir -p models
+          curl -fL --retry 3 -o models/stories15M-q4_0.gguf "$GHOSTLINK_TEST_MODEL_URL"
+          ls -la models
 
-      # The server generates its own JWT signing secret and API key on first
-      # run; keep both out of the checkout.
+      # Three separate paths matter here, all with repo-root defaults:
+      #   GHOSTLINK_API_KEY_PATH   -> auth.rs's bootstrap key file
+      #   GHOSTLINK_API_KEYS_PATH  -> main.rs's api_keys_path() key store
+      #   GHOSTLINK_JWT_SECRET_PATH-> auth.rs's jwt_secret_path()
+      # The key store is the one that actually authorizes requests: if it is
+      # left at the default it picks up any pre-existing ./api_keys.json and
+      # the bootstrap key is ignored. All three are gitignored; pointing them
+      # at a temp dir keeps the checkout clean.
       - name: Start ghost-link backend
         run: |
           set -euo pipefail
-          export GHOSTLINK_JWT_SECRET_PATH="$GHOSTLINK_CI_DIR/jwt_secret.txt"
           export GHOSTLINK_API_KEY_PATH="$GHOSTLINK_CI_DIR/api_key.txt"
+          export GHOSTLINK_API_KEYS_PATH="$GHOSTLINK_CI_DIR/api_keys.json"
+          export GHOSTLINK_JWT_SECRET_PATH="$GHOSTLINK_CI_DIR/jwt_secret.txt"
           nohup ./target/release/ghost-link serve 127.0.0.1 "$GHOSTLINK_PORT" \
             > "$GHOSTLINK_CI_DIR/server.log" 2>&1 &
           echo $! > "$GHOSTLINK_CI_DIR/server.pid"
@@ -122,6 +133,9 @@ jobs:
           tail -100 "$GHOSTLINK_CI_DIR/server.log" || true
           exit 1
 
+      # `ModelLoadRequest` is `{ model: String }` (main.rs) and the native
+      # path resolves it against `settings.models_dir`'s scan, so the file
+      # name — not an absolute path — is what goes in the body.
       - name: Load test model
         run: |
           set -euo pipefail
@@ -131,10 +145,17 @@ jobs:
             tail -50 "$GHOSTLINK_CI_DIR/server.log" || true
             exit 1
           fi
+          echo "--- available models ---"
+          curl -fsS "http://127.0.0.1:${GHOSTLINK_PORT}/api/models" \
+            -H "Authorization: Bearer $KEY" || true
+          echo
+          # scan_local_models_dir keys entries by file stem, so the stem —
+          # not the filename — is the `model` value the handler resolves.
           curl -fsS -X POST "http://127.0.0.1:${GHOSTLINK_PORT}/api/models/load" \
             -H "Authorization: Bearer $KEY" \
             -H 'Content-Type: application/json' \
-            -d "{\"path\":\"$GHOSTLINK_CI_DIR/models/stories15M-q4_0.gguf\"}"
+            -d '{"model":"stories15M-q4_0"}'
+          echo
 
       # The test scripts read the key from a repo-root-relative
       # `api_key.txt`; place it where they look. It is gitignored, so this
