@@ -81,6 +81,17 @@ sessions.json
 api_key.txt
 tls_cert.pem
 tls_key.pem
+# Same category, same repo-root default paths (auth.rs's
+# GHOSTLINK_JWT_SECRET_FILE, main.rs's GHOSTLINK_API_KEYS_FILE): the JWT
+# signing secret and the hashed RBAC key store the API writes on first run.
+# These were previously untracked only by accident — nothing stopped a
+# `git add -A` from committing a live signing secret.
+jwt_secret.txt
+api_keys.json
+# The audit trail is append-only runtime state (auth events, timestamps,
+# source IPs), not source or a fixture — a copy under crates/ghost-link/
+# had accumulated real local test runs and was tracked.
+audit_log.jsonl
 ghostlink_gui_modern/dist/
 sdks/js/node_modules/
 sdks/js/dist/
