@@ -69,21 +69,24 @@ jobs:
           python-version: '3.10'
 
       # llama-server performs the actual inference; `ghost-link serve` is the
-      # API in front of it. Build it from the vendored tree.
+      # API in front of it. `third_party/llama.cpp` is gitignored (vendored
+      # locally), so clone it here the same way Dockerfile.rpc-fabric does:
+      # shallow, current upstream master, -DGGML_RPC=ON, -DGGML_NATIVE=OFF.
       - name: Provision llama-server
         run: |
           set -euo pipefail
           mkdir -p "$GHOSTLINK_CI_DIR"
-          if [[ ! -d third_party/llama.cpp ]]; then
-            echo "::error::third_party/llama.cpp is absent, so llama-server cannot be built and these tests cannot run."
-            echo "::error::Vendor llama.cpp (it is gitignored) or run scripts/run_agentic_tests.sh locally instead."
-            exit 1
-          fi
-          cmake -S third_party/llama.cpp -B /tmp/llama-build \
-            -DGGML_RPC=ON -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release
-          cmake --build /tmp/llama-build --target llama-server -j "$(nproc)"
+          git clone --depth 1 https://github.com/ggml-org/llama.cpp.git /tmp/llama.cpp
+          cmake -S /tmp/llama.cpp -B /tmp/llama-build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_RPC=ON \
+            -DGGML_NATIVE=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF
+          cmake --build /tmp/llama-build -j "$(nproc)" --target llama-server
           cp /tmp/llama-build/bin/llama-server "$GHOSTLINK_CI_DIR/llama-server"
           echo "GHOSTLINK_LLAMA_SERVER_BIN=$GHOSTLINK_CI_DIR/llama-server" >> "$GITHUB_ENV"
+          "$GHOSTLINK_CI_DIR/llama-server" --version
 
       - name: Provision test model
         run: |
