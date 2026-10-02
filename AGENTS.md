@@ -13,10 +13,13 @@ contributor workflow, see [CONTRIBUTING.md](CONTRIBUTING.md).
 - `crates/mcp-calculator`, `crates/mcp-rag`, `crates/mcp-vision` — local
   stdio MCP servers used by the chat tool-calling loop. Internal
   (`publish = false`), not published to crates.io.
-- `crates/ghostlink-gui` — an earlier Tauri/Svelte desktop shell. **Not the
-  active GUI** — superseded by `ghostlink_gui_modern/` and not wired into
-  the launchers, workspace, or release pipeline. Don't build new features
-  here without checking with a maintainer first.
+- `crates/ghostlink-gui` — an earlier Tauri/Svelte desktop shell, the
+  pre-React GUI prototype. **Legacy only** — not the active GUI, and not
+  wired into the launchers, workspace, or release pipeline. If you're
+  looking for how something is done in the current UI, it's almost
+  certainly already implemented in `ghostlink_gui_modern/`; check there
+  first, and don't build new features here without checking with a
+  maintainer.
 - `ghostlink_gui_modern/` — the active GUI (React + Vite + TypeScript). Every
   launcher (`launch.sh`, `launch.bat`) builds and serves this one.
 - `control-plane/` — Go gateway in front of the Rust API: CORS, rate
@@ -45,7 +48,12 @@ npx vitest run
 If you changed transport, ring buffer, or pipeline code, also run
 `cargo bench --package ghostlink-core` and report before/after numbers — this
 is performance-sensitive code with documented microbenchmark baselines (see
-[docs/BENCHMARKS.md](docs/BENCHMARKS.md)).
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md), which also records how noisy the
+dev hardware is and why multi-run distributions beat single-run deltas).
+For end-to-end pipeline throughput rather than primitives, use
+`scripts/flow_perf_snapshot.py`; for real cross-process/cross-machine
+numbers, `scripts/remote_flow_benchmark.py` (both documented in
+BENCHMARKS.md's "Benchmark Methodology" section).
 
 If you changed hardware detection or system profiling, run
 `cargo run -p ghost-link -- probe my-node --full` and check for regressions.
@@ -69,11 +77,15 @@ Full pre-push checklist, release rubric, and PR expectations live in
   [docs/archive/INDEX.md](docs/archive/INDEX.md), per
   [CONTRIBUTING.md](CONTRIBUTING.md#documentation-expectations). Don't leave
   it in the repo root or in `docs/` proper where it reads as current.
-- **Ports**: the GUI talks to the control-plane gateway on `:8000`. The
-  Rust API itself listens on `:8003` (internal — the GUI does not call it
-  directly). Inference backends are `:8080` (native llama-server) or
-  `:11434` (Ollama). Pointing the GUI at the wrong port is the most common
-  local-dev failure mode (usually a 405).
+- **Ports**: the GUI talks to the control-plane gateway on `:8000` (the Go
+  reverse proxy in `control-plane/` — CORS, rate limiting, request
+  logging). The Rust API itself listens on `:8003` (internal — the GUI
+  does not call it directly; it requires bearer auth and, with
+  `enable_tls`, serves a self-signed loopback cert). Inference backends
+  are `:8080` (native llama-server) or `:11434` (Ollama), reached through
+  the gateway rather than by the browser directly. Pointing the GUI at
+  the wrong port is the most common local-dev failure mode (usually a
+  405, or a 401 if you land on `:8003` without credentials).
 
 ## Security-sensitive areas
 
@@ -83,3 +95,14 @@ trail, and RPC peer authentication are security-critical paths — see
 model before changing anything here, and update that doc if the security
 posture changes. Report vulnerabilities per [SECURITY.md](SECURITY.md)
 rather than opening a public issue.
+
+RPC peer admission is the same category: the IP allowlist and
+`rpc_shared_secret` HMAC handshake live in
+`crates/ghost-link/src/rpc_cluster.rs` (`validate_non_loopback_rpc_security`,
+`ip_allowed`, `admit_via_secret`). Contributor-process supervision —
+`RpcSupervisor`, surfaced through `is_contributing_healthy()` and
+`get_rpc_supervisor_info()` — is what stops a node from advertising
+`contribute_compute` over discovery while its `ggml-rpc-server` child is
+dead (a real gap found on hardware; see [docs/BENCHMARKS.md](docs/BENCHMARKS.md)).
+Changing either the admission path or the supervision loop is a security
+change, not a routine refactor.

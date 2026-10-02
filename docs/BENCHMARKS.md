@@ -1151,14 +1151,27 @@ yet backed by measurement on this project:
 
 ---
 
-
+---
 
 ## KV cache microbenches
 
+Five separate Criterion runs of `benches/kv_cache.rs` on the host below. They
+are kept as five raw run logs rather than averaged: this repo's own
+methodology note ("Methodology note: this host is noisy") says single-run
+deltas are unreliable and the spread between runs *is* the signal. Each run
+previously re-pasted the same header, NOTE, and baseline table; those are now
+stated once.
+
 - **Date**: 2026-03-31
 - **OS / CPU**: Linux 6.8.0 x86_64, Intel(R) Xeon(R) CPU @ 2.30GHz (4 cores)
-- **Rust / Build**: rustc 1.94.0, release build
+- **Rust / Build**: rustc 1.94.0,  release build
 - **Command**: kv_cache/initialize/small
+
+### Raw runs
+
+#### Run 1
+
+```
                         time:   [190.30 µs 192.26 µs 193.87 µs]
                         change: [-2.9907% +1.1902% +5.3370%] (p = 0.59 > 0.05)
                         No change in performance detected.
@@ -1332,33 +1345,11 @@ kv_cache/concurrent_4_readers_256/wide
 Found 2 outliers among 100 measurements (2.00%)
   1 (1.00%) high mild
   1 (1.00%) high severe
+```
 
-> [!NOTE]
-> These numbers measure isolated KV cache primitive operations and memory copies in . They do not represent end-to-end LLM model inference tokens per second (tok/s).
+#### Run 2
 
-### Baseline (BEFORE) Measurements
-
-| Workload |  (1024, 4x64) |  (8192, 4x64) |  (2048, 32x128) | Notes |
-|---|---|---|---|---|
-|  | 182.17 µs | 182.50 µs | 13.10 µs | Upfront buffer allocation |
-|  | 208.07 µs | 212.73 µs | 5.73 ms | Sequential fill 256 tokens |
-|  | 23.14 µs | 22.09 µs | 1.37 ms | Batch write 64 tokens under 1 lock |
-|  | 82.54 ns | 81.56 ns | 1.28 µs | Owned read ( Vec alloc) |
-|  | 82.53 ns | 81.68 ns | 1.29 µs | Owned range read 1 token (Vec alloc) |
-|  | 5.43 µs | 5.16 µs | 141.32 µs | Owned range read 64 tokens |
-|  | 137.68 µs | 126.44 µs | 32.59 ms | Owned range read 1024 tokens |
-|  | 3.10 ms | 3.27 ms | 108.89 ms | Write 1 + Read 0..t+1 over 256 steps |
-|  | 29.14 µs | 40.93 µs | 1.36 ms | 4 reader threads looping range(0..256) |
-
----
-
-
-## KV cache microbenches
-
-- **Date**: 2026-03-31
-- **OS / CPU**: Linux 6.8.0 x86_64, Intel(R) Xeon(R) CPU @ 2.30GHz (4 cores)
-- **Rust / Build**: rustc 1.94.0, release build
-- **Command**: kv_cache/initialize/small
+```
                         time:   [184.38 µs 186.18 µs 187.79 µs]
                         change: [-6.4867% -2.3638% +1.6278%] (p = 0.28 > 0.05)
                         No change in performance detected.
@@ -1532,32 +1523,11 @@ kv_cache/concurrent_4_readers_256/wide
 Found 3 outliers among 100 measurements (3.00%)
   1 (1.00%) high mild
   2 (2.00%) high severe
+```
 
-> [!NOTE]
-> These numbers measure isolated KV cache primitive operations and memory copies in . They do not represent end-to-end LLM model inference tokens per second (tok/s).
+#### Run 3
 
-### Baseline (BEFORE) Measurements
-
-| Workload |  (1024, 4x64) |  (8192, 4x64) |  (2048, 32x128) | Notes |
-|---|---|---|---|---|
-|  | 182.17 µs | 182.50 µs | 13.10 µs | Upfront buffer allocation |
-|  | 208.07 µs | 212.73 µs | 5.73 ms | Sequential fill 256 tokens |
-|  | 23.14 µs | 22.09 µs | 1.37 ms | Batch write 64 tokens under 1 lock |
-|  | 82.54 ns | 81.56 ns | 1.28 µs | Owned read ( Vec alloc) |
-|  | 82.53 ns | 81.68 ns | 1.29 µs | Owned range read 1 token (Vec alloc) |
-|  | 5.43 µs | 5.16 µs | 141.32 µs | Owned range read 64 tokens |
-|  | 137.68 µs | 126.44 µs | 32.59 ms | Owned range read 1024 tokens |
-|  | 3.10 ms | 3.27 ms | 108.89 ms | Write 1 + Read 0..t+1 over 256 steps |
-|  | 29.14 µs | 40.93 µs | 1.36 ms | 4 reader threads looping range(0..256) |
-
----
-
-## KV cache microbenches
-
-- **Date**: 2026-03-31
-- **OS / CPU**: Linux 6.8.0 x86_64, Intel(R) Xeon(R) CPU @ 2.30GHz (4 cores)
-- **Rust / Build**: rustc 1.94.0, release build
-- **Command**: kv_cache/initialize/small
+```
                         time:   [185.09 µs 186.81 µs 188.28 µs]
                         change: [-3.6780% +0.4235% +4.7030%] (p = 0.85 > 0.05)
                         No change in performance detected.
@@ -1735,33 +1705,11 @@ kv_cache/concurrent_4_readers_256/wide
                         Performance has regressed.
 Found 1 outliers among 100 measurements (1.00%)
   1 (1.00%) high mild
+```
 
-> [!NOTE]
-> These numbers measure isolated KV cache primitive operations and memory copies in . They do not represent end-to-end LLM model inference tokens per second (tok/s).
+#### Run 4
 
-### Baseline (BEFORE) Measurements
-
-| Workload |  (1024, 4x64) |  (8192, 4x64) |  (2048, 32x128) | Notes |
-|---|---|---|---|---|
-|  | 182.17 µs | 182.50 µs | 13.10 µs | Upfront buffer allocation |
-|  | 208.07 µs | 212.73 µs | 5.73 ms | Sequential fill 256 tokens |
-|  | 23.14 µs | 22.09 µs | 1.37 ms | Batch write 64 tokens under 1 lock |
-|  | 82.54 ns | 81.56 ns | 1.28 µs | Owned read ( Vec alloc) |
-|  | 82.53 ns | 81.68 ns | 1.29 µs | Owned range read 1 token (Vec alloc) |
-|  | 5.43 µs | 5.16 µs | 141.32 µs | Owned range read 64 tokens |
-|  | 137.68 µs | 126.44 µs | 32.59 ms | Owned range read 1024 tokens |
-|  | 3.10 ms | 3.27 ms | 108.89 ms | Write 1 + Read 0..t+1 over 256 steps |
-|  | 29.14 µs | 40.93 µs | 1.36 ms | 4 reader threads looping range(0..256) |
-
-
----
-
-## KV cache microbenches
-
-- **Date**: 2026-03-31
-- **OS / CPU**: Linux 6.8.0 x86_64, Intel(R) Xeon(R) CPU @ 2.30GHz (4 cores)
-- **Rust / Build**: rustc 1.94.0, release build
-- **Command**: kv_cache/initialize/small
+```
                         time:   [187.26 µs 189.36 µs 191.11 µs]
                         change: [-4.1266% -0.0746% +4.1839%] (p = 0.98 > 0.05)
                         No change in performance detected.
@@ -1928,33 +1876,11 @@ kv_cache/concurrent_4_readers_256/wide
 Found 4 outliers among 100 measurements (4.00%)
   2 (2.00%) high mild
   2 (2.00%) high severe
+```
 
-> [!NOTE]
-> These numbers measure isolated KV cache primitive operations and memory copies in . They do not represent end-to-end LLM model inference tokens per second (tok/s).
+#### Run 5
 
-### Baseline (BEFORE) Measurements
-
-| Workload |  (1024, 4x64) |  (8192, 4x64) |  (2048, 32x128) | Notes |
-|---|---|---|---|---|
-|  | 182.17 µs | 182.50 µs | 13.10 µs | Upfront buffer allocation |
-|  | 208.07 µs | 212.73 µs | 5.73 ms | Sequential fill 256 tokens |
-|  | 23.14 µs | 22.09 µs | 1.37 ms | Batch write 64 tokens under 1 lock |
-|  | 82.54 ns | 81.56 ns | 1.28 µs | Owned read ( Vec alloc) |
-|  | 82.53 ns | 81.68 ns | 1.29 µs | Owned range read 1 token (Vec alloc) |
-|  | 5.43 µs | 5.16 µs | 141.32 µs | Owned range read 64 tokens |
-|  | 137.68 µs | 126.44 µs | 32.59 ms | Owned range read 1024 tokens |
-|  | 3.10 ms | 3.27 ms | 108.89 ms | Write 1 + Read 0..t+1 over 256 steps |
-|  | 29.14 µs | 40.93 µs | 1.36 ms | 4 reader threads looping range(0..256) |
-
-
----
-
-## KV cache microbenches
-
-- **Date**: 2026-03-31
-- **OS / CPU**: Linux 6.8.0 x86_64, Intel(R) Xeon(R) CPU @ 2.30GHz (4 cores)
-- **Rust / Build**: rustc 1.94.0,  release build
-- **Command**: kv_cache/initialize/small
+```
                         time:   [176.32 µs 177.25 µs 178.14 µs]
                         change: [-3.4925% +1.5403% +6.8888%] (p = 0.57 > 0.05)
                         No change in performance detected.
@@ -2283,12 +2209,13 @@ kv_cache/concurrent_4_readers_256_zero_copy/wide
                         time:   [341.75 ns 344.69 ns 347.29 ns]
                         change: [+1.2195% +1.9775% +2.8231%] (p = 0.00 < 0.05)
                         Performance has regressed.
+```
 
 > [!NOTE]
-> These numbers measure isolated KV cache primitive operations and memory copies in . They do not represent end-to-end LLM model inference tokens per second (tok/s).
+> These numbers measure isolated KV cache primitive operations and memory copies. They do not represent end-to-end LLM model inference tokens per second (tok/s).
 
-### Baseline (BEFORE) Measurements
 
+### Baseline (BEFORE) Measurements (pre-zero-copy, owned-read API)
 | Workload |  (1024, 4x64) |  (8192, 4x64) |  (2048, 32x128) | Notes |
 |---|---|---|---|---|
 |  | 182.17 µs | 182.50 µs | 13.10 µs | Upfront buffer allocation |
@@ -2300,9 +2227,22 @@ kv_cache/concurrent_4_readers_256_zero_copy/wide
 |  | 137.68 µs | 126.44 µs | 32.59 ms | Owned range read 1024 tokens |
 |  | 3.10 ms | 3.27 ms | 108.89 ms | Write 1 + Read 0..t+1 over 256 steps |
 |  | 29.14 µs | 40.93 µs | 1.36 ms | 4 reader threads looping range(0..256) |
+---
 
+
+### Baseline (BEFORE) Measurements (with zero-copy read APIs)
+| Workload |  (1024, 4x64) |  (8192, 4x64) |  (2048, 32x128) | Notes |
+|---|---|---|---|---|
+|  | 182.17 µs | 182.50 µs | 13.10 µs | Upfront buffer allocation |
+|  | 208.07 µs | 212.73 µs | 5.73 ms | Sequential fill 256 tokens |
+|  | 23.14 µs | 22.09 µs | 1.37 ms | Batch write 64 tokens under 1 lock |
+|  | 82.54 ns | 81.56 ns | 1.28 µs | Owned read ( Vec alloc) |
+|  | 82.53 ns | 81.68 ns | 1.29 µs | Owned range read 1 token (Vec alloc) |
+|  | 5.43 µs | 5.16 µs | 141.32 µs | Owned range read 64 tokens |
+|  | 137.68 µs | 126.44 µs | 32.59 ms | Owned range read 1024 tokens |
+|  | 3.10 ms | 3.27 ms | 108.89 ms | Write 1 + Read 0..t+1 over 256 steps |
+|  | 29.14 µs | 40.93 µs | 1.36 ms | 4 reader threads looping range(0..256) |
 ### Optimized (AFTER) Measurements
-
 | Workload |  (1024, 4x64) |  (8192, 4x64) |  (2048, 32x128) | Notes |
 |---|---|---|---|---|
 |  | 173.89 µs | 173.53 µs | 14.68 µs | Upfront buffer allocation |
@@ -2323,16 +2263,4 @@ kv_cache/concurrent_4_readers_256_zero_copy/wide
 |  | **202.41 µs** | **197.61 µs** | **5.81 ms** | Zero-copy decode step loop (~15-18x speedup) |
 |  | 25.38 µs | 25.77 µs | 1.35 ms | 4 reader threads looping owned range |
 |  | **341.26 ns** | **340.75 ns** | **340.19 ns** | 4 reader threads zero-copy (~74x-3900x speedup) |
-
-
 ---
-
-## See Also
-
-- [README.md](../README.md) - Project overview, installation, and headline
-  Performance numbers
-- [ROADMAP.md](ROADMAP.md) - Competitive strategy, including the real
-  distributed-inference work this document's Multi-Node section depends on
-- [DEPLOYMENT.md](DEPLOYMENT.md) - Cross-machine deployment, including the
-  `stage-worker` path used by `scripts/remote_flow_benchmark.py`
-- [TESTING.md](TESTING.md) - Full test/bench workflow

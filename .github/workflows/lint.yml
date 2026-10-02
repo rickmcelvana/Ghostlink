@@ -38,6 +38,8 @@ jobs:
       - uses: actions/checkout@v7
       - name: Verify no unresolved stub TODO markers
         run: ./scripts/verify_no_stub_todos.sh
+      - name: Verify no case-colliding tracked paths
+        run: ./scripts/verify_no_case_collisions.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy

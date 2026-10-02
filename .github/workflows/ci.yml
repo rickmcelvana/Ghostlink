@@ -95,6 +95,14 @@ jobs:
       - run: npm run type-check
       - run: npm test
 
+  repo-hygiene:
+    name: Repo Hygiene (case collisions)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Verify no case-colliding tracked paths
+        run: ./scripts/verify_no_case_collisions.sh
+
   version-consistency:
     name: Manifest Version Consistency & Publish Dry-Run
     runs-on: ubuntu-latest

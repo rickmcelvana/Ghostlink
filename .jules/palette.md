@@ -1,5 +1,37 @@
 # Palette's Journal
 
+## 2026-10-02 - Specific Action-State Tracking on Multi-Choice Decision Toolbars
+**Learning:** In review panes or decision toolbars with multiple choices (e.g., Accept, Request Changes, Reject), using a single boolean `isSubmitting` hides which specific action is processing. Tracking specific `activeAction` state enables rendering action-specific `aria-busy`, spinning icon animations, and dynamic `aria-label` / `title` tooltips (e.g., 'Accepting proposed changes...' vs 'Accept proposed changes') so screen reader users and mouse hoverers receive real-time contextual feedback.
+**Action:** Track targeted decision action names (`'accept' | 'request_changes' | 'reject'`) during async operations to dynamically reflect active `aria-label`, `aria-busy`, and visual loading spinners on decision buttons.
+
+## 2026-10-02 - Async Creation Modals Need Busy States and Dialog Role Association
+**Learning:** Modal creation forms in dashboard tab views that lack submission state tracking allow users to inadvertently submit duplicate creation requests while leaving screen reader users unaware that background resource creation is processing.
+**Action:** Always wrap modal submission buttons in async creation forms with state tracking (`isSubmitting`), `aria-busy`, spinning `Loader2` feedback, dynamic `aria-label`/`title` tooltips, and bind the modal form overlay with `role="dialog"`, `aria-modal="true"`, and `aria-labelledby`.
+
+## 2026-09-26 - Descriptive Tooltips and Explicit ARIA Labels on Empty-State Suggestion Chips
+**Learning:** Empty-state suggestion chips often present concise text prompts for visual compactness, which may lack full intent context for screen reader users or mouse hoverers.
+**Action:** Always pair prompt suggestion chip buttons with explicit `aria-label={s.label}` and native `title={s.label}` tooltips so screen reader users and mouse hoverers hear and see the complete action intent.
+
+## 2026-09-15 - Context-Aware Disabled Reasons and Busy States on Toolbar Action Buttons
+**Learning:** Action buttons in toolbars or editor headers disabled based on contextual state (e.g. no open document, no unsaved edits) leave users and screen readers guessing why an action cannot be triggered.
+**Action:** Pair disabled toolbar buttons with dynamic `aria-label`, `aria-busy`, and native `title` tooltips that explicitly state the reason for being disabled (e.g. "Cannot save: no file open" or "No unsaved changes in [filename]") and update to active/busy states during async operations.
+
+## 2026-09-15 - Contextual Retries, Tooltips, and Busy States in Shared ErrorPanels
+**Learning:** Shared ErrorPanels providing retry buttons without `isRetrying` state, explicit `aria-label`, or `title` tooltips fail to inform screen reader users or mouse users when a background retry is in progress, while allowing repeated button clicks during asynchronous recovery attempts.
+**Action:** Equip shared `ErrorPanel` retry controls with `isRetrying` and `retryAriaLabel` properties bound to `disabled`, `aria-busy`, spinning icon animation, dynamic `aria-label`, and native `title` tooltips.
+
+## 2026-09-06 - Link Form Descriptions and Warnings via `aria-describedby`
+**Learning:** Screen reader users navigating through complex settings forms via Tab focus do not automatically hear field descriptions or inline warning banners unless the input elements explicitly reference them using `aria-describedby` and `aria-labelledby`.
+**Action:** In multi-field form components with helper text, generate deterministic IDs (e.g. `${fieldId}-desc`, `${fieldId}-warning`) and attach `aria-describedby` to `input`, `select`, and `radiogroup` containers.
+
+## 2026-09-06 - Actionable Loading States on Icon-Only Async Buttons
+**Learning:** Icon-only action buttons triggering asynchronous state updates (such as Refresh controls) need explicit `disabled={loading}` and `aria-busy={loading}` along with dynamic `aria-label` updates (`Refreshing...` vs `Refresh...`) to communicate status to screen readers and prevent accidental duplicate network requests.
+**Action:** Always combine visual spinner animations on icon-only refresh buttons with `disabled={loading}`, `aria-busy={loading}`, `disabled:opacity-50`, and a dynamic `aria-label`.
+
+## 2026-09-06 - Explicit ARIA Labels on EmptyState Action Primitives
+**Learning:** Shared EmptyState action buttons often use brief visible labels for visual layout neatness (e.g. "Add Server"), which may lack full context for screen reader users when announced in isolation. Providing `aria-label={action.ariaLabel || action.label}` in shared status components allows views to supply descriptive screen reader context (e.g. "Enable calculator MCP server") while preserving concise visual layout.
+**Action:** In shared UI primitives with action buttons, accept an optional `ariaLabel` property and default `aria-label` to `action.ariaLabel || action.label`.
+
 ## 2026-09-05 - [Modal Dialog ARIA Attributes & Close Button Labels]
 **Learning:** Modal overlay dialogs without explicit `role="dialog"`, `aria-modal="true"`, and `aria-labelledby` fail to communicate dialog boundaries to screen reader users. Additionally, icon-only close triggers (`✕`) require explicit `aria-label="Close dialog"` and `title="Close dialog"` so screen readers and mouse hover tooltips explicitly announce their purpose.
 **Action:** Always annotate custom modal dialog containers with `role="dialog"`, `aria-modal="true"`, and `aria-labelledby`, and ensure icon-only close triggers have explicit ARIA labels and native title attributes.
@@ -28,9 +60,17 @@
 **Learning:** Native HTML `<details>` disclosure controls (such as ErrorBoundary component stack details) are interactive elements that receive keyboard focus via `<summary>`. In dark-themed applications, default browser focus rings on `<summary>` are often invisible or clipped, leaving keyboard navigators unable to determine focus state. Adding high-contrast `focus-visible:` outlines, `hover:` color transitions, and explicit `title` tooltips ensures disclosure controls are fully accessible and discoverable across both mouse and keyboard interactions.
 **Action:** Always complement native `<summary>` disclosure controls with explicit focus-visible rings (`focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none`) and descriptive hover tooltips.
 
+## 2026-08-13 - [Semantic Form Ergonomics on Cluster Workers Tab]
+**Learning:** Form structures managing external worker node connections in cluster setup tabs benefit immensely from semantic `<form>` containers instead of non-interactive nested wrappers. This allows users to press "Enter" from any text input field to submit the form cleanly without needing manual mouse interaction. Visually marking mandatory fields (such as Host and Port) with clear asterisks and explicit `required` validation keeps setup straightforward.
+**Action:** Always implement configuration input blocks using semantic `<form>` containers with standard validation and input submission ergonomics.
+
 ## 2026-08-12 - [MCP & Workers Tab Operations Toast Notification Feedback]
 **Learning:** Asynchronous actions managing external cluster resources or protocol integrations (such as enabling/disabling MCP servers or connecting/disconnecting workers) must never alter state silently or fail without explicit feedback. Integrating success/failure toast notifications keeps the operator informed. Crucially, success state conditions must explicitly evaluate API response success flags (e.g. `result.success`) rather than compound error check fall-throughs, which otherwise risk showing false success alerts when requests fail without a descriptive error message.
 **Action:** Always secure asynchronous operations with high-fidelity toast alerts, and strictly evaluate success using explicit response success booleans rather than error-presence fall-throughs.
+
+## 2026-08-11 - [Settings Save and Reset Toast Notifications Feedback]
+**Learning:** Forms managing critical application-wide or cluster settings must provide prominent, high-fidelity feedback (such as transient toast alerts) for both success and failure outcomes during actions like "Save" and "Reset to Defaults". Failing to do so can result in silent errors when API requests fail, leaving users completely unaware that their modifications or resets were rejected.
+**Action:** Always integrate standard configuration-saving and state-reset operations with global/app-wide toast notification systems to guarantee visibility of results.
 
 ## 2026-08-10 - [Model Selector Download Redirection & Focus Visibility]
 **Learning:** Custom drop-down popups (like the Model Selector dropdown) that contain helpful quick-links (like "+ Download Models") are highly frustrating when they act as non-functional static links. Making them interactive by wiring them to programmatically switch tabs (`setActiveTab(1)`) greatly reduces cognitive friction. Additionally, aligning standard form inputs (like the MCP 'requires_confirmation' checkbox and popular model card buttons) with high-contrast, accessible `focus-visible:` keyboard rings guarantees keyboard and screen-reader navigators do not lose context in dark-theme interfaces.
@@ -64,34 +104,26 @@
 **Learning:** Cancelling a running LLM inference session is a highly disruptive action. Sighted users need immediate visual hover tooltips (`title`) to confirm the destructive function of icon-only action triggers, and all users benefit from a non-blocking confirmation dialog (`window.confirm`) to prevent accidental session evictions. Additionally, ensuring these interactive controls have tailored keyboard focus rings guarantees an accessible experience during keyboard navigation.
 **Action:** Always protect cluster session teardowns with clear modal confirmations, intuitive tooltips, and tailored `focus-visible:` focus rings.
 
-## 2026-07-20 - [Clear Chat Confirmation & Tooltip]
-**Learning:** Destructive actions placed immediately adjacent to common utility actions (like Save and Load) without tooltips or confirmation dialogs lead to high rates of accidental data loss and user frustration. Sighted users need hover tooltips (`title`) to understand icon-only buttons, and all users benefit from a non-blocking confirmation dialog before clearing an active session.
-**Action:** Always add a clear confirmation dialog and descriptive tooltips to header actions that discard user-generated state.
-
-## 2026-07-21 - [Disconnect Worker Confirmation]
-**Learning:** Instantly triggering disruptive cluster actions (like disconnecting a worker node) on single click without warning leads to operator frustration and unstable network environments. Adding a standard confirmation dialog before executing the action prevents accidents and provides peace of mind.
-**Action:** Always prompt for confirmation before executing any state-destructive or cluster-disruptive operations.
-
-## 2026-07-22 - [Empty Chat Onboarding Suggestion Chips]
-**Learning:** Empty conversational states create a high cognitive load for users who may not know how to start. Providing pre-configured prompt suggestion buttons under the welcome message reduces onboarding friction. Ensuring these buttons are semantic elements (`<button>`), fully accessible with descriptive ARIA labels, and focus-linked to the main chat composer creates a smooth, intuitive keyboard and mouse experience.
-**Action:** Always include interactive, accessible suggestion cards/chips in blank conversational views to guide users and focus the text composer when selected.
-
-## 2026-07-23 - [Keyboard Navigation Focus Rings]
-**Learning:** Custom interactive elements (such as onboarding suggestion buttons, icon-only header utility buttons, and custom model dropdown triggers) that rely on default focus outlines often have their outlines swallowed by absolute wrappers, overflow constraints, or dark-theme backgrounds. This makes keyboard-only and screen-reader navigation completely blind and confusing. Using specific Tailwind focus-visible styling ensures clear, localized, high-contrast focus rings without cluttering the visual layout for mouse/touch-first users.
-**Action:** Always apply tailored focus-visible indicators (`focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none`) to all custom-styled buttons, chips, and dropdown triggers to preserve keyboard accessibility.
+## 2026-08-01 - [Interactive Controls Keyboard Visibility]
+**Learning:** Interactive controls like tab lists (e.g., in the Models Dashboard) and control action buttons/inputs (e.g., inside the Cluster Workers dashboard) must use high-contrast focus-visible rings. Relying on default focus styles leads to invisible focused items during tab traversal on dark-theme UI panels, leaving keyboard and screen-reader users completely blind.
+**Action:** Always style all dashboards' custom buttons, tab toggles, and input elements with `focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none`.
 
 ## 2026-07-31 - [MCP Tab Keyboard Accessibility]
 **Learning:** Custom toggle buttons and control headers in utility panels (like the MCP Servers tab) must have high-contrast focus-visible styles configured. Without them, keyboard users can navigate to the page but are left unable to clearly discern which server toggle or action button currently holds visual focus.
 **Action:** Ensure all button elements inside toggle lists and header actions use `focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none` for excellent keyboard navigation visibility.
 
-## 2026-08-01 - [Interactive Controls Keyboard Visibility]
-**Learning:** Interactive controls like tab lists (e.g., in the Models Dashboard) and control action buttons/inputs (e.g., inside the Cluster Workers dashboard) must use high-contrast focus-visible rings. Relying on default focus styles leads to invisible focused items during tab traversal on dark-theme UI panels, leaving keyboard and screen-reader users completely blind.
-**Action:** Always style all dashboards' custom buttons, tab toggles, and input elements with `focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none`.
+## 2026-07-23 - [Keyboard Navigation Focus Rings]
+**Learning:** Custom interactive elements (such as onboarding suggestion buttons, icon-only header utility buttons, and custom model dropdown triggers) that rely on default focus outlines often have their outlines swallowed by absolute wrappers, overflow constraints, or dark-theme backgrounds. This makes keyboard-only and screen-reader navigation completely blind and confusing. Using specific Tailwind focus-visible styling ensures clear, localized, high-contrast focus rings without cluttering the visual layout for mouse/touch-first users.
+**Action:** Always apply tailored focus-visible indicators (`focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none`) to all custom-styled buttons, chips, and dropdown triggers to preserve keyboard accessibility.
 
-## 2026-08-11 - [Settings Save and Reset Toast Notifications Feedback]
-**Learning:** Forms managing critical application-wide or cluster settings must provide prominent, high-fidelity feedback (such as transient toast alerts) for both success and failure outcomes during actions like "Save" and "Reset to Defaults". Failing to do so can result in silent errors when API requests fail, leaving users completely unaware that their modifications or resets were rejected.
-**Action:** Always integrate standard configuration-saving and state-reset operations with global/app-wide toast notification systems to guarantee visibility of results.
+## 2026-07-22 - [Empty Chat Onboarding Suggestion Chips]
+**Learning:** Empty conversational states create a high cognitive load for users who may not know how to start. Providing pre-configured prompt suggestion buttons under the welcome message reduces onboarding friction. Ensuring these buttons are semantic elements (`<button>`), fully accessible with descriptive ARIA labels, and focus-linked to the main chat composer creates a smooth, intuitive keyboard and mouse experience.
+**Action:** Always include interactive, accessible suggestion cards/chips in blank conversational views to guide users and focus the text composer when selected.
 
-## 2026-08-13 - [Semantic Form Ergonomics on Cluster Workers Tab]
-**Learning:** Form structures managing external worker node connections in cluster setup tabs benefit immensely from semantic `<form>` containers instead of non-interactive nested wrappers. This allows users to press "Enter" from any text input field to submit the form cleanly without needing manual mouse interaction. Visually marking mandatory fields (such as Host and Port) with clear asterisks and explicit `required` validation keeps setup straightforward.
-**Action:** Always implement configuration input blocks using semantic `<form>` containers with standard validation and input submission ergonomics.
+## 2026-07-21 - [Disconnect Worker Confirmation]
+**Learning:** Instantly triggering disruptive cluster actions (like disconnecting a worker node) on single click without warning leads to operator frustration and unstable network environments. Adding a standard confirmation dialog before executing the action prevents accidents and provides peace of mind.
+**Action:** Always prompt for confirmation before executing any state-destructive or cluster-disruptive operations.
+
+## 2026-07-20 - [Clear Chat Confirmation & Tooltip]
+**Learning:** Destructive actions placed immediately adjacent to common utility actions (like Save and Load) without tooltips or confirmation dialogs lead to high rates of accidental data loss and user frustration. Sighted users need hover tooltips (`title`) to understand icon-only buttons, and all users benefit from a non-blocking confirmation dialog before clearing an active session.
+**Action:** Always add a clear confirmation dialog and descriptive tooltips to header actions that discard user-generated state.
