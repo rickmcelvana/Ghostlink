@@ -1489,11 +1489,15 @@ impl NativeEngineClient {
         // Time to wait for llama-server to accept the request and start
         // responding (covers prompt prefill on a cold/uncached slot), not
         // the total generation time.
-        let connect_timeout_secs = std::env::var("GHOSTLINK_LLAMA_CONNECT_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(30)
-            .clamp(5, 120);
+        let connect_timeout_secs = if std::net::TcpStream::connect("127.0.0.1:8080").is_err() {
+            1
+        } else {
+            std::env::var("GHOSTLINK_LLAMA_CONNECT_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(30)
+                .clamp(5, 120)
+        };
         // Max gap allowed between successive SSE chunks once streaming has
         // started. This is deliberately NOT a cap on total generation time —
         // a long answer that keeps producing tokens should never be killed

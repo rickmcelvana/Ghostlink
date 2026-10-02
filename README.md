@@ -620,7 +620,7 @@ CI enforces the same checks across Ubuntu, Windows, and macOS.
 
 Ghostlink is positioned as a launch-ready open-source foundation with a strong demo story and public-facing collateral.
 
-*Note: `main` branch development is at `v2.2.1`.*
+*Note: `main` branch development is at `v2.2.2 (Unreleased)`.*
 To publish: tag v2.2.2 and push; do not claim the GitHub Release exists in this PR.
 
 ### Current Strengths

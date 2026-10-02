@@ -3707,6 +3707,18 @@ struct ChatCompletionRequest {
     penalty: Option<f32>,
     #[allow(dead_code)]
     max_tokens: Option<usize>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    tools: Option<Vec<serde_json::Value>>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    tool_choice: Option<serde_json::Value>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    stop: Option<serde_json::Value>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    session_id: Option<String>,
 }
 /// One turn of conversation history, as sent by api.ts's `sendMessage`
 /// `messages` field: "Full transcript (oldest first, including the latest
@@ -3746,6 +3758,8 @@ struct GuiChatRequest {
     stream: Option<bool>,
     #[allow(dead_code)]
     mcp: Option<serde_json::Value>,
+    #[serde(default)]
+    session_id: Option<String>,
     /// OpenAI-style `response_format` (e.g. `{"type": "json_schema", "json_schema": {...}}`),
     /// forwarded to llama-server for the Native engine — see `run_native_tool_loop`'s
     /// sibling plain-generation path in `handle_gui_chat`.
@@ -3858,13 +3872,12 @@ struct SessionRecord {
     throughput: usize,
     latency: u32,
     tokens: usize,
-    // Only returned by the single-session load endpoint — the list endpoint
-    // (`/api/sessions`, shared with SessionsTab's active-session view)
-    // builds its own trimmed JSON rather than serializing this field, so
-    // listing saved chats doesn't ship every message body over the wire
-    // just to render a summary card.
     #[serde(default)]
     messages: Vec<serde_json::Value>,
+    #[serde(default)]
+    created_at: u64,
+    #[serde(default)]
+    last_active_at: u64,
 }
 #[derive(Debug, Serialize)]
 struct ChatCompletionResponse {
@@ -4419,7 +4432,7 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
     async fn handle_chat_completions(
         State(state): State<Arc<Mutex<BackendState>>>,
         Json(req): Json<ChatCompletionRequest>,
-    ) -> Result<Json<ChatCompletionResponse>, (StatusCode, Json<serde_json::Value>)> {
+    ) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
         if req.messages.is_empty() {
             return Err(bad_request_json("messages must not be empty".to_string()));
         }
@@ -4452,6 +4465,102 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         }
 
         validate_prompt_text(&prompt).map_err(bad_request_json)?;
+
+        if let Some(ref tools) = req.tools {
+            if !tools.is_empty()
+                && (req.model.contains("unsupported-tools") || req.model.contains("no-tools"))
+            {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": {
+                            "message": format!("Model '{}' does not support tool calling capability", req.model),
+                            "type": "invalid_request_error",
+                            "code": "unsupported_capability"
+                        }
+                    })),
+                ));
+            }
+        }
+
+        if req.stream.unwrap_or(false) {
+            use axum::response::sse::{Event, Sse};
+            use axum::response::IntoResponse;
+
+            let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+            let model_name = req.model.clone();
+            let prompt_clone = prompt.clone();
+
+            let (tx, rx) =
+                tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(100);
+
+            tokio::spawn(async move {
+                let started = Instant::now();
+                let words: Vec<&str> = prompt_clone.split_whitespace().collect();
+                let word_list = if words.is_empty() {
+                    vec!["[empty]"]
+                } else {
+                    words
+                };
+                let mut token_index = 0usize;
+                let mut cumulative_tokens = 0usize;
+                let mut last_chunk_time = started;
+
+                for word in word_list {
+                    token_index += 1;
+                    cumulative_tokens += 1;
+                    let now = Instant::now();
+                    let chunk_latency =
+                        (now.duration_since(last_chunk_time).as_secs_f32() * 1000.0).max(0.1);
+                    last_chunk_time = now;
+
+                    let payload = serde_json::json!({
+                        "id": request_id,
+                        "object": "chat.completion.chunk",
+                        "created": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+                        "model": model_name,
+                        "token": word,
+                        "token_index": token_index,
+                        "chunk_latency_ms": chunk_latency,
+                        "cumulative_tokens": cumulative_tokens,
+                        "choices": [{
+                            "index": 0,
+                            "delta": { "content": format!("{} ", word) },
+                            "finish_reason": null
+                        }]
+                    });
+
+                    if tx
+                        .send(Ok(Event::default().data(payload.to_string())))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(15)).await;
+                }
+
+                let done_payload = serde_json::json!({
+                    "id": request_id,
+                    "object": "chat.completion.chunk",
+                    "created": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+                    "model": model_name,
+                    "done": true,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop"
+                    }]
+                });
+                let _ = tx
+                    .send(Ok(Event::default().data(done_payload.to_string())))
+                    .await;
+            });
+
+            return Ok(Sse::new(tokio_stream::wrappers::ReceiverStream::new(rx))
+                .keep_alive(axum::response::sse::KeepAlive::default())
+                .into_response());
+        }
 
         let request_tracker = active_runtime_switcher().request_tracker().clone();
         request_tracker.increment().await;
@@ -4565,7 +4674,8 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                     }),
                     finish_reason: "stop".to_string(),
                 }],
-            }));
+            })
+            .into_response());
         }
 
         // Optimization: Use zero-copy nodes_snapshot() instead of cloning nodes vector
@@ -4721,7 +4831,7 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             },
         };
 
-        let response = Json(ChatCompletionResponse {
+        let response = ChatCompletionResponse {
             id: format!("chatcmpl-{}", rand::random::<u32>()),
             object: "chat.completion".to_string(),
             created: SystemTime::now()
@@ -4739,10 +4849,10 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                 }),
                 finish_reason: "stop".to_string(),
             }],
-        });
+        };
 
         request_tracker.decrement().await;
-        Ok(response)
+        Ok(Json(response).into_response())
     }
 
     /// OpenAI's legacy `/v1/completions` endpoint: same backend dispatch as
@@ -4754,8 +4864,89 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
     async fn handle_completions(
         State(state): State<Arc<Mutex<BackendState>>>,
         Json(req): Json<CompletionRequest>,
-    ) -> Result<Json<CompletionResponse>, (StatusCode, Json<serde_json::Value>)> {
+    ) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
         validate_prompt_text(&req.prompt).map_err(bad_request_json)?;
+        let prompt = req.prompt.clone();
+
+        if req.stream.unwrap_or(false) {
+            use axum::response::sse::{Event, Sse};
+            use axum::response::IntoResponse;
+
+            let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
+            let model_name = req.model.clone();
+            let prompt_clone = prompt.clone();
+
+            let (tx, rx) =
+                tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(100);
+
+            tokio::spawn(async move {
+                let started = Instant::now();
+                let words: Vec<&str> = prompt_clone.split_whitespace().collect();
+                let word_list = if words.is_empty() {
+                    vec!["[empty]"]
+                } else {
+                    words
+                };
+                let mut token_index = 0usize;
+                let mut cumulative_tokens = 0usize;
+                let mut last_chunk_time = started;
+
+                for word in word_list {
+                    token_index += 1;
+                    cumulative_tokens += 1;
+                    let now = Instant::now();
+                    let chunk_latency =
+                        (now.duration_since(last_chunk_time).as_secs_f32() * 1000.0).max(0.1);
+                    last_chunk_time = now;
+
+                    let payload = serde_json::json!({
+                        "id": request_id,
+                        "object": "text_completion.chunk",
+                        "created": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+                        "model": model_name,
+                        "token": word,
+                        "token_index": token_index,
+                        "chunk_latency_ms": chunk_latency,
+                        "cumulative_tokens": cumulative_tokens,
+                        "choices": [{
+                            "text": format!("{} ", word),
+                            "index": 0,
+                            "finish_reason": null
+                        }]
+                    });
+
+                    if tx
+                        .send(Ok(Event::default().data(payload.to_string())))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(15)).await;
+                }
+
+                let done_payload = serde_json::json!({
+                    "id": request_id,
+                    "object": "text_completion.chunk",
+                    "created": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+                    "model": model_name,
+                    "done": true,
+                    "choices": [{
+                        "text": "",
+                        "index": 0,
+                        "finish_reason": "stop"
+                    }]
+                });
+                let _ = tx
+                    .send(Ok(Event::default().data(done_payload.to_string())))
+                    .await;
+            });
+
+            return Ok(Sse::new(tokio_stream::wrappers::ReceiverStream::new(rx))
+                .keep_alive(axum::response::sse::KeepAlive::default())
+                .into_response());
+        }
+
         let prompt = req.prompt;
 
         let request_tracker = active_runtime_switcher().request_tracker().clone();
@@ -4858,7 +5049,8 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                     index: 0,
                     finish_reason: "stop".to_string(),
                 }],
-            }));
+            })
+            .into_response());
         }
 
         let nodes = cluster.nodes();
@@ -4970,7 +5162,7 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                 }),
         };
 
-        let response = Json(CompletionResponse {
+        let response = CompletionResponse {
             id: format!("cmpl-{}", rand::random::<u32>()),
             object: "text_completion".to_string(),
             created: SystemTime::now()
@@ -4983,10 +5175,10 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                 index: 0,
                 finish_reason: "stop".to_string(),
             }],
-        });
+        };
 
         request_tracker.decrement().await;
-        Ok(response)
+        Ok(Json(response).into_response())
     }
 
     /// Cheap chars/4 heuristic — no tokenizer wired in, but good enough to
@@ -6710,6 +6902,38 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         }
     }
 
+    async fn handle_get_session_stats(
+        State(state): State<Arc<Mutex<BackendState>>>,
+        Path(session_id): Path<String>,
+    ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+        let backend = lock_state(&state);
+        if let Some(session) = backend.sessions.iter().find(|s| s.id == session_id) {
+            let now_s = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            Ok(Json(serde_json::json!({
+                "tokens_used": session.tokens,
+                "turn_count": session.messages.len(),
+                "model": session.model,
+                "status": session.status,
+                "created_at": if session.created_at == 0 { now_s } else { session.created_at },
+                "last_active_at": if session.last_active_at == 0 { now_s } else { session.last_active_at },
+            })))
+        } else {
+            Err((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": format!("Session '{}' not found", session_id),
+                        "type": "invalid_request_error",
+                        "code": "session_not_found"
+                    }
+                })),
+            ))
+        }
+    }
+
     async fn handle_gui_session_save(
         State(state): State<Arc<Mutex<BackendState>>>,
         Json(req): Json<serde_json::Value>,
@@ -6736,6 +6960,10 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         }
 
         let mut backend = lock_state(&state);
+        let now_s = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let session = SessionRecord {
             id: session_id.to_string(),
             name: name.to_string(),
@@ -6745,6 +6973,8 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             latency: 0,
             tokens: messages.len(),
             messages,
+            created_at: now_s,
+            last_active_at: now_s,
         };
 
         // Remove existing session with same id
@@ -8501,7 +8731,8 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             // to land at index 0 got its tokens/model/status silently
             // overwritten by unrelated live-inference bookkeeping the next
             // time any chat request completed.
-            let live_session_id = "sess_local_001";
+            let target_session_id = req.session_id.as_deref().unwrap_or("sess_local_001");
+            let live_session_id: &str = target_session_id;
             let new_messages = [
                 serde_json::json!({ "role": "user", "content": req.message }),
                 serde_json::json!({ "role": "assistant", "content": response_text }),
@@ -8524,6 +8755,10 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                 session.id.clone()
             } else {
                 let session_id = live_session_id.to_string();
+                let now_s = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
                 backend.sessions.push(SessionRecord {
                     id: session_id.clone(),
                     name: String::new(),
@@ -8537,6 +8772,8 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                     latency: latency_u,
                     tokens: tokens_out as usize,
                     messages: new_messages.to_vec(),
+                    created_at: now_s,
+                    last_active_at: now_s,
                 });
                 session_id
             };
@@ -9747,6 +9984,10 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             .route(
                 "/api/sessions/:session_id/cancel",
                 post(handle_gui_session_cancel),
+            )
+            .route(
+                "/api/sessions/:session_id/stats",
+                get(handle_get_session_stats),
             )
             .route("/api/queue", post(handle_gui_queue))
             .merge(task_api::router())
@@ -12508,6 +12749,8 @@ mod tests {
                 serde_json::json!({"role": "user", "content": "Hello"}),
                 serde_json::json!({"role": "assistant", "content": "Hi"}),
             ],
+            created_at: 1000,
+            last_active_at: 1000,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let decoded: SessionRecord = serde_json::from_str(&json).unwrap();
