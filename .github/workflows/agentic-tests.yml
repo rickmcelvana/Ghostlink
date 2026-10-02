@@ -1,0 +1,211 @@
+name: Agentic Inference Tests
+
+# These tests exercise a *running* ghost-link server's OpenAI-compatible
+# routes with a real model behind them, so they need three things a bare
+# GitHub runner does not have:
+#
+#   1. the `llama-server` binary (built from vendored llama.cpp),
+#   2. a downloaded GGUF model,
+#   3. an API key for the authenticated /api routes.
+#
+# The previous revision of this file declared a `services:` container on
+# `image: ghostlink:latest` - an image nothing in this repo builds or
+# pushes - so the job could never start at all. Rather than swap in a
+# different broken prerequisite, this workflow now provisions all three
+# explicitly and fails with a clear message when a prerequisite is missing.
+#
+# Paths here mirror `scripts/run_agentic_tests.sh` (the local entry point)
+# so local and CI runs exercise the same setup.
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'crates/**'
+      - 'scripts/test_*.py'
+      - 'scripts/run_agentic_tests.sh'
+      - '.github/workflows/agentic-tests.yml'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'crates/**'
+      - 'scripts/test_*.py'
+      - 'scripts/run_agentic_tests.sh'
+      - '.github/workflows/agentic-tests.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  GHOSTLINK_CI_DIR: /tmp/ghostlink-ci
+  GHOSTLINK_PORT: '18014'
+  # The same small real model the repo's Docker fabric uses for smoke tests:
+  # large enough to produce real tokens, small enough for a CPU-only runner.
+  GHOSTLINK_TEST_MODEL_URL: >-
+    https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories15M-q4_0.gguf
+
+jobs:
+  agentic-tests:
+    name: Agentic inference tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build ghost-link (release)
+        run: cargo build --release -p ghost-link
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      # llama-server performs the actual inference; `ghost-link serve` is the
+      # API in front of it. Build it from the vendored tree.
+      - name: Provision llama-server
+        run: |
+          set -euo pipefail
+          mkdir -p "$GHOSTLINK_CI_DIR"
+          if [[ ! -d third_party/llama.cpp ]]; then
+            echo "::error::third_party/llama.cpp is absent, so llama-server cannot be built and these tests cannot run."
+            echo "::error::Vendor llama.cpp (it is gitignored) or run scripts/run_agentic_tests.sh locally instead."
+            exit 1
+          fi
+          cmake -S third_party/llama.cpp -B /tmp/llama-build \
+            -DGGML_RPC=ON -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release
+          cmake --build /tmp/llama-build --target llama-server -j "$(nproc)"
+          cp /tmp/llama-build/bin/llama-server "$GHOSTLINK_CI_DIR/llama-server"
+          echo "GHOSTLINK_LLAMA_SERVER_BIN=$GHOSTLINK_CI_DIR/llama-server" >> "$GITHUB_ENV"
+
+      - name: Provision test model
+        run: |
+          set -euo pipefail
+          mkdir -p "$GHOSTLINK_CI_DIR/models"
+          curl -fL --retry 3 -o "$GHOSTLINK_CI_DIR/models/stories15M-q4_0.gguf" \
+            "$GHOSTLINK_TEST_MODEL_URL"
+          ls -la "$GHOSTLINK_CI_DIR/models"
+
+      # The server generates its own JWT signing secret and API key on first
+      # run; keep both out of the checkout.
+      - name: Start ghost-link backend
+        run: |
+          set -euo pipefail
+          export GHOSTLINK_JWT_SECRET_PATH="$GHOSTLINK_CI_DIR/jwt_secret.txt"
+          export GHOSTLINK_API_KEY_PATH="$GHOSTLINK_CI_DIR/api_key.txt"
+          nohup ./target/release/ghost-link serve 127.0.0.1 "$GHOSTLINK_PORT" \
+            > "$GHOSTLINK_CI_DIR/server.log" 2>&1 &
+          echo $! > "$GHOSTLINK_CI_DIR/server.pid"
+
+      - name: Wait for backend health
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 90); do
+            if curl -fsS "http://127.0.0.1:${GHOSTLINK_PORT}/health" >/dev/null 2>&1; then
+              echo "backend healthy after ${i}s"
+              curl -fsS "http://127.0.0.1:${GHOSTLINK_PORT}/health" || true
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::backend did not become healthy within 90s"
+          tail -100 "$GHOSTLINK_CI_DIR/server.log" || true
+          exit 1
+
+      - name: Load test model
+        run: |
+          set -euo pipefail
+          KEY="$(cat "$GHOSTLINK_CI_DIR/api_key.txt" 2>/dev/null || true)"
+          if [[ -z "$KEY" ]]; then
+            echo "::error::no API key at $GHOSTLINK_CI_DIR/api_key.txt after startup"
+            tail -50 "$GHOSTLINK_CI_DIR/server.log" || true
+            exit 1
+          fi
+          curl -fsS -X POST "http://127.0.0.1:${GHOSTLINK_PORT}/api/models/load" \
+            -H "Authorization: Bearer $KEY" \
+            -H 'Content-Type: application/json' \
+            -d "{\"path\":\"$GHOSTLINK_CI_DIR/models/stories15M-q4_0.gguf\"}"
+
+      # The test scripts read the key from a repo-root-relative
+      # `api_key.txt`; place it where they look. It is gitignored, so this
+      # does not dirty the checkout.
+      - name: Stage API key for the test scripts
+        run: cp "$GHOSTLINK_CI_DIR/api_key.txt" api_key.txt
+
+      - name: Test 1 - Streaming Inference
+        run: |
+          python3 scripts/test_streaming_inference.py \
+            --prompt "Tell me a short story" \
+            --max-tokens 32 \
+            --timeout 120 \
+            --min-tokens 3
+
+      - name: Test 2 - Session Continuity
+        run: python3 scripts/test_session_continuity.py --timeout 180
+
+      - name: Test 3 - Tool Call Output
+        run: python3 scripts/test_tool_call_output.py --timeout 180
+
+      - name: Test 4 - Token Budget
+        continue-on-error: true  # Optional - may not be fully implemented
+        run: python3 scripts/test_token_budget.py --timeout 180
+
+      - name: Test 5 - Advanced Reliability
+        run: |
+          python3 scripts/test_advanced_reliability.py \
+            --concurrent 5 \
+            --reliability-runs 10 \
+            --timeout 30
+
+      - name: Stop backend
+        if: always()
+        run: |
+          if [[ -f "$GHOSTLINK_CI_DIR/server.pid" ]]; then
+            kill "$(cat "$GHOSTLINK_CI_DIR/server.pid")" 2>/dev/null || true
+          fi
+          pkill -f 'ghost-link serve' 2>/dev/null || true
+          pkill -f 'llama-server' 2>/dev/null || true
+
+      - name: Upload server log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentic-server-log
+          path: /tmp/ghostlink-ci/server.log
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Test summary
+        if: always()
+        run: |
+          {
+            echo "## Agentic Inference Tests Summary"
+            echo ""
+            echo "- Streaming inference (SSE)"
+            echo "- Multi-turn sessions"
+            echo "- Tool call parsing"
+            echo "- Token budget (optional)"
+            echo "- Reliability & load"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  status-check:
+    name: Status check
+    runs-on: ubuntu-latest
+    needs: agentic-tests
+    if: always()
+    steps:
+      - name: Report result
+        run: |
+          if [ "${{ needs.agentic-tests.result }}" = "success" ]; then
+            echo "All agentic inference tests passed"
+            exit 0
+          fi
+          echo "::error::agentic-tests did not succeed (${{ needs.agentic-tests.result }})"
+          exit 1
