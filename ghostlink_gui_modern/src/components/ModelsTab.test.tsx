@@ -221,4 +221,34 @@ describe('ModelsTab', () => {
       expect(refreshBtn).toHaveAttribute('aria-label', 'Refresh models');
     });
   });
+
+  it('sets aria-busy and shows loading state on popular model card during pull', async () => {
+    const api = createMockApi('ollama');
+    let resolvePull: (val: any) => void;
+    vi.spyOn(api, 'pullOllamaModel').mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolvePull = resolve;
+        })
+    );
+
+    render(<ModelsTab api={api} />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Popular Ollama Models')).toBeInTheDocument();
+    });
+
+    const pullBtn = screen.getByRole('button', { name: 'Pull Llama 3.2 3B Instruct' });
+    fireEvent.click(pullBtn);
+
+    expect(pullBtn).toHaveAttribute('aria-busy', 'true');
+    expect(pullBtn).toHaveAttribute('aria-label', 'Pulling Llama 3.2 3B Instruct');
+    expect(screen.getByText('Pulling...')).toBeInTheDocument();
+
+    resolvePull!({ success: true });
+
+    await waitFor(() => {
+      expect(pullBtn).toHaveAttribute('aria-busy', 'false');
+    });
+  });
 });

@@ -710,8 +710,20 @@ export const ModelsTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
                             disabled={pendingActions[model.name] === 'deleting' || loading}
                             aria-busy={pendingActions[model.name] === 'deleting'}
                             className="p-1 hover:bg-slate-700 rounded-lg transition text-slate-400 hover:text-red-400 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
-                            title={canManageRemoteCatalog ? 'Delete from Ollama' : 'Delete model file'}
-                            aria-label={canManageRemoteCatalog ? `Delete ${model.name} from Ollama` : `Delete model file ${model.name}`}
+                            title={
+                              pendingActions[model.name] === 'deleting'
+                                ? `Deleting ${model.name}...`
+                                : canManageRemoteCatalog
+                                ? 'Delete from Ollama'
+                                : 'Delete model file'
+                            }
+                            aria-label={
+                              pendingActions[model.name] === 'deleting'
+                                ? `Deleting ${model.name}...`
+                                : canManageRemoteCatalog
+                                ? `Delete ${model.name} from Ollama`
+                                : `Delete model file ${model.name}`
+                            }
                           >
                             {pendingActions[model.name] === 'deleting' ? (
                               <Loader size={16} className="mr-1 animate-spin" aria-hidden="true" />
@@ -778,6 +790,7 @@ export const ModelsTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
                         key={m.id}
                         onClick={() => handlePullModel(m.id)}
                         disabled={isInstalled || isPending || loading}
+                        aria-busy={isPending}
                         title={
                           isInstalled
                             ? `${m.name} is already installed`
@@ -802,25 +815,33 @@ export const ModelsTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
                       >
                         <div className="flex items-center gap-2 mb-2">
                           <span className="font-bold text-slate-200 truncate w-full">{m.name}</span>
-                          {isInstalled && <CheckCircle2 className="h-4 w-4 text-green-500 flex-shrink-0" />}
+                          {isInstalled && <CheckCircle2 className="h-4 w-4 text-green-500 flex-shrink-0" aria-hidden="true" />}
                         </div>
                         <div className="text-xs text-slate-400 truncate w-full font-mono">{m.id}</div>
-                        {isPending && downloadProgress[m.id] !== undefined && (
+                        {isPending && (
                           <div className="mt-2 w-full">
-                            <div className="w-full bg-slate-700 rounded-full h-1.5">
-                              <div
-                                className="bg-blue-500 h-1.5 rounded-full transition-all duration-500"
-                                style={{ width: `${Math.round(downloadProgress[m.id].progress * 100)}%` }}
-                              />
-                            </div>
-                            <div className="mt-1 text-[10px] text-slate-500 font-mono">
-                              {progressLabel(downloadProgress[m.id])}
-                            </div>
+                            {downloadProgress[m.id] !== undefined ? (
+                              <>
+                                <div className="w-full bg-slate-700 rounded-full h-1.5">
+                                  <div
+                                    className="bg-blue-500 h-1.5 rounded-full transition-all duration-500"
+                                    style={{ width: `${Math.round(downloadProgress[m.id].progress * 100)}%` }}
+                                  />
+                                </div>
+                                <div className="mt-1 text-[10px] text-slate-500 font-mono">
+                                  {progressLabel(downloadProgress[m.id])}
+                                </div>
+                              </>
+                            ) : (
+                              <div className="flex items-center justify-center gap-1 text-xs text-blue-400 font-medium">
+                                <Loader size={12} className="animate-spin" aria-hidden="true" /> Pulling...
+                              </div>
+                            )}
                           </div>
                         )}
                         {!isInstalled && !isPending && (
                           <div className="mt-2 flex items-center gap-1 text-xs text-slate-400">
-                            <Download size={12} /> Pull
+                            <Download size={12} aria-hidden="true" /> Pull
                           </div>
                         )}
                       </button>
