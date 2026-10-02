@@ -7,6 +7,7 @@
 //! - Optional pre-warming on startup
 
 use std::collections::HashMap;
+use std::fmt::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -192,10 +193,11 @@ impl Clone for ApiResponseCache {
 /// effective space to make it worse.
 fn compute_etag(body: &[u8]) -> String {
     // Optimize: Replace slower DefaultHasher (SipHash) with the hardware-accelerated CRC32 checksum.
-    // This utilizes crc32fast instructions (SSE 4.2 / ARM PMULL) and completely avoids the CPU cycles
-    // spent on cryptographic-strength SipHash for generating a simple API response ETag.
+    // Pre-allocate String capacity (32 bytes) to format weak ETag string directly without dynamic reallocations.
     let crc = crate::protocol::crc32(body);
-    format!("W/\"{:x}-{:x}\"", crc, body.len())
+    let mut etag = String::with_capacity(32);
+    let _ = write!(etag, "W/\"{:x}-{:x}\"", crc, body.len());
+    etag
 }
 
 #[cfg(test)]
