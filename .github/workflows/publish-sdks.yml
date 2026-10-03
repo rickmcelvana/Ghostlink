@@ -1,5 +1,11 @@
 name: Publish SDKs
 
+# NOTE: `workflow_dispatch` must be run against the release TAG, not a branch.
+# A manual dispatch defaults to `main`, where `github.ref` is
+# `refs/heads/main` — every `if: startsWith(github.ref, 'refs/tags/')` step
+# then silently SKIPS while the job still reports success. That produced two
+# green-but-publishing-nothing runs before this guard existed. The
+# "Require a tag ref" step below now fails loudly instead.
 'on':
   push:
     tags:
@@ -17,6 +23,17 @@ jobs:
       run:
         working-directory: sdks/js
     steps:
+      - name: Require a tag ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" != refs/tags/* ]]; then
+            echo "::error::This workflow publishes a release and must run against a tag, not '${GITHUB_REF}'."
+            echo "::error::Re-run it from the Actions tab, choose this workflow, click 'Run workflow', and select the TAG (not the branch) — or dispatch the API with {\"ref\": \"vX.Y.Z\"}."
+            echo "::error::Running against a branch skips every tag-gated step and reports a false success."
+            exit 1
+          fi
+          echo "Running against release tag ${GITHUB_REF_NAME}."
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
@@ -56,6 +73,17 @@ jobs:
       run:
         working-directory: sdks/python
     steps:
+      - name: Require a tag ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" != refs/tags/* ]]; then
+            echo "::error::This workflow publishes a release and must run against a tag, not '${GITHUB_REF}'."
+            echo "::error::Re-run it from the Actions tab, choose this workflow, click 'Run workflow', and select the TAG (not the branch) — or dispatch the API with {\"ref\": \"vX.Y.Z\"}."
+            echo "::error::Running against a branch skips every tag-gated step and reports a false success."
+            exit 1
+          fi
+          echo "Running against release tag ${GITHUB_REF_NAME}."
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:

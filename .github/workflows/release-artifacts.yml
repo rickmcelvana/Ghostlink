@@ -1,5 +1,11 @@
 name: Release Artifacts
 
+# NOTE: `workflow_dispatch` must be run against the release TAG, not a branch.
+# A manual dispatch defaults to `main`, where `github.ref` is
+# `refs/heads/main` — the tag-gated steps below (version verification, signing,
+# release notes, and "Publish GitHub Release") then silently SKIP while the job
+# still reports success, producing a release with zero assets. The
+# "Require a tag ref" step now fails loudly instead.
 'on':
   push:
     tags:
@@ -19,6 +25,17 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      - name: Require a tag ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" != refs/tags/* ]]; then
+            echo "::error::This workflow builds and publishes a release and must run against a tag, not '${GITHUB_REF}'."
+            echo "::error::Re-run it from the Actions tab, choose this workflow, click 'Run workflow', and select the TAG (not the branch) — or dispatch the API with {\"ref\": \"vX.Y.Z\"}."
+            echo "::error::Running against a branch skips the version check, signing, release notes, and the GitHub Release publish itself."
+            exit 1
+          fi
+          echo "Running against release tag ${GITHUB_REF_NAME}."
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2

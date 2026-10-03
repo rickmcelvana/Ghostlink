@@ -1,5 +1,10 @@
 name: Publish Crates
 
+# NOTE: `workflow_dispatch` must be run against the release TAG, not a branch.
+# The publish steps below are intentionally NOT tag-gated (they are the whole
+# job), so a branch dispatch would still publish — but the tag-format and
+# version-match verification steps WOULD silently skip, publishing an
+# unverified version. The "Require a tag ref" step makes that loud.
 'on':
   push:
     tags:
@@ -14,6 +19,17 @@ jobs:
     name: Publish to crates.io
     runs-on: ubuntu-latest
     steps:
+      - name: Require a tag ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" != refs/tags/* ]]; then
+            echo "::error::This workflow publishes a release and must run against a tag, not '${GITHUB_REF}'."
+            echo "::error::Re-run it from the Actions tab, choose this workflow, click 'Run workflow', and select the TAG (not the branch) — or dispatch the API with {\"ref\": \"vX.Y.Z\"}."
+            echo "::error::Running against a branch would publish without the tag-format and version-match verification."
+            exit 1
+          fi
+          echo "Running against release tag ${GITHUB_REF_NAME}."
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
