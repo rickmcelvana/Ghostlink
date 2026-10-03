@@ -6,6 +6,10 @@ All notable changes to Ghostlink Studio are documented here.
 
 ## [Unreleased]
 
+---
+
+## [2.3.0] - 2026-10-03
+
 ### Added
 - **Inference latency, streaming, and conversation memory** (`crates/ghost-link/src/native_engine.rs`, `crates/ghost-link/src/main.rs`, `crates/ghost-link/src/ollama.rs`, `crates/ghost-link/src/host_metrics.rs`, `crates/ghostlink-core/src/kv_cache.rs`, `ghostlink_gui_modern/src/api.ts`, `ghostlink_gui_modern/src/components/ChatTab.tsx`):
   A measured pass over the local inference path. Benchmarked on the reference host (Llama-3.2-1B Q3_K_M, `llama-server`): time-to-first-token, decode throughput, and the transport primitives, with every change verified against a live server rather than asserted.
