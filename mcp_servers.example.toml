@@ -226,3 +226,25 @@ requires_confirmation = false
 timeout_secs = 30
 
 [mcp_servers.env]
+
+[[mcp_servers]]
+name = "memory"
+# The assistant's durable memory (crates/mcp-memory): SQLite-backed, scoped per
+# workspace. memory_catalog / memory_search are reads and run as observations;
+# memory_remember / memory_forget are writes and are gated behind approval by
+# crates/ghost-link/src/capability.rs.
+#
+# A real slot keeps these four tools behind a Tools-panel checkbox rather than
+# always-on -- same pattern as rag/git_tools above.
+slot = "memory"
+enabled = true
+transport = "stdio"
+command = "target/release/mcp-memory.exe"
+args = []
+requires_confirmation = false
+
+[mcp_servers.env]
+# One store per workspace would need the id at spawn time; the server takes it
+# as a tool argument instead (stamped server-side by ghost-link), so a single
+# DB file holds every workspace's rows, partitioned by workspace_id.
+GHOSTLINK_MEMORY_DB_PATH = "ghostlink_memory.db"

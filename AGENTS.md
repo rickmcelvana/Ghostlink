@@ -10,9 +10,12 @@ contributor workflow, see [CONTRIBUTING.md](CONTRIBUTING.md).
 - `crates/ghost-link` — CLI + OpenAI-compatible API server (Rust).
 - `crates/ghostlink-core` — shared runtime primitives: planning, routing,
   transport, health monitoring, system profiling. `ghost-link` depends on it.
-- `crates/mcp-calculator`, `crates/mcp-rag`, `crates/mcp-vision` — local
-  stdio MCP servers used by the chat tool-calling loop. Internal
-  (`publish = false`), not published to crates.io.
+- `crates/mcp-calculator`, `crates/mcp-rag`, `crates/mcp-vision`,
+  `crates/mcp-memory` — local stdio MCP servers used by the chat tool-calling
+  loop. Internal (`publish = false`), not published to crates.io.
+  `mcp-memory` is the assistant's durable SQLite-backed memory store; its tools
+  are workspace-scoped, and `capability::stamp_workspace_scope` overwrites the
+  scope argument at dispatch so a model cannot address another workspace.
 - `crates/ghostlink-gui` — an earlier Tauri/Svelte desktop shell, the
   pre-React GUI prototype. **Legacy only** — not the active GUI, and not
   wired into the launchers, workspace, or release pipeline. If you're

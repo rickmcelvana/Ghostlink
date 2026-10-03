@@ -226,6 +226,49 @@ pub fn is_vetted_auto_apply(
     canon_path.starts_with(canon_root)
 }
 
+/// Memory tools whose arguments carry a workspace scope the server must not be
+/// able to choose for itself.
+///
+/// The model can put anything it likes in a tool call's arguments, including a
+/// `workspace_id` naming a different workspace. Left alone that would let a
+/// prompt-injected turn read (or worse, write) another workspace's memories —
+/// which defeats the entire per-workspace grant model. So for these tools the
+/// server overwrites the scope from the chat's own binding at dispatch, rather
+/// than trusting the argument.
+fn is_scope_stamped(server: &str) -> bool {
+    server == "memory"
+}
+
+/// Replaces any caller-supplied workspace scope with the chat's own.
+///
+/// Returns the args unchanged for tools that aren't workspace-scoped. For the
+/// scoped ones, `workspace_id` is always the server's value: a model-supplied
+/// one is discarded rather than rejected, because failing the call outright
+/// turns a prompt-injection attempt into a confusing tool error instead of a
+/// silently-correct result, and the audit trail already records the real scope.
+pub fn stamp_workspace_scope(
+    server: &str,
+    tool: &str,
+    mut args: serde_json::Value,
+    workspace_id: &str,
+) -> serde_json::Value {
+    let _ = tool;
+    if !is_scope_stamped(server) {
+        return args;
+    }
+    if !args.is_object() {
+        // A non-object argument bag can't carry the scope; make it one so the
+        // stamped id isn't silently dropped on the server side.
+        args = serde_json::json!({});
+    }
+    let obj = args.as_object_mut().expect("just ensured object");
+    obj.insert(
+        "workspace_id".to_string(),
+        serde_json::Value::String(workspace_id.to_string()),
+    );
+    args
+}
+
 /// What the server decided to do with a tool call, before it runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -524,5 +567,59 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn stamp_overrides_a_model_supplied_workspace() {
+        // The whole point: a model-supplied scope must never win.
+        let args = serde_json::json!({ "workspace_id": "ws_someone_else", "query": "salary" });
+        let stamped = stamp_workspace_scope("memory", "memory_search", args, "ws_real");
+        assert_eq!(stamped["workspace_id"], "ws_real");
+        assert_eq!(stamped["query"], "salary", "other args are preserved");
+    }
+
+    #[test]
+    fn stamp_adds_the_scope_when_absent() {
+        let stamped = stamp_workspace_scope(
+            "memory",
+            "memory_remember",
+            serde_json::json!({ "title": "t" }),
+            "ws_real",
+        );
+        assert_eq!(stamped["workspace_id"], "ws_real");
+    }
+
+    #[test]
+    fn stamp_replaces_a_non_object_argument_bag() {
+        // Otherwise the id would be silently dropped server-side and the tool
+        // would fall back to whatever scope it liked.
+        let stamped = stamp_workspace_scope(
+            "memory",
+            "memory_search",
+            serde_json::json!("oops"),
+            "ws_real",
+        );
+        assert_eq!(stamped["workspace_id"], "ws_real");
+    }
+
+    #[test]
+    fn stamp_leaves_unscoped_servers_alone() {
+        let args = serde_json::json!({ "expression": "2+2" });
+        let out = stamp_workspace_scope("calculator", "calculate", args.clone(), "ws_real");
+        assert_eq!(out, args);
+        assert!(out.get("workspace_id").is_none());
+    }
+
+    #[test]
+    fn scoped_memory_reads_are_reads_and_writes_are_writes() {
+        // The four tool names must match crates/mcp-memory exactly, or the gate
+        // silently falls back to exec for all of them.
+        assert_eq!(classify("memory", "memory_catalog"), CapabilityClass::Read);
+        assert_eq!(classify("memory", "memory_search"), CapabilityClass::Read);
+        assert_eq!(
+            classify("memory", "memory_remember"),
+            CapabilityClass::Write
+        );
+        assert_eq!(classify("memory", "memory_forget"), CapabilityClass::Write);
     }
 }

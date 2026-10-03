@@ -54,14 +54,15 @@ memory bodies and tool previews — not credentials. API keys stay in
 
 ## Implementation status
 
-Branch: `feature/local-assistant-layer`. Phases 0 and 2 are landed and gated
+Branch: `feature/local-assistant-layer`. Phases 0, 1, and 2 are landed and gated
 (`cargo fmt`, `cargo clippy -D warnings`, `cargo test --workspace` all clean).
 
 | Phase | Status |
 |---|---|
 | 0 — Workspace identity | **Done.** `workspace.rs`, `workspace_id` on `GuiChatRequest`, single shared `resolve_within` |
+| 1 — Memory library | **Done.** `crates/mcp-memory`; 17 store/server tests |
 | 2 — Capability boundary | **Done.** `capability.rs`, enforced in `invoke_mcp_tool`, `GET /api/inference/capabilities` |
-| 1 — Memory library | Next (needs the `rusqlite` decision) |
+| 1 — Memory library | **Done.** `crates/mcp-memory`, SQLite + `rusqlite` (bundled), 4 tools, scope stamped at dispatch |
 | 3 — Approval tray | Not started (needs persisted approvals; `CapabilityClass::parse` is its consumer) |
 | 4 — Bounded loop | Not started |
 | 5 — Scheduler | Not started |

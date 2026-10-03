@@ -1,0 +1,28 @@
+[package]
+name = "mcp-memory"
+version = "2.3.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "mcp-memory"
+path = "src/main.rs"
+
+[dependencies]
+rmcp = { version = "2", features = ["transport-io", "schemars"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+# SQLite for the durable store. `bundled` compiles it from source so there is
+# no system dependency to install and CI stays green on all three platforms.
+# The alternative (a JSON file, as crates/mcp-rag uses for its index) makes
+# ranked search and concurrent access from the chat path, the approval queue,
+# and the scheduler contend on one global file lock.
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3"

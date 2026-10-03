@@ -2581,6 +2581,7 @@ async fn invoke_mcp_tool(
                     success: false,
                 };
             }
+            let args = capability::stamp_workspace_scope(&schema.server, tool_name, args, ws.id());
             match mcp_registry
                 .call_tool(&schema.server, tool_name, args)
                 .await

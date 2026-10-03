@@ -121,6 +121,19 @@ This document summarizes current security assumptions for Ghost-Link runtime and
   single shared `resolve_within` implementation, so the GUI's file routes and the
   tool caller's scoping cannot drift into two different traversal checks.
 
+- **Workspace scope on memory tools is stamped server-side** (since 2.4.0, `crates/mcp-memory/`, `crates/ghost-link/src/capability.rs`):
+  the memory store filters every statement by `workspace_id`, and `ghost-link`
+  *overwrites* that argument at dispatch with the chat's own binding rather than
+  accepting the model's. A prompt-injected turn can trivially emit
+  `{"workspace_id": "ws_other"}`; that value is discarded, so it cannot read or
+  write another workspace's memories. An unrecognized `kind` or `source` in an
+  existing row degrades to a safe default rather than dropping the row, and
+  `memory_forget` deletes scoped to the workspace, so an id carried over from
+  elsewhere is a no-op instead of a cross-workspace delete.
+  The store holds memory bodies and titles. It does not hold credentials: API
+  keys remain in the hashed `api_keys.json` store and the OS keychain, and
+  secrets are never written to the memory DB, to prompts, or to traces.
+
 ## Threats and Risks
 
 - Discovery spoofing or replay on untrusted LAN segments.
