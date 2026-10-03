@@ -560,6 +560,51 @@ describe('GhostlinkAPI', () => {
 
       vi.unstubAllGlobals();
     });
+
+    it('reassembles an SSE frame split across two network reads without losing tokens', async () => {
+      const encoder = new TextEncoder();
+      // A single frame split mid-JSON between two reads. The old per-chunk
+      // split('\n') parser tried to JSON.parse the partial frame, failed, and
+      // dropped the leading token.
+      const fullFrame = `data: ${JSON.stringify({ token: 'Hello world' })}\n`;
+      const cut = Math.floor(fullFrame.length / 2);
+      const chunks = [fullFrame.slice(0, cut), fullFrame.slice(cut)];
+      let chunkIndex = 0;
+      const reader = {
+        read: vi.fn(async () => {
+          if (chunkIndex < chunks.length) {
+            return { done: false, value: encoder.encode(chunks[chunkIndex++]) };
+          }
+          return { done: true, value: undefined };
+        }),
+      };
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        body: { getReader: () => reader },
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const tokens: string[] = [];
+      const result = await api.sendMessage(
+        {
+          message: 'test',
+          temperature: 0.7,
+          top_p: 0.9,
+          top_k: 40,
+          penalty: 1.1,
+          max_tokens: 100,
+          system_prompt: '',
+          stream: true,
+        },
+        (token) => tokens.push(token)
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.data?.response).toBe('Hello world');
+      expect(tokens.join('')).toBe('Hello world');
+
+      vi.unstubAllGlobals();
+    });
   });
 
   describe('Download Progress', () => {

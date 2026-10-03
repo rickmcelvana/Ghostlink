@@ -21,6 +21,26 @@
 //! allow inspecting or copying cached keys and values directly without owned
 //! heap allocations.
 //!
+//! ## Read API: prefer the zero-copy closure forms
+//!
+//! `with_read_kv` / `with_read_range` are the intended read API — they hand
+//! out borrowed slices under the read lock and allocate nothing. The owned
+//! forms `read_kv` / `read_range` exist only as a reference implementation and
+//! as the equivalence oracle for the zero-copy paths' tests; they are
+//! `#[doc(hidden)]` and deliberately **not** part of the public surface.
+//!
+//! Measured on the reference host (`cargo bench -p ghostlink-core --bench
+//! kv_cache`, `wide` config), the difference is not a micro-optimization:
+//!
+//! | operation | owned | zero-copy |
+//! |---|---|---|
+//! | `read_range_1024` | 4.57 ms | 12.8 ns |
+//! | `decode_step_256` | 141.9 ms | 1.26 ms |
+//! | `concurrent_4_readers_256` | 1.63 ms | 221 ns |
+//!
+//! A naive wiring of the owned paths into a decode loop costs 100x-350,000x.
+//! Use the closure forms.
+//!
 //! This module has no current caller in `runtime.rs` — Ghostlink delegates
 //! actual model execution to an external inference engine (llama-server /
 //! Ollama, see `ghost-link::native_engine`) rather than computing attention
@@ -268,6 +288,11 @@ impl LayerKvCache {
 
     /// Reads one token's cached key/value vectors as an owned, fixed-size
     /// copy (`config.token_width()` floats each — not the whole cache).
+    ///
+    /// **Prefer [`Self::with_read_kv`]** — this allocates two `Vec`s per call
+    /// and is kept only as a reference implementation / test oracle (see the
+    /// module docs for the measured cost). Not part of the public API.
+    #[doc(hidden)]
     pub fn read_kv(&self, token_idx: usize) -> Result<KVCacheEntry, String> {
         self.with_read_kv(token_idx, |keys, values| KVCacheEntry {
             keys: keys.to_vec(),
@@ -316,6 +341,13 @@ impl LayerKvCache {
     /// end_token)`) in one call — the shape attention actually wants (all
     /// prior positions at once), instead of `end_token - start_token`
     /// separate lock acquisitions and small allocations.
+    ///
+    /// **Prefer [`Self::with_read_range`] or [`Self::read_range_into`]** —
+    /// this allocates two `Vec`s sized to the whole span on every call, which
+    /// in a decode loop is 100x-350,000x slower than the zero-copy forms (see
+    /// the module docs). Kept only as a reference implementation / test
+    /// oracle. Not part of the public API.
+    #[doc(hidden)]
     pub fn read_range(
         &self,
         start_token: usize,

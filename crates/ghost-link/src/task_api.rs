@@ -335,6 +335,7 @@ impl AgentBackend for RealAgentBackend {
                         &settings.native_engine,
                         &[],
                         None,
+                        None,
                         false,
                         None,
                     )

@@ -483,32 +483,44 @@ export class GhostlinkAPI {
         const decoder = new TextDecoder();
         let fullText = '';
         let truncated = false;
+        // SSE frames can straddle a network read boundary. Splitting each
+        // decoded chunk on '\n' without carrying the remainder forward
+        // silently dropped any JSON frame that got cut mid-line, losing
+        // tokens from the final text. Keep the partial tail for the next read.
+        let lineBuffer = '';
+
+        const handleLine = (rawLine: string) => {
+          const line = rawLine.trim();
+          if (!line.startsWith('data: ')) return;
+          try {
+            const data = JSON.parse(line.slice(6));
+            if (typeof data.token === 'string' && data.token.length > 0) {
+              fullText += data.token;
+              if (onToken) onToken(data.token);
+            }
+            // Backend reports truncation the moment llama-server sends
+            // finish_reason:"length" — not only on the terminal chunk.
+            if (typeof data.truncated === 'boolean' && data.truncated) {
+              truncated = true;
+            }
+          } catch {
+            // Ignore incomplete JSON
+          }
+        };
 
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
 
-          const chunk = decoder.decode(value, { stream: true });
-          const lines = chunk.split('\n');
-
-          for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              try {
-                const data = JSON.parse(line.slice(6));
-                if (data.token) {
-                  fullText += data.token;
-                  if (onToken) onToken(data.token);
-                }
-                // Carried on the final "done" chunk — see handle_gui_chat_stream.
-                if (typeof data.truncated === 'boolean') {
-                  truncated = data.truncated;
-                }
-              } catch {
-                // Ignore incomplete JSON
-              }
-            }
-          }
+          lineBuffer += decoder.decode(value, { stream: true });
+          const lines = lineBuffer.split('\n');
+          // Last element is either '' (chunk ended on a newline) or a partial
+          // frame to carry into the next read.
+          lineBuffer = lines.pop() ?? '';
+          for (const line of lines) handleLine(line);
         }
+        // Flush any trailing frame that arrived without a final newline.
+        if (lineBuffer) handleLine(lineBuffer);
 
         return { success: true, data: { response: fullText, truncated } };
       } else {

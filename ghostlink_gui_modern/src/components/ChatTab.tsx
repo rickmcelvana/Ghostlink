@@ -156,26 +156,55 @@ const TaskChatMessageCard: React.FC<{ taskId: string; api: GhostlinkAPI }> = ({ 
 
     const baseUrl = api.getApiBaseUrl ? api.getApiBaseUrl() : "";
     const sseUrl = `${baseUrl}/api/tasks/${taskId}/events?access_token=${encodeURIComponent(apiKey)}`;
-    const es = new EventSource(sseUrl);
 
-    es.onmessage = (e) => {
-      try {
-        const ev: TaskEvent = JSON.parse(e.data);
-        setEvents((prev) => [...prev, ev]);
-        if (
-          ["needs_review", "accepted", "rejected", "cancelled", "blocked", "review_ready", "error"].includes(
-            ev.kind
-          )
-        ) {
-          refreshTaskAndReview();
+    // `EventSource` auto-reconnects, but only at the browser's fixed cadence and
+    // with no backoff — a task endpoint that is briefly down gets hammered.
+    // Manage the connection ourselves: exponential backoff capped at 30s,
+    // stopped on unmount (or when the task reaches a terminal state).
+    let es: EventSource | null = null;
+    let closed = false;
+    let retryMs = 1000;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    const MAX_RETRY_MS = 30000;
+    const TERMINAL_KINDS = [
+      "needs_review", "accepted", "rejected", "cancelled", "blocked", "review_ready", "error",
+    ];
+
+    const connect = () => {
+      if (closed) return;
+      es = new EventSource(sseUrl);
+
+      es.onmessage = (e) => {
+        // A message proves the stream is healthy — reset the backoff.
+        retryMs = 1000;
+        try {
+          const ev: TaskEvent = JSON.parse(e.data);
+          setEvents((prev) => [...prev, ev]);
+          if (TERMINAL_KINDS.includes(ev.kind)) {
+            refreshTaskAndReview();
+          }
+        } catch {
+          /* parse error */
         }
-      } catch {
-        /* parse error */
-      }
+      };
+
+      es.onerror = () => {
+        // EventSource fires `error` for transient drops too; close and
+        // reconnect on our own schedule rather than letting it loop.
+        es?.close();
+        es = null;
+        if (closed) return;
+        retryTimer = setTimeout(connect, retryMs);
+        retryMs = Math.min(retryMs * 2, MAX_RETRY_MS);
+      };
     };
 
+    connect();
+
     return () => {
-      es.close();
+      closed = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      es?.close();
     };
   }, [taskId, apiKey, api, refreshTaskAndReview]);
 
@@ -309,6 +338,13 @@ export const ChatTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
   const genStartRef = useRef<number | null>(null);
   const genTokenCountRef = useRef(0);
   const [genTick, setGenTick] = useState(0);
+
+  // Token batching: appending to React state on every single token re-rendered
+  // the whole message list per token. Buffer incoming tokens in a ref and flush
+  // to state at most once per animation frame; the exact final text is
+  // preserved because the buffer is always flushed before the turn resolves.
+  const pendingTokensRef = useRef("");
+  const rafFlushRef = useRef<number | null>(null);
 
   const [streamAnnouncement, setStreamAnnouncement] = useState("");
   const prevStreamingIdRef = useRef<string | null>(null);
@@ -474,6 +510,24 @@ export const ChatTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
       : [];
     genStartRef.current = Date.now();
     genTokenCountRef.current = 0;
+    pendingTokensRef.current = "";
+
+    // Append the buffered tokens to the streaming assistant message in one
+    // state update, then clear the buffer. Reading `pendingTokensRef.current`
+    // and resetting it inside the updater keeps ordering exact and never drops
+    // or reorders tokens, however many flushes happen.
+    const flushPendingTokens = () => {
+      if (rafFlushRef.current !== null) {
+        cancelAnimationFrame(rafFlushRef.current);
+        rafFlushRef.current = null;
+      }
+      if (!pendingTokensRef.current) return;
+      const chunk = pendingTokensRef.current;
+      pendingTokensRef.current = "";
+      setMessages((prev) =>
+        prev.map((m) => (m.id === assistantId ? { ...m, content: m.content + chunk } : m))
+      );
+    };
 
     const useStreaming = enabledTools.length === 0;
 
@@ -494,12 +548,19 @@ export const ChatTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
       },
       (token: string) => {
         genTokenCountRef.current += 1;
-        setMessages((prev) =>
-          prev.map((m) => (m.id === assistantId ? { ...m, content: m.content + token } : m))
-        );
+        pendingTokensRef.current += token;
+        if (rafFlushRef.current === null) {
+          rafFlushRef.current = requestAnimationFrame(() => {
+            rafFlushRef.current = null;
+            flushPendingTokens();
+          });
+        }
       }
     );
 
+    // Flush any tokens still buffered (stream ended, errored, or aborted)
+    // before the turn is finalised below.
+    flushPendingTokens();
     setLoading(false);
     setStreamingId(null);
     genStartRef.current = null;
