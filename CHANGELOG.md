@@ -6,6 +6,12 @@ All notable changes to Ghostlink Studio are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- **Release workflows reported success while publishing nothing** (`.github/workflows/publish-crates.yml`, `.github/workflows/publish-sdks.yml`, `.github/workflows/release-artifacts.yml`):
+  All three carry `workflow_dispatch` alongside a `push: tags: v*` trigger, and every release-critical step is guarded by `if: startsWith(github.ref, 'refs/tags/')`. A manual dispatch defaults to a **branch** (`refs/heads/main`), so those guards evaluate false and the steps silently **skip** — while the job still concludes `success`. The result is a green run that publishes nothing, which is indistinguishable from a real release until someone checks the registry.
+  This is not hypothetical: `Publish SDKs` ran this way on 2026-09-26, 2026-09-27, and again during the v2.3.0 release, reporting success each time with npm and PyPI left empty. `Release Artifacts` behaved identically and produced a GitHub Release with **zero assets**. `Publish Crates` was unaffected only by luck — its publish steps happen to carry no tag guard, so they ran anyway, but its tag-format and version-match verification steps skipped, meaning it could publish an unverified version.
+  Each of the three workflows now begins with a **`Require a tag ref`** step that fails with an explicit `::error::` (including how to dispatch correctly) when `GITHUB_REF` is not `refs/tags/*`. A failing step was chosen over a job-level `if:` deliberately: a skipped job still reports success, which is the exact failure being fixed. Verified locally for `refs/heads/main` (fails), `refs/heads/release/v2.3.0` (fails), and `refs/tags/v2.3.0` (passes).
+
 ---
 
 ## [2.3.0] - 2026-10-03
