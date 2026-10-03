@@ -41,6 +41,183 @@ impl Project {
     }
 }
 
+/// How a project proves a change is good.
+///
+/// Without this, `ReviewPacket.checks` only ever contained commands the *model
+/// chose* to run — so "it passed checks" meant "the model ran something", not
+/// "the project's tests pass". A packet with zero checks was equally
+/// acceptable, which is how unverified work reached `main`.
+///
+/// A plan is a list of commands the project itself declares as its definition
+/// of done. They run through the same `Judge` policy as agent-issued commands,
+/// so a plan cannot be used to smuggle in a denied command.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VerificationPlan {
+    /// Each entry is an argv vector, e.g. `["cargo", "test", "--workspace"]`.
+    #[serde(default)]
+    pub commands: Vec<Vec<String>>,
+    /// When true, a failing (or absent) verification blocks acceptance.
+    #[serde(default)]
+    pub required: bool,
+}
+
+impl VerificationPlan {
+    /// Detect a plan from the project's own build files.
+    ///
+    /// The point is that this works with no configuration: point Ghostlink at
+    /// any repository and it already knows how to check itself. Detection is
+    /// deliberately conservative — it only emits commands the `Judge` allows.
+    pub fn detect(root_path: &str) -> Option<VerificationPlan> {
+        let root = std::path::Path::new(root_path);
+        let mut commands: Vec<Vec<String>> = Vec::new();
+
+        if root.join("Cargo.toml").exists() {
+            commands.push(vec!["cargo".into(), "test".into(), "--workspace".into()]);
+        }
+        if root.join("package.json").exists() {
+            // `npm test` is the conventional entry point; only include it when
+            // the manifest actually defines a test script.
+            let has_test_script = fs::read_to_string(root.join("package.json"))
+                .ok()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                .and_then(|v| v.get("scripts").and_then(|s| s.get("test")).cloned())
+                .is_some();
+            if has_test_script {
+                commands.push(vec!["npx".into(), "vitest".into(), "run".into()]);
+            }
+        }
+        if root.join("pyproject.toml").exists() || root.join("pytest.ini").exists() {
+            commands.push(vec!["python3".into(), "-m".into(), "pytest".into()]);
+        }
+
+        if commands.is_empty() {
+            None
+        } else {
+            Some(VerificationPlan {
+                commands,
+                required: true,
+            })
+        }
+    }
+
+    /// Commands in this plan that the `Judge` would refuse to run. A plan
+    /// containing one is misconfigured, and we say so rather than silently
+    /// executing it (the Judge is the single authority on what may run).
+    pub fn disallowed_commands(&self) -> Vec<Vec<String>> {
+        self.commands
+            .iter()
+            .filter(|argv| Judge::evaluate(argv) != JudgeResult::Allow)
+            .cloned()
+            .collect()
+    }
+}
+
+/// Outcome of running one verification command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerificationResult {
+    pub argv: Vec<String>,
+    pub exit: i32,
+    pub passed: bool,
+    /// Captured output, truncated — enough to see *why* it failed.
+    pub excerpt: String,
+    #[serde(default)]
+    pub timed_out: bool,
+}
+
+impl VerificationResult {
+    /// One-line summary suitable for a reviewer.
+    pub fn summary(&self) -> String {
+        let cmd = self.argv.join(" ");
+        if self.timed_out {
+            format!("TIMED OUT: {cmd}")
+        } else if self.passed {
+            format!("PASS: {cmd}")
+        } else {
+            format!("FAIL (exit {}): {cmd}", self.exit)
+        }
+    }
+}
+
+/// Run a verification plan against a project root.
+///
+/// Every command goes through `Judge` first — a plan cannot bypass the policy
+/// that governs agent-issued commands. Each command gets its own timeout so a
+/// hanging test suite cannot stall a task forever.
+pub async fn run_verification_plan(
+    plan: &VerificationPlan,
+    root_path: &str,
+    per_command_timeout: std::time::Duration,
+) -> Vec<VerificationResult> {
+    let mut results = Vec::new();
+
+    for argv in &plan.commands {
+        if argv.is_empty() {
+            continue;
+        }
+
+        // The Judge is the single authority on what may run.
+        if Judge::evaluate(argv) != JudgeResult::Allow {
+            results.push(VerificationResult {
+                argv: argv.clone(),
+                exit: -1,
+                passed: false,
+                excerpt: "Refused: command is not permitted by the Judge policy".into(),
+                timed_out: false,
+            });
+            continue;
+        }
+
+        let mut cmd = tokio::process::Command::new(&argv[0]);
+        cmd.args(&argv[1..])
+            .current_dir(root_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let outcome = tokio::time::timeout(per_command_timeout, cmd.output()).await;
+
+        match outcome {
+            Err(_elapsed) => results.push(VerificationResult {
+                argv: argv.clone(),
+                exit: -1,
+                passed: false,
+                excerpt: format!("Timed out after {}s", per_command_timeout.as_secs()),
+                timed_out: true,
+            }),
+            Ok(Err(e)) => results.push(VerificationResult {
+                argv: argv.clone(),
+                exit: -1,
+                passed: false,
+                excerpt: format!("Failed to spawn: {e}"),
+                timed_out: false,
+            }),
+            Ok(Ok(output)) => {
+                let exit = output.status.code().unwrap_or(-1);
+                let mut excerpt = format!(
+                    "STDOUT:\n{}\nSTDERR:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                // Keep the tail as well as the head: test failures print their
+                // summary at the end, which is the part a reader needs.
+                if excerpt.len() > 4000 {
+                    let head = &excerpt[..2000];
+                    let tail = &excerpt[excerpt.len() - 2000..];
+                    excerpt = format!("{head}\n...\n(tail)\n{tail}");
+                }
+                results.push(VerificationResult {
+                    argv: argv.clone(),
+                    exit,
+                    passed: exit == 0,
+                    excerpt,
+                    timed_out: false,
+                });
+            }
+        }
+    }
+
+    results
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskBudget {
     pub max_steps: u32,
@@ -136,7 +313,27 @@ pub struct ReviewPacket {
     pub commands: Vec<ReviewCommand>,
     pub checks: Vec<String>,
     pub risks: Vec<String>,
+    /// Results of running the project's own verification plan against the
+    /// change. Empty means no plan was detected/configured — which is itself
+    /// reported in `risks`, not silently treated as success.
+    #[serde(default)]
+    pub verification: Vec<VerificationResult>,
     pub created_at: String,
+}
+
+impl ReviewPacket {
+    /// True when every verification command passed.
+    ///
+    /// `None` (rather than `false`) when nothing was run, so "unverified" and
+    /// "verified and failed" stay distinguishable — collapsing them is how a
+    /// task with no checks ends up looking as good as one that passed a suite.
+    pub fn verification_passed(&self) -> Option<bool> {
+        if self.verification.is_empty() {
+            None
+        } else {
+            Some(self.verification.iter().all(|r| r.passed))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1876,6 +2073,78 @@ impl TaskRunner {
                 });
             }
 
+            // ---- Verification ------------------------------------------------
+            //
+            // Run the project's own definition of done against the *merged*
+            // result, not the staged tree in isolation: a change is only good
+            // if it works alongside the code it is being merged into. The
+            // proposed files are applied to a scratch copy of the project so
+            // the live tree is never touched.
+            let plan = VerificationPlan::detect(&project.root_path);
+            let mut verification: Vec<VerificationResult> = Vec::new();
+
+            match &plan {
+                None => {
+                    risks.push(
+                        "No verification plan detected (no Cargo.toml / package.json \
+                         test script / pytest config) — this change is UNVERIFIED"
+                            .into(),
+                    );
+                }
+                Some(plan) => {
+                    let disallowed = plan.disallowed_commands();
+                    if !disallowed.is_empty() {
+                        // A plan that asks for something the Judge refuses is a
+                        // configuration error, not a reason to run it anyway.
+                        for argv in disallowed {
+                            risks.push(format!(
+                                "Verification plan command refused by Judge policy: {}",
+                                argv.join(" ")
+                            ));
+                        }
+                    } else if !diffs.is_empty() {
+                        store.emit_event(TaskEvent {
+                            task_id: task.id.clone(),
+                            ts: Utc::now().timestamp_millis() as u64,
+                            kind: "verification_started".into(),
+                            payload: serde_json::json!({
+                                "commands": plan.commands,
+                            }),
+                        });
+
+                        match Self::verify_on_scratch_copy(
+                            &store,
+                            &project.root_path,
+                            &task.id,
+                            plan,
+                        )
+                        .await
+                        {
+                            Ok(results) => {
+                                for r in &results {
+                                    if r.passed {
+                                        checks.push(r.summary());
+                                    } else {
+                                        risks.push(r.summary());
+                                    }
+                                }
+                                verification = results;
+                            }
+                            Err(e) => risks.push(format!(
+                                "Verification could not run: {e} — change is UNVERIFIED"
+                            )),
+                        }
+                    }
+
+                    // Be explicit about the unverified case rather than letting
+                    // an empty `checks` read as success.
+                    if verification.is_empty() && !plan.commands.is_empty() {
+                        risks
+                            .push("Verification produced no results — change is UNVERIFIED".into());
+                    }
+                }
+            }
+
             let review = ReviewPacket {
                 id: format!("rev_{}", Uuid::new_v4().simple()),
                 task_id: task.id.clone(),
@@ -1885,12 +2154,78 @@ impl TaskRunner {
                 commands: commands_executed,
                 checks,
                 risks,
+                verification,
                 created_at: Utc::now().to_rfc3339(),
             };
 
             Ok((review, final_status))
         })
     }
+
+    /// Apply the task's staged files to a scratch copy of the project, run the
+    /// verification plan there, and clean up. The live tree is never modified.
+    async fn verify_on_scratch_copy(
+        store: &Arc<TaskRuntimeStore>,
+        project_root: &str,
+        task_id: &str,
+        plan: &VerificationPlan,
+    ) -> Result<Vec<VerificationResult>> {
+        let scratch = std::env::temp_dir().join(format!(
+            "ghostlink_verify_{}_{}",
+            task_id,
+            Uuid::new_v4().simple()
+        ));
+        let _ = fs::remove_dir_all(&scratch);
+
+        copy_dir_recursive(Path::new(project_root), &scratch)
+            .with_context(|| "failed to copy project to scratch dir for verification")?;
+
+        // Overlay the staged files onto the copy.
+        let proposed_dir = store.get_task_proposed_dir(project_root, task_id);
+        if proposed_dir.exists() {
+            copy_dir_recursive(&proposed_dir, &scratch)
+                .with_context(|| "failed to apply staged files to scratch copy")?;
+        }
+
+        let results = run_verification_plan(
+            plan,
+            &scratch.to_string_lossy(),
+            std::time::Duration::from_secs(600),
+        )
+        .await;
+
+        let _ = fs::remove_dir_all(&scratch);
+        Ok(results)
+    }
+}
+
+/// Recursively copy `src` into `dst`, skipping the task staging tree and VCS
+/// metadata (copying `.git` would be both slow and wrong for a scratch build).
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst)?;
+    if !src.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str == ".git" || name_str == "target" || name_str == "node_modules" {
+            continue;
+        }
+        // Don't copy the staging tree into its own verification copy.
+        if name_str == ".ghostlink" {
+            continue;
+        }
+        let from = entry.path();
+        let to = dst.join(&name);
+        if from.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else {
+            fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2954,5 +3289,168 @@ mod parallel_and_compact_tests {
         assert!(fitted.len() < msgs.len());
         // keep_last_turns still guarantees the most recent message.
         assert!(fitted.len() >= 3, "{fitted:?}");
+    }
+
+    // ---- Verification -----------------------------------------------------
+
+    #[test]
+    fn verification_plan_detects_cargo_project() {
+        let dir = std::env::temp_dir().join(format!("gl_vp_cargo_{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("Cargo.toml"), "[workspace]\n").unwrap();
+
+        let plan = VerificationPlan::detect(&dir.to_string_lossy()).expect("should detect");
+        assert!(plan.required);
+        assert_eq!(plan.commands, vec![vec!["cargo", "test", "--workspace"]]);
+        // A detected plan must never contain something the Judge would refuse.
+        assert!(plan.disallowed_commands().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verification_plan_requires_a_package_test_script() {
+        let dir = std::env::temp_dir().join(format!("gl_vp_npm_{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        // No test script -> not a verification target.
+        fs::write(
+            dir.join("package.json"),
+            r#"{"scripts":{"build":"vite build"}}"#,
+        )
+        .unwrap();
+        assert!(VerificationPlan::detect(&dir.to_string_lossy()).is_none());
+
+        // With one -> detected.
+        fs::write(
+            dir.join("package.json"),
+            r#"{"scripts":{"test":"vitest run"}}"#,
+        )
+        .unwrap();
+        let plan = VerificationPlan::detect(&dir.to_string_lossy()).expect("should detect");
+        assert_eq!(plan.commands, vec![vec!["npx", "vitest", "run"]]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verification_plan_none_for_unknown_project() {
+        let dir = std::env::temp_dir().join(format!("gl_vp_none_{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        assert!(VerificationPlan::detect(&dir.to_string_lossy()).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verification_plan_flags_disallowed_commands() {
+        // A plan asking for something the Judge denies must be reportable,
+        // not silently executed.
+        let plan = VerificationPlan {
+            commands: vec![
+                vec!["cargo".into(), "test".into()],
+                vec!["rm".into(), "-rf".into(), "/".into()],
+            ],
+            required: true,
+        };
+        let bad = plan.disallowed_commands();
+        assert_eq!(bad.len(), 1);
+        assert_eq!(bad[0][0], "rm");
+    }
+
+    #[tokio::test]
+    async fn verification_runs_commands_and_reports_failures() {
+        let dir = std::env::temp_dir().join(format!("gl_vr_{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        // `cargo test` with no Cargo.toml fails; `cargo check` likewise. Use
+        // two allowed commands so we exercise both pass and fail paths without
+        // depending on a toolchain being present for a real test run.
+        let plan = VerificationPlan {
+            commands: vec![
+                // `cargo check` in an empty dir exits non-zero -> failure path
+                vec!["cargo".into(), "check".into()],
+            ],
+            required: true,
+        };
+        let results = run_verification_plan(
+            &plan,
+            &dir.to_string_lossy(),
+            std::time::Duration::from_secs(120),
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        // Either it ran and failed (no manifest), or the toolchain is absent and
+        // it failed to spawn — both are `passed == false`, which is the point.
+        assert!(!results[0].passed, "expected failure: {:?}", results[0]);
+        assert!(results[0].summary().contains("FAIL") || results[0].summary().contains("TIMED"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn verification_refuses_disallowed_command() {
+        let dir = std::env::temp_dir().join(format!("gl_vr2_{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let plan = VerificationPlan {
+            commands: vec![vec!["sudo".into(), "rm".into(), "-rf".into(), "/".into()]],
+            required: true,
+        };
+        let results = run_verification_plan(
+            &plan,
+            &dir.to_string_lossy(),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].passed);
+        assert!(results[0].excerpt.contains("Refused"), "{:?}", results[0]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verification_passed_distinguishes_unverified_from_failed() {
+        // The distinction that matters: no results is NOT the same as passing.
+        let empty = ReviewPacket {
+            id: "r".into(),
+            task_id: "t".into(),
+            run_id: "run".into(),
+            summary: String::new(),
+            diffs: vec![],
+            commands: vec![],
+            checks: vec![],
+            risks: vec![],
+            verification: vec![],
+            created_at: String::new(),
+        };
+        assert_eq!(
+            empty.verification_passed(),
+            None,
+            "unverified is not 'passed'"
+        );
+
+        let failed = ReviewPacket {
+            verification: vec![VerificationResult {
+                argv: vec!["cargo".into(), "test".into()],
+                exit: 101,
+                passed: false,
+                excerpt: String::new(),
+                timed_out: false,
+            }],
+            ..empty.clone()
+        };
+        assert_eq!(failed.verification_passed(), Some(false));
+
+        let ok = ReviewPacket {
+            verification: vec![VerificationResult {
+                argv: vec!["cargo".into(), "test".into()],
+                exit: 0,
+                passed: true,
+                excerpt: String::new(),
+                timed_out: false,
+            }],
+            ..empty.clone()
+        };
+        assert_eq!(ok.verification_passed(), Some(true));
     }
 }

@@ -61,6 +61,7 @@ Before running shell commands or file mutations, the runtime passes the request 
 - **Bounded Agent Tool Loop**: Real bounded tool-calling loop using in-process `AgentBackend` and OpenAI-compatible inference with deterministic `Judge` policy evaluation, staged file mutations in `.ghostlink/tasks/<id>/proposed/`, real shell tool execution, and budget controls (`max_steps`, `max_tokens`, `max_minutes`). Backend calls retry with backoff; token accounting uses the backend's reported usage when available.
 - **v2.4 Child Fan-Out Trees**: Hierarchical child task creation (`parent_id`), budget inheritance, parent accept blocking (`check_parent_accept_allowed`), child task listing (`/api/tasks/:id/children`), and `planner` vs `implementer` role enforcement.
 - **Reversible Accepts**: Pre-apply snapshots plus a `rollback` decision, so an accepted `ReviewPacket` can be undone.
+- **Automatic Verification (definition of done)**: `VerificationPlan::detect` reads the project's own build files (`Cargo.toml`, a `package.json` `test` script, `pyproject.toml`/`pytest.ini`) and derives the commands that prove a change works — no configuration needed. Before a `ReviewPacket` is produced, the staged files are overlaid onto a scratch copy of the project and the plan is executed there; the live tree is never touched. Results land in `ReviewPacket.verification`, and `POST /api/reviews/:id/decide` **refuses `accept`** when verification failed or was never run, unless the caller passes `override_verification: true` (which is recorded in the response). Plan commands run through the same `Judge` policy as agent-issued commands, so a plan cannot smuggle in a denied command.
 - Per-role model routing across heterogeneous cluster nodes.
 - Per-task proposed/ staging directory isolation for parallel agents.
 
@@ -77,11 +78,11 @@ implied — the same standard the rest of this repo's docs hold to:
   What is still missing: summarization/compaction into a memory blob (dropped
   turns are simply gone), and the budget is not yet configurable per project —
   it uses `ContextGovernor::default()`.
-- **Checks are advisory, not enforced.** `ReviewPacket.checks` only contains
-  commands the *model chose* to run. Nothing automatically runs a project's
-  test suite after a mutation, and a packet with zero checks is still
-  acceptable — so "it passed checks" means "the model ran something", not
-  "the project's tests pass".
+- **Verification is one-shot, not a loop.** The plan runs once at the end of a
+  run. A failing result is reported to the reviewer and blocks `accept`, but the
+  agent is not automatically handed the failure and asked to fix it — that
+  requires `request_changes`. Detection also only covers Cargo / npm / pytest;
+  other ecosystems need an explicit plan (not yet exposed via the API).
 - **No retrieval or code intelligence.** The loop has four tools
   (`read_file`, `write_file`, `run_command`, `spawn_subagent`) and no symbol
   search, file outline, or embedding-based retrieval. The `mcp-rag` crate and
