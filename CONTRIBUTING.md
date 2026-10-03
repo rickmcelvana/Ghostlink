@@ -108,7 +108,7 @@ If a status document is no longer current, move it to `docs/archive/` and update
    - `.github/workflows/release-artifacts.yml` (GitHub Release asset bundles, SHA256SUMS, SBOM, provenance)
 4. **Manual Tag Fallback**: If workflow permissions prevent automatic tagging on main, create and push the tag manually:
    ```bash
-   git tag -a v2.2.2 -m "Ghostlink 2.2.2" && git push origin v2.2.2
+   git tag -a v2.3.0 -m "Ghostlink 2.3.0" && git push origin v2.3.0
    ```
 
 ## Release Rubric
