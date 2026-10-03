@@ -1032,6 +1032,109 @@ pub fn unified_diff(rel_path: &str, original: &str, proposed: &str) -> String {
     out
 }
 
+/// Context-window policy for the agent loop.
+///
+/// The loop's `messages` vector grows by one assistant turn plus one tool-result
+/// turn per tool call, with no upper bound — only individual tool *outputs* were
+/// truncated. On a local model with a small `n_ctx` a long task therefore hit a
+/// context overflow instead of compacting, and the backend call failed.
+///
+/// This is a real budget: the system prompt and the original task prompt are
+/// pinned (dropping them loses the task), and the most recent turns are kept up
+/// to whatever budget remains. Older turns are dropped oldest-first.
+#[derive(Debug, Clone)]
+pub struct ContextGovernor {
+    /// Total token budget for the assembled message list.
+    pub token_budget: usize,
+    /// Tokens reserved for the model's own completion, subtracted from the
+    /// budget before history is packed.
+    pub reserve_completion_tokens: usize,
+    /// Always-kept recent turns, even if they exceed the remaining budget.
+    pub keep_last_turns: usize,
+}
+
+impl Default for ContextGovernor {
+    fn default() -> Self {
+        Self {
+            token_budget: 4096,
+            reserve_completion_tokens: 512,
+            keep_last_turns: 6,
+        }
+    }
+}
+
+impl ContextGovernor {
+    /// Approximate token count for a message. Uses the same
+    /// chars/4 heuristic as the rest of the runtime; `usage_tokens` from the
+    /// backend is preferred for *accounting*, but a cheap estimate is what's
+    /// needed for a pre-flight packing decision.
+    fn message_tokens(msg: &serde_json::Value) -> usize {
+        let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        let tool_calls = msg
+            .get("tool_calls")
+            .map(|t| t.to_string().len())
+            .unwrap_or(0);
+        ((content.len() + tool_calls) / 4).max(1)
+    }
+
+    /// Total estimated tokens across a message list.
+    pub fn estimate_tokens(messages: &[serde_json::Value]) -> usize {
+        messages.iter().map(Self::message_tokens).sum()
+    }
+
+    /// Pack `messages` into the budget, returning the kept list and how many
+    /// messages were dropped.
+    ///
+    /// The first message (system prompt) and the second (the original task
+    /// prompt) are pinned — they carry the goal and are never dropped, even if
+    /// they alone exceed the budget. The most recent `keep_last_turns` turns
+    /// are also always kept. Everything in between is dropped oldest-first
+    /// until the remainder fits.
+    pub fn fit(&self, messages: &[serde_json::Value]) -> (Vec<serde_json::Value>, usize) {
+        // System + original task prompt are the pinned prefix.
+        let pinned_prefix = messages.len().min(2);
+        let pinned: Vec<serde_json::Value> = messages[..pinned_prefix].to_vec();
+        let rest = &messages[pinned_prefix..];
+
+        if rest.is_empty() {
+            return (pinned, 0);
+        }
+
+        let budget = self
+            .token_budget
+            .saturating_sub(self.reserve_completion_tokens);
+        let pinned_cost = Self::estimate_tokens(&pinned);
+        let mut remaining = budget.saturating_sub(pinned_cost);
+
+        // Walk backwards, always keeping the last `keep_last_turns` messages,
+        // then as many older ones as fit.
+        let keep_always = self.keep_last_turns.min(rest.len());
+        let mut kept_from_rest: Vec<serde_json::Value> = Vec::new();
+
+        for (idx, msg) in rest.iter().enumerate().rev() {
+            let cost = Self::message_tokens(msg);
+            let is_recent = idx >= rest.len() - keep_always;
+            if is_recent {
+                remaining = remaining.saturating_sub(cost);
+                kept_from_rest.push(msg.clone());
+            } else if cost <= remaining {
+                remaining -= cost;
+                kept_from_rest.push(msg.clone());
+            } else {
+                // Older message doesn't fit — stop scanning; everything before
+                // it is older still.
+                break;
+            }
+        }
+        kept_from_rest.reverse();
+
+        let dropped = rest.len() - kept_from_rest.len();
+        let mut out = pinned;
+        out.extend(kept_from_rest);
+        (out, dropped)
+    }
+}
+
 // Helper to recursively list relative paths in a directory
 fn list_dir_relative(
     base_dir: &Path,
@@ -1293,6 +1396,12 @@ impl TaskRunner {
             let max_steps = task.budget.max_steps;
             let max_minutes = task.budget.max_minutes as u64;
 
+            // Real context budget for this run. Previously `messages` grew
+            // unbounded and the backend call eventually failed on a context
+            // overflow; now the list is packed to fit before every call.
+            let governor = ContextGovernor::default();
+            let mut context_dropped_total = 0usize;
+
             for _step in 1..=max_steps {
                 if cancel_token.is_cancelled() {
                     return Err(anyhow!("Task execution cancelled by user"));
@@ -1329,12 +1438,31 @@ impl TaskRunner {
                 const MAX_CHAT_ATTEMPTS: u32 = 3;
                 let mut last_err: Option<String> = None;
                 let mut attempt_resp = None;
+
+                // Pack the transcript to fit the context budget before the
+                // call. The system prompt and original task prompt are pinned.
+                let (fitted, dropped) = governor.fit(&messages);
+                if dropped > 0 {
+                    context_dropped_total += dropped;
+                    store.emit_event(TaskEvent {
+                        task_id: task.id.clone(),
+                        ts: Utc::now().timestamp_millis() as u64,
+                        kind: "context_compacted".into(),
+                        payload: serde_json::json!({
+                            "dropped_messages": dropped,
+                            "kept_messages": fitted.len(),
+                            "estimated_tokens": ContextGovernor::estimate_tokens(&fitted),
+                            "token_budget": governor.token_budget,
+                        }),
+                    });
+                }
+
                 for attempt in 0..MAX_CHAT_ATTEMPTS {
                     if cancel_token.is_cancelled() {
                         return Err(anyhow!("Task execution cancelled by user"));
                     }
                     match backend
-                        .chat(&messages, &project.effective_allowed_tools())
+                        .chat(&fitted, &project.effective_allowed_tools())
                         .await
                     {
                         Ok(resp) => {
@@ -1703,6 +1831,17 @@ impl TaskRunner {
 
             if run.step_count >= max_steps && final_status != TaskStatus::Blocked {
                 risks.push("Step budget exhausted (max_steps)".into());
+            }
+
+            if context_dropped_total > 0 {
+                // Surface it rather than letting compaction happen silently:
+                // a reviewer should know the agent was working from a
+                // truncated transcript, not the whole history.
+                risks.push(format!(
+                    "Context compacted: {} older message(s) dropped to fit the \
+                     {}-token budget (system prompt and task goal pinned)",
+                    context_dropped_total, governor.token_budget
+                ));
             }
 
             if cancel_token.is_cancelled() {
@@ -2717,5 +2856,103 @@ mod parallel_and_compact_tests {
         assert!(store
             .rollback_applied_changes(&proj.root_path, &task.id)
             .is_err());
+    }
+
+    fn msg(role: &str, content: &str) -> serde_json::Value {
+        serde_json::json!({ "role": role, "content": content })
+    }
+
+    #[test]
+    fn governor_keeps_short_transcripts_intact() {
+        let g = ContextGovernor {
+            token_budget: 100_000,
+            reserve_completion_tokens: 0,
+            keep_last_turns: 6,
+        };
+        let msgs = vec![
+            msg("system", "sys"),
+            msg("user", "goal"),
+            msg("assistant", "a1"),
+            msg("user", "t1"),
+        ];
+        let (fitted, dropped) = g.fit(&msgs);
+        assert_eq!(dropped, 0);
+        assert_eq!(fitted.len(), msgs.len());
+    }
+
+    #[test]
+    fn governor_pins_system_and_goal_and_keeps_recent_turns() {
+        // Tiny budget so older turns cannot fit.
+        let g = ContextGovernor {
+            token_budget: 40,
+            reserve_completion_tokens: 0,
+            keep_last_turns: 2,
+        };
+        let mut msgs = vec![msg("system", "SYSTEM-PROMPT"), msg("user", "TASK-GOAL")];
+        for i in 0..20 {
+            msgs.push(msg(
+                "assistant",
+                &format!("assistant turn number {i} padding padding"),
+            ));
+        }
+        let (fitted, dropped) = g.fit(&msgs);
+        assert!(dropped > 0, "expected compaction, got none");
+
+        let text: String = fitted
+            .iter()
+            .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
+            .collect::<Vec<_>>()
+            .join("|");
+        // Pinned prefix survives...
+        assert!(text.contains("SYSTEM-PROMPT"), "{text}");
+        assert!(text.contains("TASK-GOAL"), "{text}");
+        // ...and the most recent turn survives, while an early one is gone.
+        assert!(text.contains("assistant turn number 19"), "{text}");
+        assert!(!text.contains("assistant turn number 0 "), "{text}");
+    }
+
+    #[test]
+    fn governor_never_drops_below_pinned_prefix() {
+        // Budget smaller than the pinned prompt itself.
+        let g = ContextGovernor {
+            token_budget: 4,
+            reserve_completion_tokens: 0,
+            keep_last_turns: 0,
+        };
+        let msgs = vec![
+            msg(
+                "system",
+                "a-very-long-system-prompt-that-exceeds-the-budget",
+            ),
+            msg("user", "the-goal"),
+            msg("assistant", "x"),
+        ];
+        let (fitted, _dropped) = g.fit(&msgs);
+        assert!(fitted.len() >= 2, "pinned prefix must survive: {fitted:?}");
+        let text: String = fitted
+            .iter()
+            .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
+            .collect::<Vec<_>>()
+            .join("|");
+        assert!(text.contains("a-very-long-system-prompt"), "{text}");
+        assert!(text.contains("the-goal"), "{text}");
+    }
+
+    #[test]
+    fn governor_reserves_completion_budget() {
+        let msgs: Vec<serde_json::Value> = (0..50)
+            .map(|_| msg("assistant", &"x".repeat(400)))
+            .collect();
+        // ~100 tokens/msg. With a 1000 budget and 900 reserved, little fits
+        // beyond the pinned prefix.
+        let g = ContextGovernor {
+            token_budget: 1000,
+            reserve_completion_tokens: 900,
+            keep_last_turns: 1,
+        };
+        let (fitted, _d) = g.fit(&msgs);
+        assert!(fitted.len() < msgs.len());
+        // keep_last_turns still guarantees the most recent message.
+        assert!(fitted.len() >= 3, "{fitted:?}");
     }
 }
