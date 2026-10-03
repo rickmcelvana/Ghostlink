@@ -54,7 +54,7 @@ memory bodies and tool previews — not credentials. API keys stay in
 
 ## Implementation status
 
-Branch: `feature/local-assistant-layer`. Phases 0, 1, and 2 are landed and gated
+Branch: `feature/local-assistant-layer`. Phases 0, 1, 2, and 6 are landed and gated
 (`cargo fmt`, `cargo clippy -D warnings`, `cargo test --workspace` all clean).
 
 | Phase | Status |
@@ -66,7 +66,7 @@ Branch: `feature/local-assistant-layer`. Phases 0, 1, and 2 are landed and gated
 | 3 — Approval tray | Not started (needs persisted approvals; `CapabilityClass::parse` is its consumer) |
 | 4 — Bounded loop | Not started |
 | 5 — Scheduler | Not started |
-| 6 — Turn traces | Partially: `chat` and `tool_confirm` audit events now carry the workspace binding and capability class |
+| 6 — Turn traces | **Done.** `trace.rs`, `GET /api/inference/traces`, redaction enforced by type (no payload field exists) |
 
 Two notes for whoever picks this up:
 
@@ -297,6 +297,11 @@ Each phase below compiles, tests, and can be reviewed on its own:
    GUI tray
 5. Phase 4 → 5 → 6
 
-Phases 5 and 6 are independent of each other and can go in either order or in
-parallel after 3. Phase 6 is the cheapest and can land early to make the rest
-observable.
+Phase 6 landed early (it was the cheapest) to make the rest observable.
+
+Carried into later phases: `PendingApproval`/`Edited` trace statuses and the
+`invoke_agent`/`execute_tool` constructors exist in the design but are not yet in
+`trace.rs` -- they would be dead code until phases 3 and 4 give them real call
+sites. `invoke_mcp_tool` emits structured logs rather than durable traces
+because threading `BackendState` through six engine-loop call sites was judged a
+poor trade for that phase.

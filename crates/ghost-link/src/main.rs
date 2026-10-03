@@ -1681,6 +1681,12 @@ struct BackendState {
     /// would need an append-only file, which is a bigger step than this
     /// first real version takes.
     audit_log: std::collections::VecDeque<audit_log::AuditLogEntry>,
+    /// Recent assistant-turn trace events, oldest first. Bounded like the audit
+    /// feed: an observability tail, not a history. The durable record is the
+    /// audit log, which every trace is also appended to via `record_trace`.
+    /// Bounded because an unbounded per-turn vector in `BackendState` is a slow
+    /// memory leak on a long-lived server.
+    trace_events: std::collections::VecDeque<trace::TraceEvent>,
     /// The live RBAC key store — every `auth_middleware` check and the new
     /// `/api/security/keys` admin endpoints read/write this. Loaded once at
     /// startup via `load_api_keys()` (which handles the bootstrap migration
@@ -1749,6 +1755,60 @@ fn record_audit_event(
     // failure is warned, not propagated, matching every other persistence
     // function in this codebase.
     audit_log::append_durable(&entry);
+}
+
+/// Records a trace event on the in-memory tail and the durable audit trail.
+///
+/// One call so a trace can't end up on one and not the other: the tail feeds the
+/// GUI, the audit log is what survives a restart. The audit entry's `detail` is
+/// the event's own fixed-field rendering, so no caller-supplied string is ever
+/// passed through to the log.
+fn record_trace(backend: &mut BackendState, event: trace::TraceEvent) {
+    let detail = event.to_detail();
+    tracing::debug!(target: "assistant_trace", "{detail}");
+    backend.trace_events.push_back(event);
+    while backend.trace_events.len() > TRACE_MAX_EVENTS {
+        backend.trace_events.pop_front();
+    }
+    let entry = audit_log::AuditLogEntry {
+        event: "trace".to_string(),
+        status: "RECORDED".to_string(),
+        ip: "local".to_string(),
+        time: chrono::Utc::now().to_rfc3339(),
+        detail: Some(detail),
+    };
+    audit_log::push_audit_entry(&mut backend.audit_log, entry.clone());
+    audit_log::append_durable(&entry);
+}
+
+/// Cap on the in-memory trace tail.
+const TRACE_MAX_EVENTS: usize = 500;
+
+/// Records the outcome of a tool dispatch on the `assistant_trace` log target.
+///
+/// Structured logging rather than a durable audit entry, because
+/// `invoke_mcp_tool` runs inside the engine loops, which don't hold a
+/// `BackendState`. The durable record of a gated call is written by the approval
+/// handler that resolves it; this line is the immediate signal, and it carries
+/// tool, class, decision, and latency -- never the tool's arguments or result.
+fn record_tool_trace(
+    tool_name: &str,
+    server: &str,
+    workspace_id: &str,
+    decision: trace::TraceDecision,
+    started_at: std::time::Instant,
+) {
+    let class = capability::classify(server, tool_name);
+    tracing::info!(
+        target: "assistant_trace",
+        tool = tool_name,
+        server,
+        class = class.as_str(),
+        workspace = workspace_id,
+        decision = decision.as_str(),
+        latency_ms = started_at.elapsed().as_millis() as u64,
+        "tool call completed"
+    );
 }
 
 /// Minimum role required to access a route. A method-based default
@@ -2562,12 +2622,24 @@ async fn invoke_mcp_tool(
             // Capability gate, enforced here in Rust before dispatch. A system
             // prompt telling the model to be careful is not enforcement; this
             // is. Unknown tools classify as Exec and are gated accordingly.
+
             let ws = active_workspace();
+            let tool_started_at = std::time::Instant::now();
             let decision = capability::decide(ws.id(), &schema.server, tool_name, None, ws.root());
             if !decision.is_allowed() {
                 let capability::Decision::NeedsApproval { class, reason } = decision else {
                     unreachable!("is_allowed() is false only for NeedsApproval")
                 };
+                // Logged rather than appended to the audit trail because this
+                // function holds no `BackendState`. The durable record of a gated
+                // call is written by the approval handler that resolves it.
+                record_tool_trace(
+                    tool_name,
+                    &schema.server,
+                    ws.id(),
+                    trace::TraceDecision::Blocked,
+                    tool_started_at,
+                );
                 // Not executed. The pending-handle plumbing that lets the model
                 // continue without the result runs through the existing
                 // confirmation path (`NativeLoopStep::NeedsConfirmation`).
@@ -2581,28 +2653,65 @@ async fn invoke_mcp_tool(
                     success: false,
                 };
             }
+            tracing::debug!(
+                target: "assistant_trace",
+                tool = tool_name,
+                server = %schema.server,
+                workspace = ws.id(),
+                "tool call allowed"
+            );
             let args = capability::stamp_workspace_scope(&schema.server, tool_name, args, ws.id());
             match mcp_registry
                 .call_tool(&schema.server, tool_name, args)
                 .await
             {
-                Some(outcome) if outcome.success => ToolResult {
-                    tool: tool_name.to_string(),
-                    result: outcome.result.to_string(),
-                    success: true,
-                },
-                Some(outcome) => ToolResult {
-                    tool: tool_name.to_string(),
-                    result: outcome
-                        .error
-                        .unwrap_or_else(|| "tool call failed".to_string()),
-                    success: false,
-                },
-                None => ToolResult {
-                    tool: tool_name.to_string(),
-                    result: "tool server is not connected".to_string(),
-                    success: false,
-                },
+                Some(outcome) if outcome.success => {
+                    // `outcome.result` is deliberately not part of the trace: a
+                    // tool's return value is exactly the kind of content that
+                    // must stay out of the durable trail.
+                    record_tool_trace(
+                        tool_name,
+                        &schema.server,
+                        ws.id(),
+                        trace::TraceDecision::Allowed,
+                        tool_started_at,
+                    );
+                    ToolResult {
+                        tool: tool_name.to_string(),
+                        result: outcome.result.to_string(),
+                        success: true,
+                    }
+                }
+                Some(outcome) => {
+                    record_tool_trace(
+                        tool_name,
+                        &schema.server,
+                        ws.id(),
+                        trace::TraceDecision::Failed,
+                        tool_started_at,
+                    );
+                    ToolResult {
+                        tool: tool_name.to_string(),
+                        result: outcome
+                            .error
+                            .unwrap_or_else(|| "tool call failed".to_string()),
+                        success: false,
+                    }
+                }
+                None => {
+                    record_tool_trace(
+                        tool_name,
+                        &schema.server,
+                        ws.id(),
+                        trace::TraceDecision::Failed,
+                        tool_started_at,
+                    );
+                    ToolResult {
+                        tool: tool_name.to_string(),
+                        result: "tool server is not connected".to_string(),
+                        success: false,
+                    }
+                }
             }
         }
         None => ToolResult {
@@ -7939,6 +8048,42 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
     /// Read-only. Lets the GUI show the boundary it is operating inside (and lets an
     /// operator audit why a tool is gated) without inferring it from a blocked tool
     /// result mid-conversation.
+    /// Returns recent assistant-turn trace events.
+    ///
+    /// Read-only and derived from the same capped in-memory feed the GUI's
+    /// Security tab already reads, so this exposes no more than the audit log
+    /// already does — it is a filter, not a new data source. Bulk history still
+    /// goes through the owner-gated audit-log export.
+    async fn handle_traces(
+        State(state): State<Arc<Mutex<BackendState>>>,
+        Query(params): Query<HashMap<String, String>>,
+    ) -> Json<serde_json::Value> {
+        let kind_filter = params
+            .get("kind")
+            .and_then(|k| trace::TraceEventKind::parse(k));
+        let backend = lock_state(&state);
+        let events: Vec<serde_json::Value> = backend
+            .trace_events
+            .iter()
+            .filter(|e| kind_filter.is_none_or(|k| e.kind == k))
+            .rev()
+            .take(500)
+            .map(|e| {
+                serde_json::json!({
+                    "kind": e.kind.as_str(),
+                    "label": e.label,
+                    "workspace_id": e.workspace_id,
+                    "class": e.capability_class,
+                    "decision": e.decision.map(|d| d.as_str()),
+                    "input_tokens": e.input_tokens,
+                    "output_tokens": e.output_tokens,
+                    "latency_ms": e.latency_ms,
+                })
+            })
+            .collect();
+        Json(serde_json::json!({ "events": events }))
+    }
+
     async fn handle_capabilities(
         State(state): State<Arc<Mutex<BackendState>>>,
     ) -> Json<serde_json::Value> {
@@ -8795,23 +8940,9 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         let exec_micro_batch = chat_exec_micro_batch();
         let request_tracker = active_runtime_switcher().request_tracker().clone();
         request_tracker.increment().await;
-
-        // Workspace binding on the audit trail: records which scope the turn ran
-        // under, never the prompt or the completion — those stay out of the
-        // trail by policy.
-        record_audit_event(
-            &mut lock_state(&state),
-            "chat",
-            "STARTED",
-            "local".to_string(),
-            Some(format!(
-                "workspace={} source={} session={}",
-                chat_workspace.id(),
-                chat_workspace.source().as_str(),
-                chat_session_id
-            )),
-        );
-
+        // Trace recorded *after* generation (below) rather than here, so it can
+        // carry real token counts and end-to-end latency instead of claiming
+        // STARTED and going silent if the turn errors out.
         let mut gen_tokens: Option<u32> = None;
         let mut gen_tps: Option<f32> = None;
         let mut gen_latency_ms: Option<f32> = None;
@@ -9435,6 +9566,17 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             },
         };
 
+        // Trace recorded *after* generation so it carries real token counts and
+        // end-to-end latency. Input count is `None` rather than a fabricated
+        // zero: the engines don't surface it today, and a wrong number in an
+        // observability feed is worse than an absent one.
+        record_trace(
+            &mut lock_state(&state),
+            trace::TraceEvent::chat(&chat_session_id, chat_workspace.id())
+                .with_tokens(None, gen_tokens)
+                .with_latency(started.elapsed()),
+        );
+
         {
             let mut available_flag = ollama_available.lock().await;
             *available_flag = real_inference;
@@ -9687,6 +9829,27 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         let session_granted = req.approve
             && req.approve_for_session
             && capability::grant_for_session(ws.id(), &server_name, &tool_name, tool_class);
+
+        // A standing grant is recorded as its own decision value so a later
+        // audit can tell "approved once" from "approved for the rest of the
+        // session" without parsing the detail text.
+        let approval_decision = if !req.approve {
+            trace::TraceDecision::Denied
+        } else if session_granted {
+            trace::TraceDecision::ApprovedForSession
+        } else {
+            trace::TraceDecision::Approved
+        };
+        record_trace(
+            &mut lock_state(&state),
+            trace::TraceEvent::tool_approval(
+                &tool_name,
+                ws.id(),
+                Some(tool_class.as_str()),
+                approval_decision,
+            )
+            .with_latency(std::time::Duration::ZERO),
+        );
 
         record_audit_event(
             &mut lock_state(&state),
@@ -10606,6 +10769,7 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         plugin_registry: backend_plugin::BackendPluginRegistry::from_env(),
         enable_tls_active: use_tls,
         audit_log: std::collections::VecDeque::new(),
+        trace_events: std::collections::VecDeque::new(),
         api_keys,
         models_scan_cache: ApiResponseCache::new(),
         session_summaries: HashMap::new(),
@@ -10794,6 +10958,7 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                 post(handle_tool_confirm),
             )
             .route("/api/inference/capabilities", get(handle_capabilities))
+            .route("/api/inference/traces", get(handle_traces))
             .route("/api/inference/engines", get(handle_inference_engines))
             .route(
                 "/api/mcp/servers",
@@ -12935,6 +13100,7 @@ mod rpc_cluster;
 mod runtime;
 mod runtime_switcher;
 mod tls;
+mod trace;
 mod vllm;
 mod workspace;
 
@@ -13200,6 +13366,7 @@ mod tests {
             enable_tls_active: false,
             plugin_registry: backend_plugin::BackendPluginRegistry::from_env(),
             audit_log: std::collections::VecDeque::new(),
+            trace_events: std::collections::VecDeque::new(),
             api_keys: vec![auth::create_key("test-admin".to_string(), auth::Role::Owner).0],
             models_scan_cache: ApiResponseCache::new(),
             session_summaries: HashMap::new(),
