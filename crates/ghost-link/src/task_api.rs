@@ -207,6 +207,8 @@ impl AgentBackend for RealAgentBackend {
             return Ok(AgentResponse {
                 content: Some(res.text),
                 tool_calls,
+                // The plugin generate() response carries no usage counts.
+                usage_tokens: None,
             });
         }
 
@@ -257,6 +259,8 @@ impl AgentBackend for RealAgentBackend {
                 Ok(AgentResponse {
                     content: Some(res.message.content),
                     tool_calls,
+                    // Ollama reports real prompt + completion counts.
+                    usage_tokens: res.prompt_eval_count.or(res.eval_count),
                 })
             }
             InferenceEngine::Vllm => {
@@ -296,6 +300,7 @@ impl AgentBackend for RealAgentBackend {
                 Ok(AgentResponse {
                     content: Some(res.content),
                     tool_calls,
+                    usage_tokens: None,
                 })
             }
             InferenceEngine::Native => {
@@ -341,6 +346,7 @@ impl AgentBackend for RealAgentBackend {
                 Ok(AgentResponse {
                     content: Some(gen.text),
                     tool_calls,
+                    usage_tokens: None,
                 })
             }
         }
@@ -529,7 +535,22 @@ async fn handle_spawn_task(
         }
     };
 
+    // Validate the role rather than defaulting silently: an unrecognized
+    // string previously fell through to "not planner", so a typo'd
+    // `{"role":"plannr"}` looked like a successful spawn but could never
+    // create child tasks. Only these two roles exist.
     let role = payload.role.unwrap_or_else(|| "implementer".into());
+    if role != "implementer" && role != "planner" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!(
+                    "invalid role '{}': must be 'implementer' or 'planner'",
+                    role
+                ),
+            })),
+        ));
+    }
     let model = payload
         .model
         .or(project.default_model)
@@ -641,12 +662,43 @@ async fn handle_decide_review(
                     Json(serde_json::json!({ "error": e.to_string() })),
                 ));
             }
-            let _ = store.apply_proposed_changes(&project.root_path, &task.id);
-            let _ = store.update_task_status(&task.id, TaskStatus::Accepted);
-            Ok(Json(
-                serde_json::json!({ "status": "accepted", "task_id": task.id }),
-            ))
+            // Report a failed apply instead of swallowing it — the old
+            // `let _ =` meant a task could be marked `Accepted` while its
+            // changes never actually landed on disk.
+            match store.apply_proposed_changes(&project.root_path, &task.id) {
+                Ok(applied) => {
+                    let _ = store.update_task_status(&task.id, TaskStatus::Accepted);
+                    Ok(Json(serde_json::json!({
+                        "status": "accepted",
+                        "task_id": task.id,
+                        "applied": applied,
+                        // A snapshot was taken; this can be undone.
+                        "rollback_available": true,
+                    })))
+                }
+                Err(e) => Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("failed to apply proposed changes: {e}"),
+                        "task_id": task.id,
+                    })),
+                )),
+            }
         }
+        "rollback" => match store.rollback_applied_changes(&project.root_path, &task.id) {
+            Ok(touched) => {
+                let _ = store.update_task_status(&task.id, TaskStatus::Rejected);
+                Ok(Json(serde_json::json!({
+                    "status": "rolled_back",
+                    "task_id": task.id,
+                    "restored_or_removed": touched,
+                })))
+            }
+            Err(e) => Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )),
+        },
         "reject" => {
             let _ = store.discard_proposed_changes(&project.root_path, &task.id);
             let _ = store.update_task_status(&task.id, TaskStatus::Rejected);
@@ -663,7 +715,7 @@ async fn handle_decide_review(
         _ => Err((
             StatusCode::BAD_REQUEST,
             Json(
-                serde_json::json!({ "error": "invalid decision: must be accept, reject, or request_changes" }),
+                serde_json::json!({ "error": "invalid decision: must be accept, reject, rollback, or request_changes" }),
             ),
         )),
     }

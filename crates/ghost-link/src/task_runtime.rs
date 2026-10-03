@@ -639,6 +639,16 @@ impl TaskRuntimeStore {
             .join("proposed")
     }
 
+    /// Directory holding the pre-apply snapshot of every live file an accept
+    /// is about to overwrite, so `rollback_applied_changes` can restore them.
+    pub fn get_task_backup_dir(&self, project_root: &str, task_id: &str) -> PathBuf {
+        PathBuf::from(project_root)
+            .join(".ghostlink")
+            .join("tasks")
+            .join(task_id)
+            .join("backup")
+    }
+
     pub fn write_proposed_file(
         &self,
         project_root: &str,
@@ -683,6 +693,13 @@ impl TaskRuntimeStore {
         Ok(())
     }
 
+    /// Apply a task's staged files onto the live project root.
+    ///
+    /// Every live file that is about to be overwritten is copied into the
+    /// task's `backup/` directory first, and a manifest of which paths
+    /// existed before is written alongside it. Without this, an accept was
+    /// an unrecoverable blind `fs::copy` over the user's working tree — a
+    /// dirty tree had no way back. `rollback_applied_changes` reverses it.
     pub fn apply_proposed_changes(&self, project_root: &str, task_id: &str) -> Result<Vec<String>> {
         let proposed_dir = self.get_task_proposed_dir(project_root, task_id);
         let mut applied_files = Vec::new();
@@ -691,40 +708,172 @@ impl TaskRuntimeStore {
             return Ok(applied_files);
         }
 
+        let backup_dir = self.get_task_backup_dir(project_root, task_id);
+        let _ = fs::remove_dir_all(&backup_dir);
+        fs::create_dir_all(&backup_dir)
+            .with_context(|| format!("Failed to create backup dir {}", backup_dir.display()))?;
+
         let root = PathBuf::from(project_root);
+        // Relative paths that did not exist before this apply, so a rollback
+        // deletes them rather than restoring an empty file.
+        let mut created_paths: Vec<String> = Vec::new();
 
         fn visit_dirs(
             dir: &Path,
             proposed_root: &Path,
             live_root: &Path,
+            backup_root: &Path,
             applied: &mut Vec<String>,
+            created: &mut Vec<String>,
         ) -> Result<()> {
             if dir.is_dir() {
                 for entry in fs::read_dir(dir)? {
                     let entry = entry?;
                     let path = entry.path();
                     if path.is_dir() {
-                        visit_dirs(&path, proposed_root, live_root, applied)?;
+                        visit_dirs(
+                            &path,
+                            proposed_root,
+                            live_root,
+                            backup_root,
+                            applied,
+                            created,
+                        )?;
                     } else {
                         let rel = path.strip_prefix(proposed_root)?;
                         let live_target = live_root.join(rel);
+                        let rel_str = rel.to_string_lossy().to_string();
+
+                        if live_target.exists() {
+                            // Snapshot the current contents before clobbering.
+                            let backup_target = backup_root.join(rel);
+                            if let Some(parent) = backup_target.parent() {
+                                fs::create_dir_all(parent)?;
+                            }
+                            fs::copy(&live_target, &backup_target).with_context(|| {
+                                format!("Failed to back up {}", live_target.display())
+                            })?;
+                        } else {
+                            created.push(rel_str.clone());
+                        }
+
                         if let Some(parent) = live_target.parent() {
                             fs::create_dir_all(parent)?;
                         }
                         fs::copy(&path, &live_target)?;
-                        applied.push(rel.to_string_lossy().to_string());
+                        applied.push(rel_str);
                     }
                 }
             }
             Ok(())
         }
 
-        visit_dirs(&proposed_dir, &proposed_dir, &root, &mut applied_files)?;
+        visit_dirs(
+            &proposed_dir,
+            &proposed_dir,
+            &root,
+            &backup_dir,
+            &mut applied_files,
+            &mut created_paths,
+        )?;
+
+        // Record which applied paths were newly created, so rollback knows to
+        // delete them instead of restoring from an (absent) snapshot.
+        let manifest = serde_json::json!({
+            "task_id": task_id,
+            "applied": applied_files,
+            "created": created_paths,
+            "created_at": Utc::now().to_rfc3339(),
+        });
+        let manifest_path = backup_dir.join("manifest.json");
+        let _ = Self::atomic_write_json(&manifest_path, &manifest);
 
         // Clean up proposed directory after successful apply
         let _ = fs::remove_dir_all(&proposed_dir);
 
         Ok(applied_files)
+    }
+
+    /// Undo a previous `apply_proposed_changes` for this task.
+    ///
+    /// Restores every file captured in the task's `backup/` snapshot and
+    /// deletes the paths the apply created. Returns the list of paths that
+    /// were restored or removed. Errors if there is no snapshot to roll back
+    /// to, rather than silently reporting success.
+    pub fn rollback_applied_changes(
+        &self,
+        project_root: &str,
+        task_id: &str,
+    ) -> Result<Vec<String>> {
+        let backup_dir = self.get_task_backup_dir(project_root, task_id);
+        let manifest_path = backup_dir.join("manifest.json");
+
+        if !manifest_path.exists() {
+            return Err(anyhow!(
+                "No apply snapshot for task '{}' — nothing to roll back",
+                task_id
+            ));
+        }
+
+        let raw = fs::read_to_string(&manifest_path)?;
+        let manifest: serde_json::Value = serde_json::from_str(&raw)?;
+
+        let root = PathBuf::from(project_root);
+        let mut touched = Vec::new();
+
+        // Delete paths that this apply created.
+        if let Some(created) = manifest.get("created").and_then(|c| c.as_array()) {
+            for rel in created.iter().filter_map(|v| v.as_str()) {
+                if let Ok(target) = Self::validate_and_resolve_path(project_root, rel) {
+                    if target.exists() {
+                        let _ = fs::remove_file(&target);
+                    }
+                    touched.push(rel.to_string());
+                }
+            }
+        }
+
+        // Restore paths that existed before the apply.
+        fn restore_dirs(
+            dir: &Path,
+            backup_root: &Path,
+            live_root: &Path,
+            touched: &mut Vec<String>,
+        ) -> Result<()> {
+            if !dir.is_dir() {
+                return Ok(());
+            }
+            for entry in fs::read_dir(dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_dir() {
+                    restore_dirs(&path, backup_root, live_root, touched)?;
+                } else if path
+                    .file_name()
+                    .map(|n| n == "manifest.json")
+                    .unwrap_or(false)
+                {
+                    continue;
+                } else {
+                    let rel = path.strip_prefix(backup_root)?;
+                    let live_target = live_root.join(rel);
+                    if let Some(parent) = live_target.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::copy(&path, &live_target)?;
+                    touched.push(rel.to_string_lossy().to_string());
+                }
+            }
+            Ok(())
+        }
+
+        restore_dirs(&backup_dir, &backup_dir, &root, &mut touched)?;
+
+        // Snapshot consumed — remove it so a second rollback errors instead of
+        // silently re-restoring stale content.
+        let _ = fs::remove_dir_all(&backup_dir);
+
+        Ok(touched)
     }
 
     pub fn discard_proposed_changes(&self, project_root: &str, task_id: &str) -> Result<()> {
@@ -747,6 +896,11 @@ pub struct ToolCall {
 pub struct AgentResponse {
     pub content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
+    /// Real token usage for this turn when the backend reports it
+    /// (prompt + completion). `None` means "unknown" — the runtime then falls
+    /// back to a character-based estimate rather than pretending it knows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_tokens: Option<u32>,
 }
 
 #[allow(clippy::double_must_use)]
@@ -757,6 +911,125 @@ pub trait AgentBackend: Send + Sync {
         messages: &[serde_json::Value],
         allowed_tools: &[String],
     ) -> Result<AgentResponse>;
+}
+
+/// Produce a real unified diff between `original` and `proposed`.
+///
+/// `ReviewPacket.diffs[].unified_diff` previously carried a hand-built string
+/// with a hardcoded `@@ -0,0 +1,3 @@` hunk header regardless of the actual
+/// content, so a reviewer saw fabricated line numbers. This computes an
+/// LCS-based diff with correct hunk headers instead of pulling in a new
+/// dependency for one function.
+///
+/// Returns an empty string when the two sides are identical.
+pub fn unified_diff(rel_path: &str, original: &str, proposed: &str) -> String {
+    if original == proposed {
+        return String::new();
+    }
+
+    let a: Vec<&str> = original.lines().collect();
+    let b: Vec<&str> = proposed.lines().collect();
+
+    // LCS table over lines.
+    let (n, m) = (a.len(), b.len());
+    let mut lcs = vec![vec![0usize; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            lcs[i][j] = if a[i] == b[j] {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
+        }
+    }
+
+    // Walk the table emitting context / deletions / additions.
+    #[derive(PartialEq)]
+    enum Op {
+        Ctx,
+        Del,
+        Add,
+    }
+    let mut ops: Vec<(Op, &str)> = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < n && j < m {
+        if a[i] == b[j] {
+            ops.push((Op::Ctx, a[i]));
+            i += 1;
+            j += 1;
+        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
+            ops.push((Op::Del, a[i]));
+            i += 1;
+        } else {
+            ops.push((Op::Add, b[j]));
+            j += 1;
+        }
+    }
+    while i < n {
+        ops.push((Op::Del, a[i]));
+        i += 1;
+    }
+    while j < m {
+        ops.push((Op::Add, b[j]));
+        j += 1;
+    }
+
+    // Group into hunks with 3 lines of context, tracking real line numbers.
+    const CTX: usize = 3;
+    let mut out = String::new();
+    out.push_str(&format!("--- a/{rel_path}\n+++ b/{rel_path}\n"));
+
+    let changed: Vec<usize> = ops
+        .iter()
+        .enumerate()
+        .filter(|(_, (op, _))| *op != Op::Ctx)
+        .map(|(idx, _)| idx)
+        .collect();
+
+    if changed.is_empty() {
+        return out;
+    }
+
+    // Build hunk ranges [start, end) over `ops`.
+    let mut hunks: Vec<(usize, usize)> = Vec::new();
+    let mut start = changed[0].saturating_sub(CTX);
+    let mut end = (changed[0] + CTX + 1).min(ops.len());
+    for &idx in &changed[1..] {
+        if idx <= end + CTX {
+            end = (idx + CTX + 1).min(ops.len());
+        } else {
+            hunks.push((start, end));
+            start = idx.saturating_sub(CTX);
+            end = (idx + CTX + 1).min(ops.len());
+        }
+    }
+    hunks.push((start, end));
+
+    for (hs, he) in hunks {
+        // Line numbers at the start of this hunk (1-based, as of the first
+        // op in the range).
+        let old_start = 1 + ops[..hs].iter().filter(|(o, _)| *o != Op::Add).count();
+        let new_start = 1 + ops[..hs].iter().filter(|(o, _)| *o != Op::Del).count();
+        let old_len = ops[hs..he].iter().filter(|(o, _)| *o != Op::Add).count();
+        let new_len = ops[hs..he].iter().filter(|(o, _)| *o != Op::Del).count();
+
+        out.push_str(&format!(
+            "@@ -{},{} +{},{} @@\n",
+            old_start, old_len, new_start, new_len
+        ));
+        for (op, line) in &ops[hs..he] {
+            let prefix = match op {
+                Op::Ctx => ' ',
+                Op::Del => '-',
+                Op::Add => '+',
+            };
+            out.push(prefix);
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+
+    out
 }
 
 // Helper to recursively list relative paths in a directory
@@ -1045,21 +1318,76 @@ impl TaskRunner {
                 payload: serde_json::json!({ "step": run.step_count, "description": format!("Agent step {}", run.step_count) }),
             });
 
-                // Call model via AgentBackend
-                let agent_resp = match backend
-                    .chat(&messages, &project.effective_allowed_tools())
-                    .await
-                {
-                    Ok(resp) => resp,
-                    Err(err) => {
-                        risks.push(format!("Backend inference error: {}", err));
+                // Call model via AgentBackend.
+                //
+                // Retried with exponential backoff: a local inference backend
+                // (llama-server mid model-swap, a transient RPC hiccup) used to
+                // fail the whole task on a single error, pushing it to
+                // `Blocked` — the same transient-failure class the RPC fabric
+                // already handles with its own backoff policy. Cancellation is
+                // honoured between attempts.
+                const MAX_CHAT_ATTEMPTS: u32 = 3;
+                let mut last_err: Option<String> = None;
+                let mut attempt_resp = None;
+                for attempt in 0..MAX_CHAT_ATTEMPTS {
+                    if cancel_token.is_cancelled() {
+                        return Err(anyhow!("Task execution cancelled by user"));
+                    }
+                    match backend
+                        .chat(&messages, &project.effective_allowed_tools())
+                        .await
+                    {
+                        Ok(resp) => {
+                            attempt_resp = Some(resp);
+                            break;
+                        }
+                        Err(err) => {
+                            let msg = err.to_string();
+                            last_err = Some(msg.clone());
+                            if attempt + 1 < MAX_CHAT_ATTEMPTS {
+                                // 1s, 2s — bounded, and short enough not to
+                                // eat a meaningful slice of max_minutes.
+                                let backoff = std::time::Duration::from_secs(1 << attempt);
+                                store.emit_event(TaskEvent {
+                                    task_id: task.id.clone(),
+                                    ts: Utc::now().timestamp_millis() as u64,
+                                    kind: "retry".into(),
+                                    payload: serde_json::json!({
+                                        "attempt": attempt + 1,
+                                        "max_attempts": MAX_CHAT_ATTEMPTS,
+                                        "backoff_ms": backoff.as_millis() as u64,
+                                        "error": msg,
+                                    }),
+                                });
+                                tokio::time::sleep(backoff).await;
+                            }
+                        }
+                    }
+                }
+
+                let agent_resp = match attempt_resp {
+                    Some(resp) => resp,
+                    None => {
+                        let err = last_err.unwrap_or_else(|| "unknown backend error".into());
+                        risks.push(format!(
+                            "Backend inference error after {} attempts: {}",
+                            MAX_CHAT_ATTEMPTS, err
+                        ));
                         break;
                     }
                 };
 
-                // Estimate tokens
+                // Count tokens. Prefer the backend's reported usage; fall back
+                // to a character estimate only when the backend doesn't report
+                // it. The old code *always* estimated from assistant text
+                // alone, ignoring prompt and tool-call tokens, so a
+                // tool-call-only turn charged a flat 10 tokens and
+                // `max_tokens` was effectively unreachable.
                 let content_str = agent_resp.content.clone().unwrap_or_default();
-                run.token_count += (content_str.len() / 4).max(10) as u32;
+                run.token_count += match agent_resp.usage_tokens {
+                    Some(usage) => usage,
+                    None => (content_str.len() / 4).max(10) as u32,
+                };
 
                 if !content_str.is_empty() {
                     messages
@@ -1399,11 +1727,7 @@ impl TaskRunner {
                     "".to_string()
                 };
 
-                let unified_diff = format!(
-                    "--- a/{0}\n+++ b/{0}\n@@ -0,0 +1,3 @@\n+{1}",
-                    rel_path,
-                    proposed_content.replace("\n", "\n+")
-                );
+                let unified_diff = unified_diff(&rel_path, &original_content, &proposed_content);
 
                 diffs.push(ReviewDiff {
                     path: rel_path,
@@ -1448,6 +1772,7 @@ impl AgentBackend for FakeBackend {
             Ok(AgentResponse {
                 content: Some("Finished".into()),
                 tool_calls: vec![],
+                usage_tokens: None,
             })
         } else {
             Ok(guard.remove(0))
@@ -1494,10 +1819,12 @@ mod slice1_tests {
                             "content": "Hello Slice 1"
                         }),
                     }],
+                    usage_tokens: None,
                 },
                 AgentResponse {
                     content: Some("All done".into()),
                     tool_calls: vec![],
+                    usage_tokens: None,
                 },
             ])),
         });
@@ -1578,6 +1905,7 @@ mod slice1_tests {
                         "argv": ["rm", "-rf", "/"]
                     }),
                 }],
+                usage_tokens: None,
             }])),
         });
 
@@ -1649,6 +1977,7 @@ mod slice1_tests {
                         "argv": ["custom_unknown_binary", "--arg"]
                     }),
                 }],
+                usage_tokens: None,
             }])),
         });
 
@@ -1711,6 +2040,7 @@ mod slice1_tests {
             responses: Arc::new(Mutex::new(vec![AgentResponse {
                 content: Some("Step 1".into()),
                 tool_calls: vec![],
+                usage_tokens: None,
             }])),
         });
 
@@ -1783,10 +2113,12 @@ mod slice1_tests {
                         name: "read_file".into(),
                         args: serde_json::json!({ "path": "nonexistent.txt" }),
                     }],
+                    usage_tokens: None,
                 },
                 AgentResponse {
                     content: Some("Step 2 - should not run".into()),
                     tool_calls: vec![],
+                    usage_tokens: None,
                 },
             ])),
         });
@@ -2111,10 +2443,12 @@ mod parallel_and_compact_tests {
                         args: serde_json::json!({ "path": "file2.txt" }),
                     },
                 ],
+                usage_tokens: None,
             },
             AgentResponse {
                 content: Some("Done reading".into()),
                 tool_calls: vec![],
+                usage_tokens: None,
             },
         ]));
 
@@ -2168,14 +2502,17 @@ mod parallel_and_compact_tests {
                     name: "spawn_subagent".into(),
                     args: serde_json::json!({ "goal": "Child goal" }),
                 }],
+                usage_tokens: None,
             },
             AgentResponse {
                 content: Some("Parent finished".into()),
                 tool_calls: vec![],
+                usage_tokens: None,
             },
             AgentResponse {
                 content: Some("Child finished".into()),
                 tool_calls: vec![],
+                usage_tokens: None,
             },
         ]));
 
@@ -2234,6 +2571,7 @@ mod parallel_and_compact_tests {
         let responses = Arc::new(Mutex::new(vec![AgentResponse {
             content: Some("Done".into()),
             tool_calls: vec![],
+            usage_tokens: None,
         }]));
 
         let backend = Arc::new(FakeBackend { responses });
@@ -2255,5 +2593,129 @@ mod parallel_and_compact_tests {
         assert_eq!(review.diffs.len(), 1);
         assert!(review.diffs[0].unified_diff.contains("--- a/code.rs"));
         assert!(review.diffs[0].unified_diff.contains("+++ b/code.rs"));
+        // The old implementation emitted a hardcoded `@@ -0,0 +1,3 @@`
+        // regardless of content; assert real line numbers now.
+        assert!(
+            review.diffs[0].unified_diff.contains("@@ -1,1 +1,3 @@"),
+            "expected a real hunk header, got:\n{}",
+            review.diffs[0].unified_diff
+        );
+    }
+
+    #[test]
+    fn unified_diff_reports_real_hunk_headers() {
+        let d = unified_diff(
+            "a.rs",
+            "fn hello() {}\n",
+            "fn hello() {\n    println!(\"world\");\n}\n",
+        );
+        assert!(d.contains("@@ -1,1 +1,3 @@"), "{d}");
+        assert!(d.contains("-fn hello() {}"), "{d}");
+        assert!(d.contains("+    println!(\"world\");"), "{d}");
+    }
+
+    #[test]
+    fn unified_diff_is_empty_when_unchanged() {
+        assert_eq!(unified_diff("a.rs", "same\n", "same\n"), "");
+    }
+
+    #[test]
+    fn unified_diff_handles_pure_insert_and_delete() {
+        let added = unified_diff("a.rs", "", "new\n");
+        assert!(added.contains("+new"), "{added}");
+
+        let removed = unified_diff("a.rs", "gone\n", "");
+        assert!(removed.contains("-gone"), "{removed}");
+    }
+
+    #[test]
+    fn unified_diff_line_numbers_are_correct_mid_file() {
+        let original: String = (1..=10).map(|i| format!("line{i}\n")).collect();
+        let mut proposed: String = (1..=10).map(|i| format!("line{i}\n")).collect();
+        proposed = proposed.replace("line7\n", "line7-changed\n");
+        let d = unified_diff("f.rs", &original, &proposed);
+        // Change is on line 7, so the hunk starts 3 lines earlier at line 4.
+        assert!(d.contains("@@ -4,7 +4,7 @@"), "{d}");
+    }
+
+    #[tokio::test]
+    async fn rollback_restores_overwritten_file_and_deletes_created_one() {
+        let temp_dir = std::env::temp_dir().join(format!("ghostlink_rb_{}", Uuid::new_v4()));
+        let store = Arc::new(TaskRuntimeStore::new(&temp_dir).unwrap());
+
+        let proj_dir = std::env::temp_dir().join(format!("ghostlink_rb_proj_{}", Uuid::new_v4()));
+        fs::create_dir_all(&proj_dir).unwrap();
+        fs::write(proj_dir.join("existing.rs"), "ORIGINAL\n").unwrap();
+
+        let proj = store
+            .create_project(
+                "RB Proj".into(),
+                ProjectKind::Code,
+                proj_dir.to_string_lossy().to_string(),
+                None,
+                None,
+            )
+            .unwrap();
+        let task = store
+            .create_task(&proj.id, "Mutate".into(), None, None, None)
+            .unwrap();
+
+        // Overwrite one existing file and create one brand-new file.
+        store
+            .write_proposed_file(&proj.root_path, &task.id, "existing.rs", "CLOBBERED\n")
+            .unwrap();
+        store
+            .write_proposed_file(&proj.root_path, &task.id, "brand_new.rs", "NEW\n")
+            .unwrap();
+
+        let applied = store
+            .apply_proposed_changes(&proj.root_path, &task.id)
+            .unwrap();
+        assert_eq!(applied.len(), 2);
+        assert_eq!(
+            fs::read_to_string(proj_dir.join("existing.rs")).unwrap(),
+            "CLOBBERED\n"
+        );
+        assert!(proj_dir.join("brand_new.rs").exists());
+
+        let touched = store
+            .rollback_applied_changes(&proj.root_path, &task.id)
+            .unwrap();
+        assert_eq!(touched.len(), 2);
+        // Overwritten file is restored...
+        assert_eq!(
+            fs::read_to_string(proj_dir.join("existing.rs")).unwrap(),
+            "ORIGINAL\n"
+        );
+        // ...and the created file is removed.
+        assert!(!proj_dir.join("brand_new.rs").exists());
+
+        // A second rollback must fail rather than silently succeed.
+        assert!(store
+            .rollback_applied_changes(&proj.root_path, &task.id)
+            .is_err());
+    }
+
+    #[test]
+    fn rollback_without_snapshot_errors() {
+        let temp_dir = std::env::temp_dir().join(format!("ghostlink_rb2_{}", Uuid::new_v4()));
+        let store = Arc::new(TaskRuntimeStore::new(&temp_dir).unwrap());
+        let proj_dir = std::env::temp_dir().join(format!("ghostlink_rb2_proj_{}", Uuid::new_v4()));
+        fs::create_dir_all(&proj_dir).unwrap();
+        let proj = store
+            .create_project(
+                "P".into(),
+                ProjectKind::Code,
+                proj_dir.to_string_lossy().to_string(),
+                None,
+                None,
+            )
+            .unwrap();
+        let task = store
+            .create_task(&proj.id, "g".into(), None, None, None)
+            .unwrap();
+        assert!(store
+            .rollback_applied_changes(&proj.root_path, &task.id)
+            .is_err());
     }
 }
