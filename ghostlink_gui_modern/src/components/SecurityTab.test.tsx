@@ -74,11 +74,67 @@ describe('SecurityTab', () => {
     });
   });
 
+  it('handles token refresh button loading state and aria-busy attribute', async () => {
+    let resolveRefresh: any;
+    const refreshPromise = new Promise((resolve) => { resolveRefresh = resolve; });
+    const api = createMockApi({
+      refreshJWT: vi.fn().mockImplementation(() => refreshPromise),
+    });
+
+    render(<SecurityTab api={api} />);
+
+    const refreshBtn = screen.getByRole('button', { name: 'Refresh JWT access token' });
+    expect(refreshBtn).toHaveAttribute('aria-busy', 'false');
+    expect(refreshBtn).toHaveAttribute('title', 'Refresh JWT access token');
+
+    fireEvent.click(refreshBtn);
+
+    expect(refreshBtn).toHaveAttribute('aria-busy', 'true');
+    expect(screen.getByRole('button', { name: 'Refreshing JWT access token...' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Refreshing JWT access token...' })).toHaveAttribute('title', 'Refreshing JWT access token...');
+    expect(screen.getByText('Refreshing Token...')).toBeInTheDocument();
+
+    resolveRefresh({ success: true, data: { token: 'new.jwt.token' } });
+
+    await waitFor(() => {
+      expect(refreshBtn).toHaveAttribute('aria-busy', 'false');
+      expect(screen.getByText('Refresh Token')).toBeInTheDocument();
+    });
+  });
+
+  it('handles PQC enable button loading state and aria-busy attribute', async () => {
+    let resolvePqc: any;
+    const pqcPromise = new Promise((resolve) => { resolvePqc = resolve; });
+    const api = createMockApi({
+      enablePQC: vi.fn().mockImplementation(() => pqcPromise),
+    });
+
+    render(<SecurityTab api={api} />);
+
+    const enableBtn = await screen.findByRole('button', { name: 'Enable HTTPS and PQC-hybrid TLS' });
+    expect(enableBtn).toHaveAttribute('aria-busy', 'false');
+    expect(enableBtn).toHaveAttribute('title', 'Enable HTTPS and PQC-hybrid TLS');
+
+    fireEvent.click(enableBtn);
+
+    expect(screen.getByRole('button', { name: 'Enabling HTTPS and PQC-hybrid TLS...' })).toBeInTheDocument();
+    const busyBtn = screen.getByRole('button', { name: 'Enabling HTTPS and PQC-hybrid TLS...' });
+    expect(busyBtn).toHaveAttribute('aria-busy', 'true');
+    expect(busyBtn).toHaveAttribute('title', 'Enabling HTTPS and PQC-hybrid TLS...');
+    expect(screen.getByText('Enabling HTTPS + PQC-Hybrid TLS...')).toBeInTheDocument();
+
+    resolvePqc({ success: true, data: { restart_required: true, enabled: true } });
+
+    await waitFor(() => {
+      expect(screen.getByText(/restart the server/i)).toBeInTheDocument();
+    });
+  });
+
   it('shows a restart-required message rather than claiming PQC is already active', async () => {
     const api = createMockApi();
     render(<SecurityTab api={api} />);
 
-    fireEvent.click(await screen.findByRole('button', { name: /enable https \+ pqc-hybrid tls/i }));
+    fireEvent.click(await screen.findByRole('button', { name: /enable https and pqc-hybrid tls/i }));
 
     await waitFor(() => {
       expect(screen.getByText(/restart the server/i)).toBeInTheDocument();
@@ -102,7 +158,7 @@ describe('SecurityTab', () => {
     render(<SecurityTab api={api} />);
 
     // Refresh token first to have a valid token
-    fireEvent.click(screen.getByRole('button', { name: /refresh token/i }));
+    fireEvent.click(screen.getByRole('button', { name: /refresh jwt access token/i }));
     await screen.findByRole('button', { name: /copy access token/i });
 
     const copyBtn = screen.getByRole('button', { name: /copy access token/i });

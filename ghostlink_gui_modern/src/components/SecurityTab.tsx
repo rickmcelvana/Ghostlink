@@ -13,7 +13,8 @@ interface AuditEntry {
 
 export const SecurityTab: React.FC<{ api: any }> = ({ api }) => {
   const { addToast } = useAppStore();
-  const [loading, setLoading] = useState(false);
+  const [refreshingToken, setRefreshingToken] = useState(false);
+  const [enablingPqc, setEnablingPqc] = useState(false);
   const [showToken, setShowShowToken] = useState(false);
   const [pqcEnabled, setPqcEnabled] = useState(false);
   // null (not an empty/placeholder-looking string) until a real token is
@@ -87,7 +88,7 @@ export const SecurityTab: React.FC<{ api: any }> = ({ api }) => {
   }, [api]);
 
   const handleRefresh = async () => {
-    setLoading(true);
+    setRefreshingToken(true);
     try {
       const result = await api.refreshJWT();
       if (result.success) {
@@ -96,12 +97,12 @@ export const SecurityTab: React.FC<{ api: any }> = ({ api }) => {
         addToast({ type: 'error', message: result.error || 'Failed to refresh token' });
       }
     } finally {
-      setLoading(false);
+      setRefreshingToken(false);
     }
   };
 
   const handlePqc = async () => {
-    setLoading(true);
+    setEnablingPqc(true);
     try {
       const result = await api.enablePQC();
       // Saves the enable_tls setting for next restart — the listener is
@@ -115,7 +116,7 @@ export const SecurityTab: React.FC<{ api: any }> = ({ api }) => {
         addToast({ type: 'error', message: result.error || 'Failed to enable PQC' });
       }
     } finally {
-      setLoading(false);
+      setEnablingPqc(false);
     }
   };
 
@@ -233,11 +234,14 @@ export const SecurityTab: React.FC<{ api: any }> = ({ api }) => {
 
               <button
                 onClick={handleRefresh}
-                disabled={loading}
-                className="w-full flex items-center justify-center gap-2 py-3 bg-slate-800 hover:bg-slate-700 text-white rounded-xl text-sm font-bold transition focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
+                disabled={refreshingToken}
+                aria-busy={refreshingToken}
+                aria-label={refreshingToken ? 'Refreshing JWT access token...' : 'Refresh JWT access token'}
+                title={refreshingToken ? 'Refreshing JWT access token...' : 'Refresh JWT access token'}
+                className="w-full flex items-center justify-center gap-2 py-3 bg-slate-800 hover:bg-slate-700 text-white rounded-xl text-sm font-bold transition disabled:opacity-50 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
               >
-                <RefreshCw size={16} className={loading ? 'animate-spin' : ''} aria-hidden="true" />
-                Refresh Token
+                <RefreshCw size={16} className={refreshingToken ? 'animate-spin' : ''} aria-hidden="true" />
+                {refreshingToken ? 'Refreshing Token...' : 'Refresh Token'}
               </button>
             </div>
 
@@ -280,10 +284,14 @@ export const SecurityTab: React.FC<{ api: any }> = ({ api }) => {
               {!pqcEnabled && !pqcRestartRequired && (
                 <button
                   onClick={handlePqc}
-                  disabled={loading}
-                  className="w-full py-3 bg-purple-600 hover:bg-purple-500 text-white rounded-xl text-sm font-bold transition shadow-lg shadow-purple-500/20 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
+                  disabled={enablingPqc}
+                  aria-busy={enablingPqc}
+                  aria-label={enablingPqc ? 'Enabling HTTPS and PQC-hybrid TLS...' : 'Enable HTTPS and PQC-hybrid TLS'}
+                  title={enablingPqc ? 'Enabling HTTPS and PQC-hybrid TLS...' : 'Enable HTTPS and PQC-hybrid TLS'}
+                  className="w-full flex items-center justify-center gap-2 py-3 bg-purple-600 hover:bg-purple-500 text-white rounded-xl text-sm font-bold transition shadow-lg shadow-purple-500/20 disabled:opacity-50 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
                 >
-                  Enable HTTPS + PQC-Hybrid TLS
+                  {enablingPqc && <RefreshCw size={16} className="animate-spin" aria-hidden="true" />}
+                  {enablingPqc ? 'Enabling HTTPS + PQC-Hybrid TLS...' : 'Enable HTTPS + PQC-Hybrid TLS'}
                 </button>
               )}
             </div>
