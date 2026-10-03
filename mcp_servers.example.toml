@@ -1,3 +1,29 @@
+# --- Capability classes ---
+#
+# Every MCP tool the chat loop can reach is classified read / write / exec in
+# Rust (`crates/ghost-link/src/capability.rs`), keyed on (server name, tool
+# name), and enforced before dispatch. `requires_confirmation` below is
+# PER-SERVER and only decides whether the legacy blocking confirmation pause
+# fires — it is not the security boundary, and it cannot distinguish
+# `read_text_file` from `write_file` on the same server.
+#
+# The classification table fails CLOSED: a tool not listed there is treated as
+# `exec`, including an unlisted tool on a server that is listed. So adding a new
+# server or tool here does not silently grant it read access — it gets gated
+# until someone vets it. Check the effective classification of everything
+# currently connected with:
+#
+#   curl -H "Authorization: Bearer $GHOSTLINK_API_KEY" \
+#        http://127.0.0.1:8003/api/inference/capabilities
+#
+# Known classes (see the table for the authoritative list):
+#   read  - filesystem inspection, calculator, rag search, memory catalog/search,
+#           git log/diff/status/blame, web fetch/search, sequential-thinking,
+#           vision
+#   write - filesystem write/edit/mkdir/move, rag index_document, memory
+#           remember/forget, git commit/add/checkout/reset/push, sqlite writes
+#   exec  - terminal, code execution, docker gateway, and ANY UNLISTED TOOL
+
 [[mcp_servers]]
 name = "filesystem"
 slot = "file_operations"

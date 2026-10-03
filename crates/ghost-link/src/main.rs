@@ -2507,6 +2507,41 @@ fn mcp_tools_to_openai_json(tools: &[mcp::McpToolSchema]) -> Vec<serde_json::Val
         .collect()
 }
 
+/// The workspace root every tool call, approval, and memory write is scoped to.
+///
+/// `GHOSTLINK_WORKSPACE_ROOT` if set, otherwise the launch directory. Defined at
+/// module scope rather than inside the API server so the tool-calling loop can
+/// reach it — the capability gate needs the same root the workspace file routes
+/// use, and two definitions would be free to drift.
+fn workspace_root() -> std::path::PathBuf {
+    std::env::var("GHOSTLINK_WORKSPACE_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+        })
+}
+
+/// The active workspace binding for a chat/tool call.
+///
+/// Derived from the configured root, so a single-node deployment behaves exactly
+/// as it did before workspace ids existed.
+fn active_workspace() -> workspace::WorkspaceId {
+    workspace::WorkspaceId::from_root(workspace_root())
+}
+
+/// Resolves the workspace a request is bound to.
+///
+/// A client-supplied id is honored but always paired with the server's
+/// configured root: the id selects *which* workspace's memories, RAG index, and
+/// grants apply, never a filesystem root chosen by the caller. Letting a request
+/// name its own root would hand it path traversal for free.
+fn resolve_request_workspace(requested: Option<&str>) -> workspace::WorkspaceId {
+    match requested {
+        Some(id) => workspace::WorkspaceId::explicit(id, workspace_root()),
+        None => active_workspace(),
+    }
+}
+
 /// Invokes a real MCP tool by name (matched against the caller's already
 /// slot-resolved `tools` catalog) and reports the outcome in the GUI's
 /// `ToolResult` shape — shared by every engine's tool-calling loop so
@@ -2523,28 +2558,52 @@ async fn invoke_mcp_tool(
         tools.iter().map(|t| (t.name.as_str(), t)).collect();
 
     match tool_map.get(tool_name) {
-        Some(schema) => match mcp_registry
-            .call_tool(&schema.server, tool_name, args)
-            .await
-        {
-            Some(outcome) if outcome.success => ToolResult {
-                tool: tool_name.to_string(),
-                result: outcome.result.to_string(),
-                success: true,
-            },
-            Some(outcome) => ToolResult {
-                tool: tool_name.to_string(),
-                result: outcome
-                    .error
-                    .unwrap_or_else(|| "tool call failed".to_string()),
-                success: false,
-            },
-            None => ToolResult {
-                tool: tool_name.to_string(),
-                result: "tool server is not connected".to_string(),
-                success: false,
-            },
-        },
+        Some(schema) => {
+            // Capability gate, enforced here in Rust before dispatch. A system
+            // prompt telling the model to be careful is not enforcement; this
+            // is. Unknown tools classify as Exec and are gated accordingly.
+            let ws = active_workspace();
+            let decision = capability::decide(ws.id(), &schema.server, tool_name, None, ws.root());
+            if !decision.is_allowed() {
+                let capability::Decision::NeedsApproval { class, reason } = decision else {
+                    unreachable!("is_allowed() is false only for NeedsApproval")
+                };
+                // Not executed. The pending-handle plumbing that lets the model
+                // continue without the result runs through the existing
+                // confirmation path (`NativeLoopStep::NeedsConfirmation`).
+                return ToolResult {
+                    tool: tool_name.to_string(),
+                    result: format!(
+                        "blocked: {} (class={}) — awaiting approval",
+                        reason,
+                        class.as_str()
+                    ),
+                    success: false,
+                };
+            }
+            match mcp_registry
+                .call_tool(&schema.server, tool_name, args)
+                .await
+            {
+                Some(outcome) if outcome.success => ToolResult {
+                    tool: tool_name.to_string(),
+                    result: outcome.result.to_string(),
+                    success: true,
+                },
+                Some(outcome) => ToolResult {
+                    tool: tool_name.to_string(),
+                    result: outcome
+                        .error
+                        .unwrap_or_else(|| "tool call failed".to_string()),
+                    success: false,
+                },
+                None => ToolResult {
+                    tool: tool_name.to_string(),
+                    result: "tool server is not connected".to_string(),
+                    success: false,
+                },
+            }
+        }
         None => ToolResult {
             tool: tool_name.to_string(),
             result: format!("unknown tool '{tool_name}'"),
@@ -3894,12 +3953,21 @@ struct GuiChatRequest {
     /// sibling plain-generation path in `handle_gui_chat`.
     #[serde(default)]
     response_format: Option<serde_json::Value>,
+    /// Scopes this chat to a named workspace. Absent means "the configured
+    /// root", which is what every pre-existing client sends — the id is
+    /// additive, so no current deployment changes behavior.
+    #[serde(default)]
+    workspace_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ToolConfirmRequest {
     request_id: String,
     approve: bool,
+    /// Standing grant for this (workspace, tool) for the rest of the session.
+    /// Refused for exec-class tools — see `CapabilityClass::session_grant_allowed`.
+    #[serde(default)]
+    approve_for_session: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -7275,46 +7343,17 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
     /// in-browser editor.
     const MAX_WORKSPACE_FILE_BYTES: u64 = 5 * 1024 * 1024;
 
-    fn workspace_root() -> std::path::PathBuf {
-        std::env::var("GHOSTLINK_WORKSPACE_ROOT")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| {
-                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-            })
-    }
-
     /// Resolves a client-supplied relative path against the workspace root
-    /// and rejects anything that escapes it. Canonicalizing both sides and
-    /// checking the prefix is what actually catches `..` traversal and
-    /// symlink escapes — a naive string check on the raw path does not.
+    /// and rejects anything that escapes it.
+    ///
+    /// Delegates to `workspace::resolve_within` — the assistant layer's single
+    /// sandbox implementation — so the Editor tab's file routes and the tool
+    /// caller's path scoping can't drift into two different traversal checks.
     fn resolve_workspace_path(
         root: &std::path::Path,
         rel: &str,
     ) -> Result<std::path::PathBuf, String> {
-        let rel = rel.trim_start_matches(['/', '\\']);
-        let canon_root = root
-            .canonicalize()
-            .map_err(|e| format!("workspace root: {e}"))?;
-        if rel.is_empty() {
-            return Ok(canon_root);
-        }
-        let candidate = canon_root.join(rel);
-        let resolved = if candidate.exists() {
-            candidate.canonicalize().map_err(|e| e.to_string())?
-        } else {
-            // A not-yet-existing file (e.g. the target of a fresh write) can't
-            // be canonicalized itself — canonicalize its parent instead and
-            // reattach the file name, which still catches `..` in `rel`.
-            let parent = candidate.parent().ok_or("invalid path")?;
-            let canon_parent = parent
-                .canonicalize()
-                .map_err(|_| "parent directory does not exist".to_string())?;
-            canon_parent.join(candidate.file_name().ok_or("invalid path")?)
-        };
-        if !resolved.starts_with(&canon_root) {
-            return Err("path escapes workspace root".to_string());
-        }
-        Ok(resolved)
+        workspace::resolve_within(root, rel)
     }
 
     #[derive(serde::Serialize)]
@@ -7890,6 +7929,52 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             "inference_backend": inference,
             "native_engine": backend.settings.native_engine,
             "current_model": backend.current_model,
+        }))
+    }
+
+    /// Reports the capability class of every tool the connected MCP servers
+    /// advertise, plus the active workspace binding.
+    ///
+    /// Read-only. Lets the GUI show the boundary it is operating inside (and lets an
+    /// operator audit why a tool is gated) without inferring it from a blocked tool
+    /// result mid-conversation.
+    async fn handle_capabilities(
+        State(state): State<Arc<Mutex<BackendState>>>,
+    ) -> Json<serde_json::Value> {
+        let registry = {
+            let backend = lock_state(&state);
+            Arc::clone(&backend.mcp_registry)
+        };
+        let servers = match registry.list_all_servers().await {
+            Ok(servers) => servers,
+            Err(err) => return Json(serde_json::json!({ "tools": [], "error": err })),
+        };
+
+        let ws = active_workspace();
+        let mut classified = Vec::new();
+        for server in &servers {
+            // A server that isn't connected reports no tools; skipping it keeps the
+            // response to what is actually reachable right now.
+            if !server.connected {
+                continue;
+            }
+            for tool in registry.tool_schemas_for_server(&server.name).await {
+                let class = capability::classify_schema(&tool);
+                classified.push(serde_json::json!({
+                    "server": tool.server,
+                    "tool": tool.name,
+                    "class": class.as_str(),
+                    "requires_approval": class.requires_approval(),
+                    "session_grant_allowed": class.session_grant_allowed(),
+                    "session_granted": capability::has_session_grant(ws.id(), &tool.server, &tool.name),
+                }));
+            }
+        }
+
+        Json(serde_json::json!({
+            "workspace_id": ws.id(),
+            "workspace_source": ws.source().as_str(),
+            "tools": classified,
         }))
     }
 
@@ -8547,6 +8632,11 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
     ) -> axum::response::Response {
         let started = Instant::now();
 
+        // Which workspace this turn's grants, memories, and RAG index resolve
+        // against. A client-supplied id selects the *scope*, never a filesystem
+        // root — the root stays server-configured (see `resolve_request_workspace`).
+        let chat_workspace = resolve_request_workspace(req.workspace_id.as_deref());
+
         // Legacy chat "tool slot" names the GUI's tool checkboxes send (calculator,
         // file_operations, ...) - resolved against real MCP servers below, then
         // dispatched via whichever protocol the active engine actually speaks
@@ -8704,6 +8794,22 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         let exec_micro_batch = chat_exec_micro_batch();
         let request_tracker = active_runtime_switcher().request_tracker().clone();
         request_tracker.increment().await;
+
+        // Workspace binding on the audit trail: records which scope the turn ran
+        // under, never the prompt or the completion — those stay out of the
+        // trail by policy.
+        record_audit_event(
+            &mut lock_state(&state),
+            "chat",
+            "STARTED",
+            "local".to_string(),
+            Some(format!(
+                "workspace={} source={} session={}",
+                chat_workspace.id(),
+                chat_workspace.source().as_str(),
+                chat_session_id
+            )),
+        );
 
         let mut gen_tokens: Option<u32> = None;
         let mut gen_tps: Option<f32> = None;
@@ -9572,12 +9678,29 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             PendingToolCall::Ollama { tool, server, .. } => (tool.clone(), server.clone()),
             PendingToolCall::Vllm { tool, server, .. } => (tool.clone(), server.clone()),
         };
+        // Classified from the Rust-side table, never from the request: the
+        // caller can't assert a class to obtain a broader grant. Recorded on the
+        // audit trail because a session grant outlives the turn that made it.
+        let tool_class = capability::classify(&server_name, &tool_name);
+        let ws = active_workspace();
+        let session_granted = req.approve
+            && req.approve_for_session
+            && capability::grant_for_session(ws.id(), &server_name, &tool_name, tool_class);
+
         record_audit_event(
             &mut lock_state(&state),
             "tool_confirm",
             if req.approve { "APPROVED" } else { "DENIED" },
             addr.ip().to_string(),
-            Some(format!("{tool_name} @ {server_name}")),
+            Some(format!(
+                "{tool_name} @ {server_name} [class={}]{}",
+                tool_class.as_str(),
+                if session_granted {
+                    " session_granted"
+                } else {
+                    ""
+                }
+            )),
         );
 
         let mut tool_results: Vec<ToolResult> = Vec::new();
@@ -10669,6 +10792,7 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                 "/api/inference/chat/tool-confirm",
                 post(handle_tool_confirm),
             )
+            .route("/api/inference/capabilities", get(handle_capabilities))
             .route("/api/inference/engines", get(handle_inference_engines))
             .route(
                 "/api/mcp/servers",
@@ -12799,6 +12923,7 @@ mod backend_api;
 mod backend_config;
 mod backend_plugin;
 mod backend_registry;
+mod capability;
 mod host_metrics;
 mod inference_engine;
 mod mcp;
@@ -12810,6 +12935,7 @@ mod runtime;
 mod runtime_switcher;
 mod tls;
 mod vllm;
+mod workspace;
 
 static ACTIVE_BACKEND_REGISTRY: OnceLock<Arc<backend_registry::BackendRegistry>> = OnceLock::new();
 static ACTIVE_RUNTIME_SWITCHER: OnceLock<runtime_switcher::RuntimeSwitcher> = OnceLock::new();

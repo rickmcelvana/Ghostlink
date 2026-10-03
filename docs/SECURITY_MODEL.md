@@ -86,6 +86,41 @@ This document summarizes current security assumptions for Ghost-Link runtime and
   Change the default Grafana admin password (`GRAFANA_ADMIN_PASSWORD`)
   before running this profile beyond local evaluation.
 
+- **Server-side tool capability classification** (since 2.4.0, `crates/ghost-link/src/capability.rs`):
+  every MCP tool call in the chat tool loop is classified `read` / `write` / `exec`
+  in Rust, from a `(server, tool)` table, and the classification is enforced
+  *before* dispatch in `invoke_mcp_tool`. This closes a gap the previous
+  per-server `requires_confirmation` flag could not: that flag is per-server, so it
+  could not distinguish `read_text_file` from `write_file` on the same filesystem
+  server, and it could not express "this specific tool is vetted to auto-apply".
+  **Classification fails closed** — any tool not in the table is treated as `exec`,
+  including an unlisted tool on an otherwise-known server. The rationale is
+  asymmetric cost: a wrong `read` permits arbitrary command execution, while a
+  spurious `exec` costs one approval prompt.
+  A system-prompt instruction to the model is explicitly *not* part of this
+  control. The model is not the trust boundary; the server is.
+  Session-scoped grants ("approve for session") are keyed by
+  `(workspace_id, server, tool)` and **never cover `exec`** — a standing grant must
+  not become a standing shell. The grant API refuses an `exec` class outright
+  rather than relying on the caller to check, and `POST
+  /api/inference/chat/tool-confirm` derives the class server-side instead of
+  accepting one from the request body.
+  The vetted auto-apply path admits a `write` only when its target canonicalizes
+  inside the configured workspace root; `exec` and `read` are never auto-applied,
+  and a write with no resolvable path is refused rather than assumed safe.
+  `GET /api/inference/capabilities` exposes the effective classification of every
+  connected tool so the boundary can be audited rather than inferred.
+- **Per-workspace scoping of grants and data** (since 2.4.0, `crates/ghost-link/src/workspace.rs`):
+  tool grants, memories, RAG indexes, and schedules are scoped by
+  `workspace_id`, so a chat bound to workspace A cannot reach workspace B's files
+  or data. A client-supplied `workspace_id` selects *which* workspace's data
+  applies and never selects a filesystem root — the root remains
+  server-configured (`GHOSTLINK_WORKSPACE_ROOT`), because accepting a
+  caller-chosen root would hand out path traversal for free. Ids are sanitized and
+  length-bounded before use as a filename or database key. Path containment uses a
+  single shared `resolve_within` implementation, so the GUI's file routes and the
+  tool caller's scoping cannot drift into two different traversal checks.
+
 ## Threats and Risks
 
 - Discovery spoofing or replay on untrusted LAN segments.
