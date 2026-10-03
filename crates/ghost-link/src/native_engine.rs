@@ -15,8 +15,19 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::sleep as tokio_sleep;
 
-/// Stream of incremental text deltas from a native backend's chat endpoint.
-pub type NativeChatStream = Pin<Box<dyn Stream<Item = Result<String, String>> + Send>>;
+/// One item from a native chat stream: an incremental text delta, or a terminal
+/// marker that the model stopped because it hit the token budget
+/// (llama-server reports `finish_reason: "length"`). Surfaced the moment the
+/// backend reports it so the GUI can flag truncation without waiting for the
+/// final chunk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeChatEvent {
+    Delta(String),
+    Truncated,
+}
+
+/// Stream of incremental events from a native backend's chat endpoint.
+pub type NativeChatStream = Pin<Box<dyn Stream<Item = Result<NativeChatEvent, String>> + Send>>;
 
 #[derive(Debug, Clone)]
 pub struct NativeGeneration {
@@ -74,20 +85,45 @@ impl NativeEngineClient {
         }
     }
 
-    /// Default system prompt for both the non-streaming (`generate_with_llama_server`)
+    /// Static system prompt for both the non-streaming (`generate_with_llama_server`)
     /// and streaming (`generate_chat_stream`) chat paths. Small local models otherwise
     /// default to run-on, ungrammatical prose with no Markdown structure — spelling out
     /// formatting expectations here measurably improves readability since these models
     /// have no other source of style guidance (no fine-tuning on Ghostlink's own output).
-    fn default_system_prompt() -> String {
+    ///
+    /// **Must stay byte-identical across requests.** llama-server's `cache_prompt`
+    /// (prefix cache) only reuses a slot's KV state for a common prefix; any
+    /// per-request byte in this string — a timestamp, a request id — changes the
+    /// very first token and forces a full re-prefill of the entire conversation
+    /// on every turn. Everything genuinely dynamic therefore lives in
+    /// `dynamic_context_suffix()` and is appended to the *user* turn instead.
+    fn static_system_prompt() -> String {
+        "You are a helpful, precise assistant. Write clear, grammatically correct \
+         responses in clean Markdown: headings (#, ##, ###) on their own line with \
+         blank lines around them, lists for multiple items, **bold** labels before \
+         values, and fenced code blocks with a language tag. Keep prose tight — no \
+         run-on paragraphs."
+            .to_string()
+    }
+
+    /// Per-request dynamic context, appended to the user turn rather than the
+    /// system prompt so the cached system prefix stays stable (see
+    /// `static_system_prompt`). Models have no clock; this is what lets
+    /// questions like "what date is it today?" get a correct answer.
+    /// Portable chrono format (avoid %-d, which is Unix-only).
+    pub(crate) fn dynamic_context_suffix() -> String {
         format!(
-            "You are a helpful, precise assistant. Write clear, grammatically correct \
-             responses in clean Markdown: headings (#, ##, ###) on their own line with \
-             blank lines around them, lists for multiple items, **bold** labels before \
-             values, and fenced code blocks with a language tag. Keep prose tight — no \
-             run-on paragraphs. Current local date and time: {}.",
+            "[Context: current local date and time is {}]",
             chrono::Local::now().format("%A, %B %d, %Y, %H:%M")
         )
+    }
+
+    /// The user-turn content sent to a chat endpoint: the caller's prompt with
+    /// the dynamic context appended. Kept as one helper so every backend path
+    /// splits static/dynamic identically — Ollama/vLLM builders in `main.rs`
+    /// call this too, so the timestamp lives outside every cached prefix.
+    pub(crate) fn user_turn_with_context(cleaned_prompt: &str) -> String {
+        format!("{cleaned_prompt}\n\n{}", Self::dynamic_context_suffix())
     }
 
     /// Get or initialize the llama-server process handle
@@ -627,13 +663,44 @@ impl NativeEngineClient {
     /// .parallel_slots` by `load_settings()`, or set directly by a launch
     /// script). More than one slot lets llama-server serve concurrent
     /// generations instead of queueing them one at a time.
-    fn get_parallel_slots() -> usize {
+    ///
+    /// This is the authoritative slot count: it is what actually shaped the
+    /// running server's `-np`. Callers that need to pin a request to a slot
+    /// must use *this*, not `RuntimeSettings::parallel_slots` — the persisted
+    /// setting and the env var can disagree (the env var is only mirrored from
+    /// settings when unset), and pinning against the wrong count silently
+    /// disables pinning.
+    pub(crate) fn get_parallel_slots() -> usize {
         if let Ok(val) = std::env::var("GHOSTLINK_PARALLEL_SLOTS") {
             if let Ok(n) = val.trim().parse::<usize>() {
                 return n.clamp(1, 64);
             }
         }
         1
+    }
+
+    /// Stable llama-server slot for a conversation, so a returning multi-turn
+    /// session lands on the slot whose KV still holds its prefix and
+    /// `cache_prompt` actually hits. Without this, `id_slot: -1` (auto) lets
+    /// llama-server hand any free slot to the request — with `-np > 1` a
+    /// follow-up turn can be served by a slot whose cached prefix belongs to a
+    /// different conversation, silently turning a cache hit into a full
+    /// re-prefill (measured on the reference host: ~62ms hit vs ~103ms miss).
+    ///
+    /// Only meaningful when more than one slot exists: with `-np 1` there is
+    /// nothing to pin, so callers pass `None` and keep the old auto behavior
+    /// exactly. The hash is stable across processes (FNV-1a, not `DefaultHasher`,
+    /// whose seed is randomized per process).
+    pub(crate) fn slot_for_session(session_id: &str, parallel_slots: usize) -> Option<i64> {
+        if parallel_slots <= 1 || session_id.is_empty() {
+            return None;
+        }
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in session_id.as_bytes() {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        Some((hash % parallel_slots as u64) as i64)
     }
 
     /// Check if llama-server is healthy. `url` may be a base URL or a launcher URL
@@ -1082,7 +1149,59 @@ impl NativeEngineClient {
         drop(handle);
 
         eprintln!("[model-load] Successfully loaded model: {normalized_path}");
+
+        // Warm the freshly-loaded server with one throwaway generation. The
+        // first real request otherwise pays for graph/allocator/KV-slot setup
+        // that nothing else has triggered yet — measured on the reference host
+        // as a ~99ms first-token vs ~22-45ms once warm. Deliberately
+        // best-effort: a warmup failure must never fail a load that already
+        // proved itself healthy above. `load_model_into_slot` is sync, so the
+        // warmup is driven on the runtime it already uses for the health wait.
+        rt.block_on(Self::warmup_after_load(&base_url));
+
         Ok(())
+    }
+
+    /// Best-effort single-token generation against a just-loaded server.
+    /// `max_tokens: 1` keeps the cost to one prefill + one decode; the result
+    /// is discarded. Never propagates an error — the load is already confirmed
+    /// healthy by the caller.
+    async fn warmup_after_load(base_url: &str) {
+        let client = reqwest::Client::new();
+        let payload = serde_json::json!({
+            "model": "warmup",
+            "messages": [
+                {"role": "system", "content": Self::static_system_prompt()},
+                {"role": "user", "content": "warmup"},
+            ],
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "stream": false,
+            "cache_prompt": true,
+        });
+        let url = format!("{base_url}/v1/chat/completions");
+        match tokio::time::timeout(
+            Duration::from_secs(60),
+            client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .json(&payload)
+                .send(),
+        )
+        .await
+        {
+            Ok(Ok(resp)) if resp.status().is_success() => {
+                eprintln!("[model-load] Warmup generation completed");
+            }
+            Ok(Ok(resp)) => {
+                eprintln!(
+                    "[model-load] Warmup returned status {} (ignored)",
+                    resp.status()
+                );
+            }
+            Ok(Err(err)) => eprintln!("[model-load] Warmup request failed (ignored): {err}"),
+            Err(_) => eprintln!("[model-load] Warmup timed out after 60s (ignored)"),
+        }
     }
 
     /// Unload the current model by stopping llama-server (owned or external).
@@ -1136,6 +1255,10 @@ impl NativeEngineClient {
         // paths below, which build a single flat prompt string with no
         // chat-template concept.
         history: &[(String, String)],
+        // Condensed memory of turns trimmed out of the conversation budget.
+        // See `generate_with_llama_server`'s doc comment. Ignored by the
+        // llama_cpp/simulated paths below.
+        history_summary: Option<&str>,
         // See `generate_with_llama_server`'s doc comment. Ignored by the
         // llama_cpp/simulated paths below, which have no slot concept.
         id_slot: Option<i64>,
@@ -1176,6 +1299,7 @@ impl NativeEngineClient {
                         top_k,
                         repeat_penalty,
                         history,
+                        history_summary,
                         id_slot,
                         cache_prompt,
                         response_format,
@@ -1295,6 +1419,13 @@ impl NativeEngineClient {
         // fallback's flat prompt, between the system prompt and the current
         // `cleaned_prompt` turn.
         history: &[(String, String)],
+        // Condensed memory of turns that aged out of the conversation budget
+        // (see `handle_gui_chat`'s `session_summaries`). Sent as a *second*
+        // `system` message right after the static one when present — verified
+        // against llama-server's chat template, which honours an extra system
+        // turn. `None` for stateless callers and sessions with no trimmed
+        // history, which is the prior behavior exactly.
+        history_summary: Option<&str>,
         // Slot/context reuse: `id_slot` pins this generation to a specific
         // llama-server slot (-1, llama-server's own "any idle slot" sentinel,
         // when None) and `cache_prompt` lets llama-server reuse whatever KV
@@ -1316,20 +1447,26 @@ impl NativeEngineClient {
             .unwrap_or(60)
             .clamp(5, 300);
 
-        // Models have no clock; give them the current local date/time so
-        // questions like "what date is it today?" get a correct answer.
-        // Use portable chrono format (avoid %-d which is Unix-only).
-        let system_prompt = Self::default_system_prompt();
+        // Models have no clock; the current local date/time is appended to the
+        // user turn (not the system prompt) so the cached system prefix stays
+        // byte-identical across requests — see `static_system_prompt`.
+        let system_prompt = Self::static_system_prompt();
 
         // Try chat completion endpoint first (for models with chat templates)
         let chat_url = format!("{base_url}/v1/chat/completions");
 
         let mut chat_messages =
             vec![serde_json::json!({"role": "system", "content": system_prompt})];
+        if let Some(summary) = history_summary.filter(|s| !s.trim().is_empty()) {
+            chat_messages.push(serde_json::json!({
+                "role": "system",
+                "content": format!("Summary of earlier conversation:\n{}", summary.trim())
+            }));
+        }
         for (role, content) in history {
             chat_messages.push(serde_json::json!({"role": role, "content": content}));
         }
-        chat_messages.push(serde_json::json!({"role": "user", "content": cleaned_prompt}));
+        chat_messages.push(serde_json::json!({"role": "user", "content": Self::user_turn_with_context(cleaned_prompt)}));
 
         let mut chat_payload = serde_json::json!({
             "model": model,
@@ -1403,6 +1540,14 @@ impl NativeEngineClient {
         // models that fell through to this path specifically because they
         // don't understand structured `messages`.
         let mut completion_prompt = system_prompt.clone();
+        if let Some(summary) = history_summary.filter(|s| !s.trim().is_empty()) {
+            // No structured `messages` on this no-chat-template fallback, so
+            // the condensed memory is just a labelled block before the turns.
+            completion_prompt.push_str(&format!(
+                "\n\nSummary of earlier conversation: {}",
+                summary.trim()
+            ));
+        }
         for (role, content) in history {
             let label = if role.eq_ignore_ascii_case("assistant") {
                 "Assistant"
@@ -1411,7 +1556,10 @@ impl NativeEngineClient {
             };
             completion_prompt.push_str(&format!("\n\n{label}: {content}"));
         }
-        completion_prompt.push_str(&format!("\n\nUser: {cleaned_prompt}\n\nAssistant:"));
+        completion_prompt.push_str(&format!(
+            "\n\nUser: {}\n\nAssistant:",
+            Self::user_turn_with_context(cleaned_prompt)
+        ));
 
         let completion_payload = serde_json::json!({
             "model": model,
@@ -1479,6 +1627,8 @@ impl NativeEngineClient {
         top_k: usize,
         repeat_penalty: f32,
         history: &[(String, String)],
+        // See `generate_with_llama_server`'s `history_summary`.
+        history_summary: Option<&str>,
         id_slot: Option<i64>,
         cache_prompt: bool,
         response_format: Option<serde_json::Value>,
@@ -1508,15 +1658,21 @@ impl NativeEngineClient {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(60)
             .clamp(5, 300);
-        let system_prompt = Self::default_system_prompt();
+        let system_prompt = Self::static_system_prompt();
         let chat_url = format!("{base_url}/v1/chat/completions");
 
         let mut chat_messages =
             vec![serde_json::json!({"role": "system", "content": system_prompt})];
+        if let Some(summary) = history_summary.filter(|s| !s.trim().is_empty()) {
+            chat_messages.push(serde_json::json!({
+                "role": "system",
+                "content": format!("Summary of earlier conversation:\n{}", summary.trim())
+            }));
+        }
         for (role, content) in history {
             chat_messages.push(serde_json::json!({"role": role, "content": content}));
         }
-        chat_messages.push(serde_json::json!({"role": "user", "content": cleaned_prompt}));
+        chat_messages.push(serde_json::json!({"role": "user", "content": Self::user_turn_with_context(cleaned_prompt)}));
 
         let mut chat_payload = serde_json::json!({
             "model": model,
@@ -1574,12 +1730,13 @@ impl NativeEngineClient {
                     top_k,
                     repeat_penalty,
                     history,
+                    history_summary,
                     id_slot,
                     cache_prompt,
                     response_format,
                 )
                 .await?;
-            let single = futures::stream::once(async move { Ok(gen.text) });
+            let single = futures::stream::once(async move { Ok(NativeChatEvent::Delta(gen.text)) });
             return Ok(Box::pin(single));
         }
 
@@ -1592,7 +1749,7 @@ impl NativeEngineClient {
             ));
         }
 
-        let (tx, rx) = mpsc::channel::<Result<String, String>>(100);
+        let (tx, rx) = mpsc::channel::<Result<NativeChatEvent, String>>(100);
         tokio::spawn(async move {
             let mut byte_stream = response.bytes_stream();
             let mut buf = String::new();
@@ -1634,12 +1791,27 @@ impl NativeEngineClient {
                     if let Some(choice) = data.choices.first() {
                         if let Some(delta) = &choice.delta {
                             if let Some(text) = &delta.content {
-                                if !text.is_empty() && tx.send(Ok(text.clone())).await.is_err() {
+                                if !text.is_empty()
+                                    && tx
+                                        .send(Ok(NativeChatEvent::Delta(text.clone())))
+                                        .await
+                                        .is_err()
+                                {
                                     return; // receiver dropped, stop reading
                                 }
                             }
                         }
-                        if choice.finish_reason.as_ref().is_some_and(|r| !r.is_null()) {
+                        if let Some(reason) = choice.finish_reason.as_ref().filter(|r| !r.is_null())
+                        {
+                            // "length" means the model was cut off at
+                            // max_tokens, not that it chose to stop — report
+                            // truncation the moment the backend says so,
+                            // rather than only on the terminal done-chunk.
+                            if reason.as_str() == Some("length")
+                                && tx.send(Ok(NativeChatEvent::Truncated)).await.is_err()
+                            {
+                                return;
+                            }
                             return;
                         }
                     }
@@ -1809,12 +1981,83 @@ fn extract_generation_text(stdout: &str, stderr: &str, prompt: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::NativeEngineClient;
+    use super::{NativeChatEvent, NativeEngineClient};
     use std::sync::{Mutex, OnceLock};
 
     fn env_lock() -> &'static Mutex<()> {
         static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// The static system prompt is the cached prefix llama-server reuses for
+    /// `cache_prompt`. It must not embed a timestamp (or anything else that
+    /// changes between requests), or the prefix cache can never hit.
+    #[test]
+    fn static_system_prompt_is_stable_and_has_no_timestamp() {
+        let first = NativeEngineClient::static_system_prompt();
+        // Sleep past a minute boundary so a per-request `chrono::Local::now()`
+        // would demonstrably differ if it had not been split out.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let second = NativeEngineClient::static_system_prompt();
+        assert_eq!(
+            first, second,
+            "system prompt must be byte-identical across calls"
+        );
+        assert!(
+            !first.contains("Current local date and time"),
+            "timestamp must not live in the cached system prefix"
+        );
+        // No digits at all: a date/time interpolation always introduces some.
+        assert!(
+            !first.chars().any(|c| c.is_ascii_digit()),
+            "static system prompt unexpectedly contains digits: {first}"
+        );
+    }
+
+    /// The dynamic date/time must actually reach the model, just outside the
+    /// cached system prefix (appended to the user turn).
+    #[test]
+    fn user_turn_appends_dynamic_context_outside_system_prompt() {
+        let turn = NativeEngineClient::user_turn_with_context("Hello there");
+        assert!(turn.starts_with("Hello there\n\n[Context: current local date and time is "));
+        assert!(turn.ends_with(']'));
+    }
+
+    /// With a single slot there is nothing to pin — must keep llama-server's
+    /// own auto (`-1`) behavior exactly as before.
+    #[test]
+    fn slot_for_session_is_none_with_a_single_slot() {
+        assert_eq!(NativeEngineClient::slot_for_session("sess_a", 1), None);
+        assert_eq!(NativeEngineClient::slot_for_session("sess_a", 0), None);
+        assert_eq!(NativeEngineClient::slot_for_session("", 8), None);
+    }
+
+    /// Same conversation must always map to the same slot (that is the whole
+    /// point — a stable prefix cache), stay in range, and be a *stable* value
+    /// across processes (FNV-1a, not a randomized hasher).
+    #[test]
+    fn slot_for_session_is_stable_in_range_and_spreads() {
+        let slots = 8usize;
+        let a1 = NativeEngineClient::slot_for_session("sess_alpha", slots);
+        let a2 = NativeEngineClient::slot_for_session("sess_alpha", slots);
+        assert_eq!(a1, a2, "same session must map to the same slot");
+        assert!(a1.unwrap() >= 0 && (a1.unwrap() as usize) < slots);
+
+        // Pin an exact value so a change to the hash is caught: a per-process
+        // randomized hasher would make this flaky instead of deterministic.
+        assert_eq!(
+            NativeEngineClient::slot_for_session("sess_local_001", 8),
+            Some(3)
+        );
+
+        // Different sessions should not all collapse onto one slot.
+        let distinct: std::collections::HashSet<i64> = (0..32)
+            .map(|i| NativeEngineClient::slot_for_session(&format!("sess_{i}"), slots).unwrap())
+            .collect();
+        assert!(
+            distinct.len() > 1,
+            "slot mapping collapsed every session onto one slot: {distinct:?}"
+        );
     }
 
     #[test]
@@ -1954,6 +2197,7 @@ mod tests {
                     1.1,
                     &[],
                     None,
+                    None,
                     false,
                     None,
                 )
@@ -1965,10 +2209,12 @@ mod tests {
             let start = std::time::Instant::now();
             let mut full_text = String::new();
             while let Some(item) = stream.next().await {
-                let text = item.expect("chunk should not error");
+                let event = item.expect("chunk should not error");
                 chunk_count += 1;
                 chunk_times.push(start.elapsed());
-                full_text.push_str(&text);
+                if let NativeChatEvent::Delta(text) = event {
+                    full_text.push_str(&text);
+                }
             }
             eprintln!("received {chunk_count} chunks over {:?}", start.elapsed());
             eprintln!("first few chunk arrival times: {:?}", &chunk_times[..chunk_times.len().min(5)]);
@@ -2003,6 +2249,7 @@ mod tests {
                         1.1,
                         "simulated",
                         &[],
+                        None,
                         None,
                         false,
                         None,
@@ -2087,6 +2334,7 @@ mod tests {
                         1.1,
                         "llama_server",
                         &[],
+                        None,
                         Some(0),
                         true,
                         None,
@@ -2165,6 +2413,7 @@ mod tests {
                     "llama_server",
                     &history,
                     None,
+                    None,
                     false,
                     None,
                 )
@@ -2192,7 +2441,25 @@ mod tests {
         assert_eq!(messages[2]["role"], "assistant");
         assert_eq!(messages[2]["content"], "Paris.");
         assert_eq!(messages[3]["role"], "user");
-        assert_eq!(messages[3]["content"], "and its population?");
+        // The new user turn carries the prompt plus the dynamic date/time
+        // context appended outside the cached system prefix.
+        let user_turn = messages[3]["content"]
+            .as_str()
+            .expect("user turn content should be a string");
+        assert!(
+            user_turn
+                .starts_with("and its population?\n\n[Context: current local date and time is "),
+            "unexpected user turn: {user_turn}"
+        );
+        // The cached system prefix must stay free of the per-request timestamp.
+        assert_eq!(
+            messages[0]["content"],
+            NativeEngineClient::static_system_prompt()
+        );
+        assert!(!messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("current local date and time"));
 
         std::env::remove_var("GHOSTLINK_LLAMA_SERVER_URL");
     }
@@ -2218,6 +2485,7 @@ mod tests {
                         1.1,
                         "llama_cpp",
                         &[],
+                        None,
                         None,
                         false,
                         None,

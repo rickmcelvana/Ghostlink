@@ -939,6 +939,109 @@ mod tests {
         assert_eq!(client.base_url, "http://localhost:11434");
     }
 
+    /// `chat_stream` is the real streaming path the GUI's Ollama branch now
+    /// uses, but it had no coverage at all. Drive it against a real socket
+    /// that speaks Ollama's newline-delimited JSON, and assert the deltas
+    /// arrive incrementally (in order, last one `done`) rather than being
+    /// buffered until the end.
+    #[tokio::test]
+    async fn chat_stream_yields_incremental_deltas_in_order() {
+        use futures::StreamExt;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            // Read the request headers+body (we don't assert on it here).
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+
+            // Ollama streams one JSON object per line, each carrying the
+            // cumulative message content for that chunk.
+            let frames = [
+                json!({"model":"m","created_at":"t","message":{"role":"assistant","content":"Hel"},"done":false}),
+                json!({"model":"m","created_at":"t","message":{"role":"assistant","content":"lo "},"done":false}),
+                json!({"model":"m","created_at":"t","message":{"role":"assistant","content":"world"},"done":false}),
+                json!({"model":"m","created_at":"t","message":{"role":"assistant","content":""},"done":true}),
+            ];
+            let body: String = frames.iter().map(|f| format!("{f}\n")).collect();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let client = OllamaClient::new(format!("http://{addr}"));
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "hi".to_string(),
+            tool_calls: None,
+        }];
+        let mut stream = client
+            .chat_stream("m", &messages, Some(0.0), None, None, None, Some(16))
+            .await
+            .expect("chat_stream should start");
+
+        let mut chunks = Vec::new();
+        while let Some(item) = stream.next().await {
+            let resp = item.expect("chunk should not error");
+            chunks.push((resp.message.content.clone(), resp.done));
+        }
+        server.join().unwrap();
+
+        assert_eq!(
+            chunks,
+            vec![
+                ("Hel".to_string(), false),
+                ("lo ".to_string(), false),
+                ("world".to_string(), false),
+                (String::new(), true),
+            ],
+            "deltas must arrive one per frame, in order, terminated by done"
+        );
+    }
+
+    /// An HTTP error must surface as `Err` from `chat_stream`, not as an
+    /// empty-but-Ok stream (a previously-fixed class of bug in this module).
+    #[tokio::test]
+    async fn chat_stream_surfaces_http_error_instead_of_empty_stream() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = "model not found";
+            let response = format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let client = OllamaClient::new(format!("http://{addr}"));
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "hi".to_string(),
+            tool_calls: None,
+        }];
+        let result = client
+            .chat_stream("missing", &messages, None, None, None, None, None)
+            .await;
+        server.join().unwrap();
+
+        assert!(result.is_err(), "a 404 must be an Err, not an Ok stream");
+    }
+
     #[test]
     fn chat_request_nests_sampling_params_under_options() {
         fn assert_json_number_close(value: &Value, expected: f64, label: &str) {

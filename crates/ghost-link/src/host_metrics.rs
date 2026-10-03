@@ -71,6 +71,13 @@ pub struct InferenceSnapshot {
     pub last_tokens: u32,
     pub samples: usize,
     pub real_inference: bool,
+    /// Time to first token (streaming only) — p50/p95 over recorded samples.
+    /// `0.0` when no streaming sample has been recorded yet (e.g. Ollama/vLLM,
+    /// which have no incremental path — see `record_ttft`).
+    pub ttft_p50_ms: f32,
+    pub ttft_p95_ms: f32,
+    pub last_ttft_ms: f32,
+    pub ttft_samples: usize,
 }
 
 impl Default for InferenceSnapshot {
@@ -83,6 +90,10 @@ impl Default for InferenceSnapshot {
             last_tokens: 0,
             samples: 0,
             real_inference: false,
+            ttft_p50_ms: 0.0,
+            ttft_p95_ms: 0.0,
+            last_ttft_ms: 0.0,
+            ttft_samples: 0,
         }
     }
 }
@@ -94,6 +105,11 @@ pub struct InferenceMetrics {
     last_latency_ms: f32,
     last_tokens: u32,
     last_real: bool,
+    /// Time-to-first-token samples, streaming path only. Bounded like
+    /// `latency_ms`; kept separate so a slow prefill doesn't skew decode
+    /// latency percentiles.
+    ttft_ms: VecDeque<f32>,
+    last_ttft_ms: f32,
 }
 
 impl Default for InferenceMetrics {
@@ -104,6 +120,8 @@ impl Default for InferenceMetrics {
             last_latency_ms: 0.0,
             last_tokens: 0,
             last_real: false,
+            ttft_ms: VecDeque::with_capacity(LATENCY_SAMPLES_CAP),
+            last_ttft_ms: 0.0,
         }
     }
 }
@@ -152,8 +170,23 @@ impl InferenceMetrics {
         }
     }
 
+    /// Record a time-to-first-token measurement (streaming path only). Called
+    /// once per streamed turn, at the moment the first delta arrives — distinct
+    /// from `record`'s total-generation latency, and not fed into the
+    /// throughput EMA. A `0`-token or failed attempt never reaches here, so
+    /// callers should only call it on a real first token.
+    pub fn record_ttft(&mut self, ttft_ms: f32) {
+        let ttft_ms = ttft_ms.max(0.1);
+        self.last_ttft_ms = ttft_ms;
+        if self.ttft_ms.len() >= LATENCY_SAMPLES_CAP {
+            self.ttft_ms.pop_front();
+        }
+        self.ttft_ms.push_back(ttft_ms);
+    }
+
     pub fn snapshot(&self) -> InferenceSnapshot {
         let (p50, p95) = percentiles_ms(&self.latency_ms);
+        let (ttft_p50, ttft_p95) = percentiles_ms(&self.ttft_ms);
         InferenceSnapshot {
             tokens_per_sec: self.tokens_per_sec_ema,
             latency_p50_ms: if p50 > 0.0 { p50 } else { self.last_latency_ms },
@@ -168,6 +201,10 @@ impl InferenceMetrics {
             last_tokens: self.last_tokens,
             samples: self.latency_ms.len(),
             real_inference: self.last_real,
+            ttft_p50_ms: ttft_p50,
+            ttft_p95_ms: ttft_p95,
+            last_ttft_ms: self.last_ttft_ms,
+            ttft_samples: self.ttft_ms.len(),
         }
     }
 }

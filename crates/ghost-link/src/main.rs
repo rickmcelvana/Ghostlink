@@ -1694,7 +1694,39 @@ struct BackendState {
     /// delete handlers so a change is visible immediately rather than
     /// waiting out the TTL.
     models_scan_cache: ApiResponseCache,
+    /// Per-session running summary of turns that have aged out of
+    /// `conversation_token_limit`, keyed by session id.
+    ///
+    /// History past the budget used to be dropped FIFO with no trace — a long
+    /// conversation silently forgot its own beginning. Instead, when
+    /// `handle_gui_chat` trims a session's history it stores the dropped turns
+    /// here and a background task folds them into this running summary; the
+    /// summary is then prepended to later requests as a second `system`
+    /// message, so the model keeps a compressed memory of what was cut.
+    ///
+    /// In-memory only (resets on restart, like `pending_tool_calls`) — a
+    /// durable store is a bigger step than this pass takes. Bounded to
+    /// `SUMMARY_MAX_SESSIONS` entries, least-recently-updated evicted first.
+    session_summaries: HashMap<String, SessionSummary>,
 }
+
+/// A session's running summary of trimmed turns (see
+/// `BackendState::session_summaries`).
+#[derive(Debug, Clone, Default)]
+struct SessionSummary {
+    /// The condensed text prepended as a second system message.
+    text: String,
+    /// Total turns folded into `text` so far.
+    turns_summarized: usize,
+    /// When the summary last changed — drives LRU eviction.
+    updated_at: Option<Instant>,
+}
+
+/// Cap on the number of sessions whose summaries are retained in memory.
+const SUMMARY_MAX_SESSIONS: usize = 64;
+/// Cap on the summary's own length (characters), so a long conversation's
+/// condensed memory cannot itself grow without bound.
+const SUMMARY_MAX_CHARS: usize = 4000;
 
 fn record_audit_event(
     backend: &mut BackendState,
@@ -2624,6 +2656,7 @@ async fn native_tool_loop_core(
                 native_engine,
                 history,
                 None,
+                None,
                 false,
                 None,
             )
@@ -3053,7 +3086,9 @@ async fn run_ollama_chat(
 ) -> Result<OllamaLoopStep, String> {
     let messages = vec![ollama::ChatMessage {
         role: "user".to_string(),
-        content: user_message.to_string(),
+        // Dynamic date/time goes in the user turn, never a cached system
+        // prefix — see NativeEngineClient::user_turn_with_context.
+        content: native_engine::NativeEngineClient::user_turn_with_context(user_message),
         tool_calls: None,
     }];
 
@@ -3354,7 +3389,9 @@ async fn run_vllm_chat(
     tools: &[mcp::McpToolSchema],
     response_format: Option<serde_json::Value>,
 ) -> Result<VllmLoopStep, String> {
-    let messages = vec![serde_json::json!({ "role": "user", "content": user_message })];
+    let messages = vec![
+        serde_json::json!({ "role": "user", "content": native_engine::NativeEngineClient::user_turn_with_context(user_message) }),
+    ];
 
     let openai_tools = if tools.is_empty() {
         None
@@ -3536,15 +3573,107 @@ fn load_persistent_sessions() -> Vec<SessionRecord> {
     if path.exists() {
         if let Ok(data) = fs::read_to_string(path) {
             if let Ok(sessions) = serde_json::from_str::<Vec<SessionRecord>>(&data) {
-                return sessions;
+                // Startup cleanup: bound what a long-lived deployment's
+                // sessions.json can hand back to the in-memory list.
+                return prune_sessions_for_persistence(&sessions);
             }
         }
     }
     vec![]
 }
 
+/// A session's last activity time, falling back to its creation time. `0`
+/// means "unknown" (a legacy record written before timestamps existed).
+fn session_activity_ts(session: &SessionRecord) -> u64 {
+    if session.last_active_at > 0 {
+        session.last_active_at
+    } else {
+        session.created_at
+    }
+}
+
+/// Bound `sessions.json` growth. Two independent caps, both env-tunable:
+/// `GHOSTLINK_SESSION_MAX_AGE_DAYS` (default 30, `0` disables) drops sessions
+/// whose last activity is older than that, and `GHOSTLINK_SESSION_MAX_BYTES`
+/// (default 20 MB, `0` disables) drops the least-recently-active survivors
+/// until the serialized set fits.
+///
+/// The current conversation is never dropped: the newest session by activity
+/// time — and the well-known live id `sess_local_001` — are always protected,
+/// even when the byte cap would otherwise evict them. Returns the pruned set;
+/// callers keep the full in-memory list, only the persisted copy is bounded.
+fn prune_sessions_for_persistence(sessions: &[SessionRecord]) -> Vec<SessionRecord> {
+    let max_age_days = std::env::var("GHOSTLINK_SESSION_MAX_AGE_DAYS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(30);
+    let max_bytes = std::env::var("GHOSTLINK_SESSION_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(20_000_000);
+
+    let now_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Protect the current session: the live id, plus the most recently active
+    // one (only meaningful when timestamps are actually present).
+    let newest_active = sessions.iter().map(session_activity_ts).max().unwrap_or(0);
+    let is_protected = |s: &SessionRecord| -> bool {
+        s.id == "sess_local_001" || (newest_active > 0 && session_activity_ts(s) == newest_active)
+    };
+
+    let max_age_secs = max_age_days.saturating_mul(86_400);
+    let mut survivors: Vec<SessionRecord> = sessions
+        .iter()
+        .filter(|s| {
+            if max_age_days == 0 || is_protected(s) {
+                return true;
+            }
+            let ts = session_activity_ts(s);
+            // Unknown age — keep rather than guess.
+            ts == 0 || now_s.saturating_sub(ts) <= max_age_secs
+        })
+        .cloned()
+        .collect();
+
+    if max_bytes > 0 {
+        let per_session_bytes =
+            |s: &SessionRecord| serde_json::to_string(s).map(|d| d.len() + 1).unwrap_or(0);
+        let mut total: usize = survivors.iter().map(per_session_bytes).sum();
+
+        // Least-recently-active first.
+        let mut evictable: Vec<usize> = (0..survivors.len())
+            .filter(|&i| !is_protected(&survivors[i]))
+            .collect();
+        evictable.sort_by_key(|&i| session_activity_ts(&survivors[i]));
+
+        let mut dropped = std::collections::HashSet::new();
+        for &i in &evictable {
+            if total <= max_bytes {
+                break;
+            }
+            total = total.saturating_sub(per_session_bytes(&survivors[i]));
+            dropped.insert(i);
+        }
+
+        survivors = survivors
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| !dropped.contains(i))
+            .map(|(_, s)| s)
+            .collect();
+    }
+
+    survivors
+}
+
 fn save_persistent_sessions(sessions: &[SessionRecord]) {
-    if let Ok(data) = serde_json::to_string_pretty(sessions) {
+    // Persist a bounded copy; the in-memory list is left untouched so live
+    // sessions stay visible to /api/sessions for this process's lifetime.
+    let pruned = prune_sessions_for_persistence(sessions);
+    if let Ok(data) = serde_json::to_string_pretty(&pruned) {
         let _ = fs::write(sessions_path(), data);
     }
 }
@@ -4323,6 +4452,98 @@ async fn auth_middleware(
     next.run(req).await
 }
 
+/// Turns that `trim_conversation_history_async` dropped, oldest first —
+/// i.e. everything before the kept suffix. These are what gets folded into
+/// the session's running summary.
+fn dropped_turns(prior: &[ChatHistoryTurn], kept_len: usize) -> Vec<(String, String)> {
+    let dropped_count = prior.len().saturating_sub(kept_len);
+    prior[..dropped_count]
+        .iter()
+        .map(|t| (t.role.clone(), t.content.clone()))
+        .collect()
+}
+
+/// Builds the prompt that asks the model to fold `new_turns` into the
+/// existing `running_summary`. Kept deliberately conservative — the point
+/// is a compact, faithful memory, not a rewrite.
+fn build_summary_prompt(running_summary: &str, new_turns: &[(String, String)]) -> String {
+    let mut out = String::new();
+    if running_summary.trim().is_empty() {
+        out.push_str(
+            "You maintain a memory of a conversation for a local assistant. \
+             Condense the transcript below into a compact factual summary. \
+             Preserve names, decisions, code/file names, numbers, and any \
+             commitments. Omit pleasantries. Write plain prose, no headings.\n\n",
+        );
+    } else {
+        out.push_str(
+            "You maintain a memory of a conversation for a local assistant. \
+             Below is an existing summary followed by newer transcript lines. \
+             Rewrite them as one compact factual summary. Preserve names, \
+             decisions, code/file names, numbers, and commitments. Omit \
+             pleasantries. Write plain prose, no headings.\n\n",
+        );
+        out.push_str("Existing summary:\n");
+        out.push_str(running_summary.trim());
+        out.push_str("\n\nNewer transcript:\n");
+    }
+    for (role, content) in new_turns {
+        let label = if role.eq_ignore_ascii_case("assistant") {
+            "Assistant"
+        } else {
+            "User"
+        };
+        // Bound each turn so one huge pasted message cannot blow the
+        // summarizer's own context.
+        let trimmed: String = content.chars().take(2000).collect();
+        out.push_str(&format!("{label}: {trimmed}\n"));
+    }
+    out.push_str("\nSummary:");
+    out
+}
+
+/// Stores a session's summary, evicting the least-recently-updated entries
+/// once `SUMMARY_MAX_SESSIONS` is exceeded, and trimming the text itself to
+/// `SUMMARY_MAX_CHARS` so a long conversation's condensed memory cannot
+/// grow without bound.
+fn put_session_summary(
+    summaries: &mut HashMap<String, SessionSummary>,
+    session_id: &str,
+    text: String,
+    turns_added: usize,
+) {
+    let capped = if text.chars().count() > SUMMARY_MAX_CHARS {
+        let tail: String = text
+            .chars()
+            .rev()
+            .take(SUMMARY_MAX_CHARS)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        tail
+    } else {
+        text
+    };
+
+    let entry = summaries.entry(session_id.to_string()).or_default();
+    entry.text = capped;
+    entry.turns_summarized += turns_added;
+    entry.updated_at = Some(Instant::now());
+
+    if summaries.len() > SUMMARY_MAX_SESSIONS {
+        let mut by_age: Vec<(String, Option<Instant>)> = summaries
+            .iter()
+            .map(|(k, v)| (k.clone(), v.updated_at))
+            .collect();
+        by_age.sort_by_key(|(_, ts)| *ts);
+        let excess = summaries.len() - SUMMARY_MAX_SESSIONS;
+        for (key, _) in by_age.into_iter().take(excess) {
+            summaries.remove(&key);
+        }
+    }
+}
+
 fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
     use axum::{
         extract::{ConnectInfo, Extension, Path, Query, State},
@@ -4795,6 +5016,7 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                     &settings.native_engine,
                     &[],
                     None,
+                    None,
                     false,
                     None,
                 )
@@ -5142,6 +5364,7 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                     // Stateless endpoint, no session to pin a slot to —
                     // matches handle_chat_completions' same behavior.
                     &[],
+                    None,
                     None,
                     false,
                     None,
@@ -6706,6 +6929,10 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                 "samples": inf.samples,
                 "last_latency_ms": inf.last_latency_ms,
                 "last_tokens": inf.last_tokens,
+                "ttft_p50_ms": inf.ttft_p50_ms,
+                "ttft_p95_ms": inf.ttft_p95_ms,
+                "last_ttft_ms": inf.last_ttft_ms,
+                "ttft_samples": inf.ttft_samples,
                 "uptime_s": uptime_s,
                 "inference_backend": backend_name,
             }
@@ -6802,6 +7029,18 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             "ghostlink_inference_latency_p95_milliseconds",
             "Inference latency, 95th percentile over the recent sample window.",
             inf.latency_p95_ms,
+        );
+        gauge(
+            &mut body,
+            "ghostlink_inference_ttft_p50_milliseconds",
+            "Time to first token, 50th percentile (streaming path only; 0 until a streamed turn completes).",
+            inf.ttft_p50_ms,
+        );
+        gauge(
+            &mut body,
+            "ghostlink_inference_ttft_p95_milliseconds",
+            "Time to first token, 95th percentile (streaming path only; 0 until a streamed turn completes).",
+            inf.ttft_p95_ms,
         );
         gauge(
             &mut body,
@@ -8218,6 +8457,82 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         (kept, truncated)
     }
 
+    /// Generates a summary for `new_turns` and folds it into `session_id`'s
+    /// running summary. Runs detached from the request path (spawned by the
+    /// caller) so a chat turn never waits on an extra generation.
+    ///
+    /// Best-effort: if the model is unavailable or errors, the running summary
+    /// is left exactly as it was — the dropped turns are simply not remembered
+    /// this round, which is no worse than the previous FIFO behavior.
+    async fn summarize_dropped_turns(
+        state: Arc<Mutex<BackendState>>,
+        session_id: String,
+        new_turns: Vec<(String, String)>,
+    ) {
+        if new_turns.is_empty() {
+            return;
+        }
+
+        let (native_engine_client, model, engine_kind, running_summary) = {
+            let backend = lock_state(&state);
+            let summary = backend
+                .session_summaries
+                .get(&session_id)
+                .map(|s| s.text.clone())
+                .unwrap_or_default();
+            (
+                backend.native_engine_client.clone(),
+                backend.current_model.clone(),
+                backend.settings.native_engine.clone(),
+                summary,
+            )
+        };
+
+        let prompt = build_summary_prompt(&running_summary, &new_turns);
+        // Small, bounded generation — a summary is short by construction.
+        let generated = native_engine_client
+            .generate(
+                &model,
+                &prompt,
+                512,
+                0.2,
+                0.9,
+                40,
+                1.1,
+                &engine_kind,
+                &[],
+                None,
+                None,
+                false,
+                None,
+            )
+            .await;
+
+        match generated {
+            Ok(gen) if gen.real_inference && !gen.text.trim().is_empty() => {
+                let mut backend = lock_state(&state);
+                put_session_summary(
+                    &mut backend.session_summaries,
+                    &session_id,
+                    gen.text.trim().to_string(),
+                    new_turns.len(),
+                );
+            }
+            Ok(_) => {
+                tracing::debug!(
+                    session_id,
+                    "summarization produced no usable text; keeping prior summary"
+                );
+            }
+            Err(err) => {
+                tracing::debug!(
+                    session_id,
+                    "summarization failed ({err}); keeping prior summary"
+                );
+            }
+        }
+    }
+
     // `inference_generate` span covers the whole chat turn (including any
     // tool-calling round trips, not just the raw generate call) — this
     // handler has multiple `.generate()` call sites across its
@@ -8323,6 +8638,12 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         }
 
         let token_estimate = req.message.split_whitespace().count().clamp(1, 1024);
+        // Session id this turn belongs to — also the key for the running
+        // summary of any turns trimmed below.
+        let chat_session_id = req
+            .session_id
+            .clone()
+            .unwrap_or_else(|| "sess_local_001".to_string());
         let (history_turns, history_truncated) = trim_conversation_history_async(
             &native_engine_client,
             matches!(inference_backend, InferenceEngine::Native),
@@ -8330,10 +8651,51 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             settings.conversation_token_limit,
         )
         .await;
+
+        // If trimming dropped turns, fold them into this session's running
+        // summary instead of losing them. The generation runs detached so this
+        // request never waits on it; the summary applies from the next turn.
+        if history_truncated {
+            let prior = req
+                .messages
+                .as_deref()
+                .map(|m| &m[..m.len().saturating_sub(1)])
+                .unwrap_or(&[]);
+            let dropped = dropped_turns(prior, history_turns.len());
+            if !dropped.is_empty() {
+                let summary_state = Arc::clone(&state);
+                let summary_session = chat_session_id.clone();
+                tokio::spawn(async move {
+                    summarize_dropped_turns(summary_state, summary_session, dropped).await;
+                });
+            }
+        }
+
+        // The session's existing condensed memory, prepended as a second
+        // system message (verified against llama-server's chat template —
+        // a summary in an extra system turn is honoured).
+        let session_summary = {
+            let backend = lock_state(&state);
+            backend
+                .session_summaries
+                .get(&chat_session_id)
+                .map(|s| s.text.clone())
+                .filter(|t| !t.trim().is_empty())
+        };
         let temp = req.temperature.unwrap_or(settings.temperature);
         let top_p = req.top_p.unwrap_or(settings.top_p);
         let top_k = req.top_k.unwrap_or(settings.top_k);
         let penalty = req.penalty.unwrap_or(settings.repeat_penalty);
+        // Pin this conversation to a stable llama-server slot so its cached
+        // prefix survives across turns (see NativeEngineClient::slot_for_session).
+        // Uses the engine's own slot count — the value that actually shaped the
+        // running server's `-np` — not `settings.parallel_slots`, which can lag
+        // behind it. `None` when there is only one slot, keeping the old auto
+        // behavior exactly.
+        let chat_slot = native_engine::NativeEngineClient::slot_for_session(
+            req.session_id.as_deref().unwrap_or("sess_local_001"),
+            native_engine::NativeEngineClient::get_parallel_slots(),
+        );
         let requested_exec_tokens = req
             .max_tokens
             .unwrap_or(settings.max_tokens)
@@ -8426,6 +8788,199 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                                     Err(err) => {
                                         let fallback = format!(
                                             "Ollama chat failed for model '{}': {}",
+                                            model_name, err
+                                        );
+                                        (fallback, false, InferenceEngine::Ollama.as_str())
+                                    }
+                                }
+                            } else if req.stream.unwrap_or(false) {
+                                // Real incremental streaming from Ollama's
+                                // /api/chat. Previously this path always called
+                                // the non-streaming `generate` and the handler
+                                // faked a token stream from the finished
+                                // string — the user saw no output until the
+                                // whole answer existed. `chat_stream` was
+                                // implemented but never called from anywhere.
+                                use futures::StreamExt;
+                                let messages = vec![ollama::ChatMessage {
+                                    role: "user".to_string(),
+                                    content: native_engine::NativeEngineClient::user_turn_with_context(
+                                        &req.message,
+                                    ),
+                                    tool_calls: None,
+                                }];
+                                // `chat_stream`'s error type is `Box<dyn Error>`,
+                                // which is not `Send` — convert it to a String
+                                // *before* the match so it is not held across
+                                // the `Ok` arm's awaits (that would make this
+                                // handler's future non-Send and axum would
+                                // reject the route).
+                                let stream_result = ollama_client
+                                    .chat_stream(
+                                        &model_name,
+                                        &messages,
+                                        Some(temp),
+                                        Some(top_p),
+                                        Some(top_k),
+                                        Some(penalty),
+                                        Some(exec_tokens),
+                                    )
+                                    .await
+                                    .map_err(|e| e.to_string());
+                                match stream_result {
+                                    Ok(mut stream) => {
+                                        if model_name != current_model {
+                                            let mut backend = lock_state(&state);
+                                            backend.current_model = model_name.clone();
+                                        }
+                                        let request_id_str =
+                                            format!("req-{}", uuid::Uuid::new_v4());
+                                        let state_clone = Arc::clone(&state);
+                                        let (tx, rx) = tokio::sync::mpsc::channel::<
+                                            Result<Event, Infallible>,
+                                        >(100);
+                                        let first_token_timeout_secs = std::env::var(
+                                            "GHOSTLINK_FIRST_TOKEN_TIMEOUT_SECS",
+                                        )
+                                        .ok()
+                                        .and_then(|v| v.parse::<u64>().ok())
+                                        .unwrap_or(30);
+
+                                        tokio::spawn(async move {
+                                            let stream_started = Instant::now();
+                                            let mut first_token_ms: Option<f32> = None;
+                                            let mut accumulated_tokens: u32 = 0;
+                                            loop {
+                                                let next = if first_token_ms.is_none()
+                                                    && first_token_timeout_secs > 0
+                                                {
+                                                    match tokio::time::timeout(
+                                                        Duration::from_secs(
+                                                            first_token_timeout_secs,
+                                                        ),
+                                                        stream.next(),
+                                                    )
+                                                    .await
+                                                    {
+                                                        Ok(item) => item,
+                                                        Err(_) => {
+                                                            let msg = format!(
+                                                                " [stream error: no first token within {first_token_timeout_secs}s]"
+                                                            );
+                                                            let escaped =
+                                                                serde_json::to_string(&msg)
+                                                                    .unwrap_or_else(|_| {
+                                                                        String::from("\"\"")
+                                                                    });
+                                                            let _ = tx
+                                                                .send(Ok(Event::default().data(
+                                                                    format!(
+                                                                        r#"{{"token":{},"request_id":"{}","error":true}}"#,
+                                                                        escaped, request_id_str
+                                                                    ),
+                                                                )))
+                                                                .await;
+                                                            break;
+                                                        }
+                                                    }
+                                                } else {
+                                                    stream.next().await
+                                                };
+
+                                                let Some(item) = next else { break };
+                                                match item {
+                                                    Ok(chunk) => {
+                                                        let text = chunk.message.content;
+                                                        if text.is_empty() {
+                                                            continue;
+                                                        }
+                                                        if first_token_ms.is_none() {
+                                                            first_token_ms = Some(
+                                                                (stream_started
+                                                                    .elapsed()
+                                                                    .as_secs_f32()
+                                                                    * 1000.0)
+                                                                    .max(0.1),
+                                                            );
+                                                        }
+                                                        accumulated_tokens =
+                                                            accumulated_tokens.saturating_add(1);
+                                                        let escaped = serde_json::to_string(&text)
+                                                            .unwrap_or_else(|_| {
+                                                                String::from("\"\"")
+                                                            });
+                                                        if tx
+                                                            .send(Ok(Event::default().data(
+                                                                format!(
+                                                                    r#"{{"token":{},"request_id":"{}"}}"#,
+                                                                    escaped, request_id_str
+                                                                ),
+                                                            )))
+                                                            .await
+                                                            .is_err()
+                                                        {
+                                                            break;
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        let msg =
+                                                            format!(" [stream error: {e}]");
+                                                        let escaped =
+                                                            serde_json::to_string(&msg)
+                                                                .unwrap_or_else(|_| {
+                                                                    String::from("\"\"")
+                                                                });
+                                                        let _ = tx
+                                                            .send(Ok(Event::default().data(
+                                                                format!(
+                                                                    r#"{{"token":{},"request_id":"{}"}}"#,
+                                                                    escaped, request_id_str
+                                                                ),
+                                                            )))
+                                                            .await;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            let _ = tx
+                                                .send(Ok(Event::default().data(format!(
+                                                    r#"{{"done":true,"request_id":"{}","truncated":false}}"#,
+                                                    request_id_str
+                                                ))))
+                                                .await;
+
+                                            let elapsed_ms = (stream_started
+                                                .elapsed()
+                                                .as_secs_f32()
+                                                * 1000.0)
+                                                .max(0.1);
+                                            let mut backend = lock_state(&state_clone);
+                                            if let Some(ttft_ms) = first_token_ms {
+                                                backend.inference_metrics.record_ttft(ttft_ms);
+                                            }
+                                            if accumulated_tokens > 0 {
+                                                let tps = (accumulated_tokens as f32)
+                                                    / (elapsed_ms / 1000.0);
+                                                backend.last_latency_ms = elapsed_ms;
+                                                backend.last_tokens_per_sec = tps;
+                                                backend.inference_metrics.record(
+                                                    elapsed_ms,
+                                                    accumulated_tokens,
+                                                    Some(tps),
+                                                    true,
+                                                );
+                                            }
+                                        });
+
+                                        request_tracker.decrement().await;
+                                        return Sse::new(
+                                            tokio_stream::wrappers::ReceiverStream::new(rx),
+                                        )
+                                        .into_response();
+                                    }
+                                    Err(err) => {
+                                        let fallback = format!(
+                                            "Ollama chat stream failed for model '{}': {}",
                                             model_name, err
                                         );
                                         (fallback, false, InferenceEngine::Ollama.as_str())
@@ -8537,7 +9092,8 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                         top_k,
                         penalty,
                         &history_turns,
-                        None,
+                        session_summary.as_deref(),
+                        chat_slot,
                         true,
                         req.response_format.clone(),
                     )
@@ -8550,11 +9106,82 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                         let state_clone = Arc::clone(&state);
                         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(100);
 
+                        // Separate from llama-server's own idle timeout (which
+                        // guards the gap *between* chunks): this bounds the
+                        // initial wait for the very first token, which on a
+                        // cold/uncached slot is dominated by prompt prefill.
+                        // `0` disables it. No automatic retry — a slow prefill
+                        // would just burn the same budget again.
+                        let first_token_timeout_secs = std::env::var("GHOSTLINK_FIRST_TOKEN_TIMEOUT_SECS")
+                            .ok()
+                            .and_then(|v| v.parse::<u64>().ok())
+                            .unwrap_or(30);
+
                         tokio::spawn(async move {
                             let stream_started = Instant::now();
                             let mut accumulated_tokens: u32 = 0;
-                            while let Some(item) = stream.next().await {
-                                let text_chunk = item.unwrap_or_else(|e| format!(" [stream error: {e}]"));
+                            let mut first_token_ms: Option<f32> = None;
+                            let mut truncated = false;
+                            loop {
+                                let next_item = if first_token_ms.is_none()
+                                    && first_token_timeout_secs > 0
+                                {
+                                    match tokio::time::timeout(
+                                        Duration::from_secs(first_token_timeout_secs),
+                                        stream.next(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(item) => item,
+                                        Err(_) => {
+                                            let msg = format!(
+                                                " [stream error: no first token within {first_token_timeout_secs}s (set GHOSTLINK_FIRST_TOKEN_TIMEOUT_SECS=0 to disable)]"
+                                            );
+                                            let escaped = serde_json::to_string(&msg)
+                                                .unwrap_or_else(|_| String::from("\"\""));
+                                            let data_str = format!(
+                                                r#"{{"token":{},"request_id":"{}","error":true}}"#,
+                                                escaped, request_id_str
+                                            );
+                                            let _ = tx
+                                                .send(Ok(Event::default().data(data_str)))
+                                                .await;
+                                            break;
+                                        }
+                                    }
+                                } else {
+                                    stream.next().await
+                                };
+
+                                let Some(item) = next_item else { break };
+                                // Only a real text delta counts as the first
+                                // token; a Truncated marker or an error must not
+                                // record a bogus TTFT.
+                                let text_chunk = match item {
+                                    Ok(native_engine::NativeChatEvent::Delta(text)) => {
+                                        if first_token_ms.is_none() {
+                                            first_token_ms = Some(
+                                                (stream_started.elapsed().as_secs_f32() * 1000.0)
+                                                    .max(0.1),
+                                            );
+                                        }
+                                        text
+                                    }
+                                    Ok(native_engine::NativeChatEvent::Truncated) => {
+                                        // finish_reason: "length" — the model was
+                                        // cut off at max_tokens. Emit it right
+                                        // away instead of waiting for the
+                                        // terminal done-chunk.
+                                        truncated = true;
+                                        let data_str = format!(
+                                            r#"{{"token":"","request_id":"{}","truncated":true}}"#,
+                                            request_id_str
+                                        );
+                                        let _ = tx.send(Ok(Event::default().data(data_str))).await;
+                                        continue;
+                                    }
+                                    Err(e) => format!(" [stream error: {e}]"),
+                                };
                                 accumulated_tokens = accumulated_tokens.saturating_add(1);
                                 let escaped_token = serde_json::to_string(&text_chunk).unwrap_or_else(|_| String::from("\"\""));
                                 let data_str = format!(r#"{{"token":{},"request_id":"{}"}}"#, escaped_token, request_id_str);
@@ -8562,10 +9189,21 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                                     break;
                                 }
                             }
+                            // Always send a terminal done-chunk so the client
+                            // can flush its token buffer and learn the final
+                            // truncation state without waiting for a timeout.
+                            let done_str = format!(
+                                r#"{{"done":true,"request_id":"{}","truncated":{}}}"#,
+                                request_id_str, truncated
+                            );
+                            let _ = tx.send(Ok(Event::default().data(done_str))).await;
                             let elapsed_ms = (stream_started.elapsed().as_secs_f32() * 1000.0).max(0.1);
+                            let mut backend = lock_state(&state_clone);
+                            if let Some(ttft_ms) = first_token_ms {
+                                backend.inference_metrics.record_ttft(ttft_ms);
+                            }
                             if accumulated_tokens > 0 {
                                 let tps = (accumulated_tokens as f32) / (elapsed_ms / 1000.0);
-                                let mut backend = lock_state(&state_clone);
                                 backend.last_latency_ms = elapsed_ms;
                                 backend.last_tokens_per_sec = tps;
                                 backend.inference_metrics.record(
@@ -8604,7 +9242,8 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                         penalty,
                         &settings.native_engine,
                         &history_turns,
-                        None,
+                        session_summary.as_deref(),
+                        chat_slot,
                         true,
                         req.response_format.clone(),
                     )
@@ -8813,6 +9452,10 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             // ChatMessage.truncatedBefore) instead of looking like the model
             // just forgot on its own.
             "truncated": history_truncated,
+            // Set when this session has a running summary of turns that were
+            // trimmed in earlier requests — the GUI can show that the model is
+            // working from a condensed memory rather than the full transcript.
+            "summarized_history": session_summary.is_some(),
             "metrics": metrics_json
         });
 
@@ -8860,16 +9503,29 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                 tokens.push(current);
             }
 
+            let token_session_id = session_id.clone();
             let stream = stream::iter(tokens).map(move |token| {
                 let chunk = serde_json::json!({
                     "token": token,
                     "request_id": format!("req-{}", request_id),
-                    "session_id": session_id.clone(),
+                    "session_id": token_session_id.clone(),
+                });
+                Ok::<Event, Infallible>(Event::default().data(chunk.to_string()))
+            });
+            // Terminal done-chunk, matching the native streaming path, so a
+            // client can flush its token buffer deterministically and learn
+            // the truncation state without waiting for a stream-end timeout.
+            let done = stream::once(async move {
+                let chunk = serde_json::json!({
+                    "done": true,
+                    "request_id": format!("req-{}", request_id),
+                    "session_id": session_id,
+                    "truncated": history_truncated,
                 });
                 Ok::<Event, Infallible>(Event::default().data(chunk.to_string()))
             });
 
-            Sse::new(stream).into_response()
+            Sse::new(stream.chain(done)).into_response()
         } else {
             Json(response).into_response()
         }
@@ -9828,6 +10484,7 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         audit_log: std::collections::VecDeque::new(),
         api_keys,
         models_scan_cache: ApiResponseCache::new(),
+        session_summaries: HashMap::new(),
     }));
 
     // Background CPU/RAM/GPU sampler — keeps /api/metrics non-blocking.
@@ -12418,6 +13075,7 @@ mod tests {
             audit_log: std::collections::VecDeque::new(),
             api_keys: vec![auth::create_key("test-admin".to_string(), auth::Role::Owner).0],
             models_scan_cache: ApiResponseCache::new(),
+            session_summaries: HashMap::new(),
         }))
     }
 
@@ -12757,6 +13415,65 @@ mod tests {
         assert_eq!(decoded.id, "sess_test_1");
         assert_eq!(decoded.throughput, 42);
         assert_eq!(decoded.messages.len(), 2);
+    }
+
+    fn session_with(id: &str, last_active_at: u64) -> SessionRecord {
+        SessionRecord {
+            id: id.to_string(),
+            name: String::new(),
+            model: "llama3".to_string(),
+            status: "saved".to_string(),
+            throughput: 0,
+            latency: 0,
+            tokens: 0,
+            messages: vec![],
+            created_at: last_active_at,
+            last_active_at,
+        }
+    }
+
+    #[test]
+    fn prune_sessions_drops_records_older_than_max_age_but_keeps_current() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        std::env::remove_var("GHOSTLINK_SESSION_MAX_BYTES");
+        std::env::set_var("GHOSTLINK_SESSION_MAX_AGE_DAYS", "30");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let stale = session_with("stale", now - 90 * 86_400);
+        // The most recently active session is protected even though it is the
+        // "current" one — pruning must never delete the live conversation.
+        let current = session_with("current", now);
+        let sessions = vec![stale.clone(), current.clone()];
+
+        let kept = prune_sessions_for_persistence(&sessions);
+        assert!(kept.iter().any(|s| s.id == "current"));
+        assert!(!kept.iter().any(|s| s.id == "stale"));
+
+        std::env::remove_var("GHOSTLINK_SESSION_MAX_AGE_DAYS");
+    }
+
+    #[test]
+    fn prune_sessions_enforces_byte_cap_but_protects_live_id() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        std::env::remove_var("GHOSTLINK_SESSION_MAX_AGE_DAYS");
+        // Tiny cap: only the protected live session should survive.
+        std::env::set_var("GHOSTLINK_SESSION_MAX_BYTES", "200");
+
+        let mut old = session_with("old", 1_000);
+        // Give it real bulk so it cannot fit under the cap.
+        old.messages = (0..50)
+            .map(|i| serde_json::json!({"role": "user", "content": format!("message {i} padding")}))
+            .collect();
+        let live = session_with("sess_local_001", 2_000);
+
+        let kept = prune_sessions_for_persistence(&[old, live]);
+        assert_eq!(kept.len(), 1, "byte cap should evict the bulk session");
+        assert_eq!(kept[0].id, "sess_local_001");
+
+        std::env::remove_var("GHOSTLINK_SESSION_MAX_BYTES");
     }
 
     #[tokio::test]
@@ -13367,5 +14084,105 @@ mod tests {
         );
         let response = app.clone().oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // ---- session summarization of trimmed history ----
+
+    #[test]
+    fn dropped_turns_returns_the_oldest_turns_before_the_kept_suffix() {
+        let prior: Vec<ChatHistoryTurn> = (0..5)
+            .map(|i| ChatHistoryTurn {
+                role: if i % 2 == 0 {
+                    "user".into()
+                } else {
+                    "assistant".into()
+                },
+                content: format!("turn {i}"),
+            })
+            .collect();
+
+        // Kept the last 2 -> the first 3 were dropped, oldest first.
+        let dropped = dropped_turns(&prior, 2);
+        assert_eq!(dropped.len(), 3);
+        assert_eq!(dropped[0].1, "turn 0");
+        assert_eq!(dropped[2].1, "turn 2");
+
+        // Nothing dropped -> empty.
+        assert!(dropped_turns(&prior, 5).is_empty());
+        // Defensive: a kept_len larger than the input must not panic or
+        // underflow (saturating_sub).
+        assert!(dropped_turns(&prior, 99).is_empty());
+    }
+
+    #[test]
+    fn build_summary_prompt_includes_running_summary_and_all_turns() {
+        let turns = vec![
+            ("user".to_string(), "my name is Dana".to_string()),
+            ("assistant".to_string(), "noted".to_string()),
+        ];
+
+        // First summarization: no existing summary, so no "Existing summary"
+        // block, but both turns must be present and labelled.
+        let first = build_summary_prompt("", &turns);
+        assert!(first.contains("User: my name is Dana"));
+        assert!(first.contains("Assistant: noted"));
+        assert!(!first.contains("Existing summary:"));
+        assert!(first.trim_end().ends_with("Summary:"));
+
+        // Incremental: the running summary must be carried forward so it is
+        // rewritten rather than lost.
+        let second = build_summary_prompt("the user is Dana", &turns);
+        assert!(second.contains("Existing summary:"));
+        assert!(second.contains("the user is Dana"));
+        assert!(second.contains("Newer transcript:"));
+    }
+
+    #[test]
+    fn build_summary_prompt_bounds_each_turn() {
+        // One enormous pasted turn must not blow the summarizer's own context.
+        let huge = "x".repeat(10_000);
+        let prompt = build_summary_prompt("", &[("user".to_string(), huge)]);
+        // 2000 chars of the turn, plus the instructions/label overhead.
+        assert!(
+            prompt.len() < 3_000,
+            "prompt should be bounded, was {} chars",
+            prompt.len()
+        );
+    }
+
+    #[test]
+    fn put_session_summary_tracks_turns_and_caps_text() {
+        let mut summaries: HashMap<String, SessionSummary> = HashMap::new();
+        put_session_summary(&mut summaries, "s1", "first".to_string(), 3);
+        put_session_summary(&mut summaries, "s1", "second".to_string(), 2);
+
+        let s = summaries.get("s1").unwrap();
+        assert_eq!(s.text, "second", "later summary replaces the earlier one");
+        assert_eq!(s.turns_summarized, 5, "turn count accumulates");
+        assert!(s.updated_at.is_some());
+
+        // Text over the cap is trimmed (keeping the tail).
+        let long = "a".repeat(SUMMARY_MAX_CHARS + 500);
+        put_session_summary(&mut summaries, "s2", long, 1);
+        assert_eq!(
+            summaries.get("s2").unwrap().text.chars().count(),
+            SUMMARY_MAX_CHARS
+        );
+    }
+
+    #[test]
+    fn put_session_summary_evicts_least_recently_updated_beyond_cap() {
+        let mut summaries: HashMap<String, SessionSummary> = HashMap::new();
+        // Insert cap+N sessions; each insertion refreshes updated_at, so the
+        // earliest-inserted ones are the oldest and must be evicted.
+        for i in 0..(SUMMARY_MAX_SESSIONS + 5) {
+            put_session_summary(&mut summaries, &format!("s{i}"), "x".to_string(), 1);
+        }
+        assert_eq!(summaries.len(), SUMMARY_MAX_SESSIONS);
+        assert!(!summaries.contains_key("s0"), "oldest should be evicted");
+        assert!(
+            summaries.contains_key(&format!("s{}", SUMMARY_MAX_SESSIONS + 4)),
+            "newest should survive"
+        );
     }
 }
