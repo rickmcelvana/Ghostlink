@@ -1,7 +1,7 @@
 use crate::backend_plugin;
 use crate::ollama::ChatMessage as OllamaChatMessage;
 use crate::task_runtime::{
-    AgentBackend, AgentResponse, ProjectKind, TaskBudget, TaskStatus, ToolCall,
+    AgentBackend, AgentResponse, ProjectKind, TaskBudget, TaskStatus, ToolCall, VerificationPlan,
 };
 use crate::BackendState;
 use crate::InferenceEngine;
@@ -618,6 +618,11 @@ async fn handle_get_task_review(
 pub struct DecideReviewReq {
     pub decision: String,
     pub note: Option<String>,
+    /// Explicit, auditable override of the verification gate. Accepting a
+    /// change whose own tests fail is sometimes the right call — but it should
+    /// be a deliberate act that is recorded, not the default.
+    #[serde(default)]
+    pub override_verification: bool,
 }
 
 async fn handle_decide_review(
@@ -662,6 +667,54 @@ async fn handle_decide_review(
                     Json(serde_json::json!({ "error": e.to_string() })),
                 ));
             }
+
+            // Enforce the verification gate. A change whose own project tests
+            // fail must not be accepted through the API — that is the whole
+            // point of running them. `override` is the explicit, auditable way
+            // to say "I know it fails and I am taking it anyway".
+            match store.get_task_review(&task.id) {
+                Ok(review) => {
+                    let passed = review.verification_passed();
+                    let plan_required = VerificationPlan::detect(&project.root_path)
+                        .map(|p| p.required)
+                        .unwrap_or(false);
+
+                    if plan_required && !payload.override_verification {
+                        match passed {
+                            Some(false) => {
+                                let failures: Vec<String> = review
+                                    .verification
+                                    .iter()
+                                    .filter(|r| !r.passed)
+                                    .map(|r| r.summary())
+                                    .collect();
+                                return Err((
+                                    StatusCode::CONFLICT,
+                                    Json(serde_json::json!({
+                                        "error": "verification failed; refusing to accept",
+                                        "failures": failures,
+                                        "hint": "re-run with request_changes, or pass \
+                                                 override_verification: true to accept anyway",
+                                    })),
+                                ));
+                            }
+                            None => {
+                                return Err((
+                                    StatusCode::CONFLICT,
+                                    Json(serde_json::json!({
+                                        "error": "no verification results for this task; \
+                                                  refusing to accept an unverified change",
+                                        "hint": "pass override_verification: true to accept anyway",
+                                    })),
+                                ));
+                            }
+                            Some(true) => {}
+                        }
+                    }
+                }
+                Err(_) => { /* no review packet yet — nothing to gate on */ }
+            }
+
             // Report a failed apply instead of swallowing it — the old
             // `let _ =` meant a task could be marked `Accepted` while its
             // changes never actually landed on disk.
@@ -674,6 +727,7 @@ async fn handle_decide_review(
                         "applied": applied,
                         // A snapshot was taken; this can be undone.
                         "rollback_available": true,
+                        "verification_overridden": payload.override_verification,
                     })))
                 }
                 Err(e) => Err((
