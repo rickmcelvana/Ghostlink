@@ -140,3 +140,10 @@ ghostlink_gui_modern/public/env-config.js
 # is pointed at. That staging tree is derived, reviewable, and disposable:
 # it must never be committed into a user's repository.
 .ghostlink/
+
+# Assistant runtime state (phase 3 approval queue, phase 1 memory store).
+# Both are derived, machine-local, and disposable: the queue holds the tool
+# arguments of pending actions, which is exactly the kind of thing that must
+# never be committed into a user's repository.
+approvals.json
+ghostlink_memory.db

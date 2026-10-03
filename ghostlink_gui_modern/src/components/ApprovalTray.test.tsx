@@ -1,0 +1,151 @@
+import React from 'react';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { render, screen, waitFor, fireEvent } from '@testing-library/react';
+import { ApprovalTray } from './ApprovalTray';
+import { GhostlinkAPI } from '../api';
+import { PendingApproval } from '../store';
+
+function approval(overrides: Partial<PendingApproval> = {}): PendingApproval {
+  return {
+    id: 'a1',
+    workspace_id: 'ws_1',
+    turn_id: 'sess_1',
+    tool: 'write_file',
+    server: 'filesystem',
+    class: 'write',
+    preview: 'write_file on notes.md',
+    status: 'pending',
+    created_at: 1,
+    resolved_at: null,
+    ...overrides,
+  };
+}
+
+function makeApi(overrides: Partial<GhostlinkAPI> = {}): GhostlinkAPI {
+  return {
+    listApprovals: vi.fn().mockResolvedValue({ approvals: [] }),
+    decideApproval: vi.fn().mockResolvedValue({ success: true, status: 'approved' }),
+    ...overrides,
+  } as unknown as GhostlinkAPI;
+}
+
+describe('ApprovalTray', () => {
+  beforeEach(() => vi.useRealTimers());
+  afterEach(() => vi.restoreAllMocks());
+
+  it('renders nothing when no approvals are queued', async () => {
+    const api = makeApi();
+    const { container } = render(<ApprovalTray api={api} />);
+    await waitFor(() => expect(api.listApprovals).toHaveBeenCalled());
+    expect(container.querySelector('.approval-tray')).toBeNull();
+  });
+
+  it('lists a pending approval with its class and preview', async () => {
+    const api = makeApi({
+      listApprovals: vi.fn().mockResolvedValue({ approvals: [approval()] }),
+    } as unknown as Partial<GhostlinkAPI>);
+    render(<ApprovalTray api={api} />);
+
+    await screen.findByText('write_file');
+    expect(screen.getByText('Write')).toBeTruthy();
+    expect(screen.getByText('write_file on notes.md')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Approve' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Deny' })).toBeTruthy();
+  });
+
+  it('never offers a session grant for an exec-class tool', async () => {
+    // "Always allow" on a command runner is a standing shell. The backend
+    // refuses it too; the button is hidden so the user isn't offered a dead end.
+    const api = makeApi({
+      listApprovals: vi
+        .fn()
+        .mockResolvedValue({ approvals: [approval({ class: 'exec', tool: 'run_command' })] }),
+    } as unknown as Partial<GhostlinkAPI>);
+    render(<ApprovalTray api={api} />);
+
+    await screen.findByText('run_command');
+    expect(screen.queryByRole('button', { name: 'Approve for session' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Approve' })).toBeTruthy();
+  });
+
+  it('offers a session grant for a write-class tool', async () => {
+    const api = makeApi({
+      listApprovals: vi.fn().mockResolvedValue({ approvals: [approval()] }),
+    } as unknown as Partial<GhostlinkAPI>);
+    render(<ApprovalTray api={api} />);
+    await screen.findByText('write_file');
+    expect(screen.getByRole('button', { name: 'Approve for session' })).toBeTruthy();
+  });
+
+  it('sends approve=true with the session flag when requested', async () => {
+    const decide = vi.fn().mockResolvedValue({ success: true, status: 'approved' });
+    const api = makeApi({
+      listApprovals: vi.fn().mockResolvedValue({ approvals: [approval()] }),
+      decideApproval: decide,
+    } as unknown as Partial<GhostlinkAPI>);
+    render(<ApprovalTray api={api} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Approve for session' }));
+    await waitFor(() =>
+      expect(decide).toHaveBeenCalledWith('a1', true, { approveForSession: true })
+    );
+  });
+
+  it('sends approve=false when denied', async () => {
+    const decide = vi.fn().mockResolvedValue({ success: true, status: 'denied' });
+    const api = makeApi({
+      listApprovals: vi.fn().mockResolvedValue({ approvals: [approval()] }),
+      decideApproval: decide,
+    } as unknown as Partial<GhostlinkAPI>);
+    render(<ApprovalTray api={api} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Deny' }));
+    await waitFor(() =>
+      expect(decide).toHaveBeenCalledWith('a1', false, { approveForSession: false })
+    );
+  });
+
+  it('shows the executed result after approving', async () => {
+    const decide = vi.fn().mockResolvedValue({
+      success: true,
+      status: 'approved',
+      result: 'wrote 12 bytes',
+    });
+    // The tray re-fetches after deciding, so the mock has to reflect the
+    // resolved state the real backend would return on the next poll.
+    const listApprovals = vi
+      .fn()
+      .mockResolvedValueOnce({ approvals: [approval()] })
+      .mockResolvedValue({ approvals: [approval({ status: 'approved', resolved_at: 2 })] });
+    const api = makeApi({ listApprovals, decideApproval: decide } as unknown as Partial<GhostlinkAPI>);
+    render(<ApprovalTray api={api} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Approve' }));
+    // Approving should not be a blind act — the user sees what happened.
+    expect(await screen.findByText('wrote 12 bytes')).toBeTruthy();
+  });
+
+  it('surfaces a backend error instead of failing silently', async () => {
+    const api = makeApi({
+      listApprovals: vi.fn().mockResolvedValue({ approvals: [approval()] }),
+      decideApproval: vi.fn().mockResolvedValue({ success: false, error: 'server exploded' }),
+    } as unknown as Partial<GhostlinkAPI>);
+    render(<ApprovalTray api={api} />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Approve' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('server exploded');
+  });
+
+  it('shows resolved approvals without decision buttons', async () => {
+    const api = makeApi({
+      listApprovals: vi
+        .fn()
+        .mockResolvedValue({ approvals: [approval({ status: 'denied', resolved_at: 2 })] }),
+    } as unknown as Partial<GhostlinkAPI>);
+    render(<ApprovalTray api={api} />);
+
+    await screen.findByText('Denied');
+    expect(screen.queryByRole('button', { name: 'Approve' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Deny' })).toBeNull();
+  });
+});

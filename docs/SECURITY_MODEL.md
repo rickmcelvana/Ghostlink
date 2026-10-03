@@ -134,6 +134,29 @@ This document summarizes current security assumptions for Ghost-Link runtime and
   keys remain in the hashed `api_keys.json` store and the OS keychain, and
   secrets are never written to the memory DB, to prompts, or to traces.
 
+- **Non-blocking approval queue for gated tool calls** (since 2.4.0, `crates/ghost-link/src/approvals.rs`):
+  `write` and `exec` calls are recorded as pending actions and surfaced to a
+  review tray rather than stalling the chat turn. Three properties matter:
+  the queued action's capability class is **re-derived server-side** from the
+  classification table on the approve path, so a hand-edited `approvals.json`
+  cannot promote a tool to a weaker class; `approve_for_session` refuses `exec`
+  outright, so a standing grant cannot become a standing shell; and
+  resolution is scoped to the owning `workspace_id`, returning an
+  indistinguishable "not found" for another workspace's ids so the queue
+  cannot be used to probe them.
+  The queue stores full arguments (an approved action must actually run) but
+  only a bounded **preview** leaves the process: `build_preview` reads specific
+  named argument fields per server and has no generic fallback that would dump
+  the argument bag, because that is where a credential would appear. The
+  list endpoint returns `ActionSummary`, a type with no `args` field at all.
+  A queued write is treated as a promise to the user and persisted, so it
+  survives a restart rather than silently disappearing; a corrupt queue file
+  degrades to an empty tray and is left on disk for inspection rather than
+  overwritten. Resolved entries are pruned after 30 days
+  (`GHOSTLINK_APPROVAL_MAX_AGE_DAYS`); pending entries are never pruned at any
+  age. Tool reachability is checked *before* the gate, so an action queued
+  against a disconnected server cannot exist — it would be unactionable.
+
 ## Threats and Risks
 
 - Discovery spoofing or replay on untrusted LAN segments.

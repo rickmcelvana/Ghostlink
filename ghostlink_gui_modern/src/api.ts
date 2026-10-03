@@ -75,7 +75,7 @@ export interface TaskEvent {
 }
 
 import axios, { AxiosInstance } from 'axios';
-import { Model, Metric, MetricSample, Session, Worker, Settings, McpServer, McpServerInput, WorkspaceEntry } from './store';
+import { Model, Metric, MetricSample, Session, Worker, Settings, McpServer, McpServerInput, WorkspaceEntry, PendingApproval } from './store';
 import { InferenceEngineDescriptor } from './types/engines';
 
 export type MetricsHistoryPoint = MetricSample;
@@ -548,6 +548,59 @@ export class GhostlinkAPI {
         { timeout: this.toolCallTimeout }
       );
       return { success: true, data: response.data };
+    } catch (error: any) {
+      return { success: false, error: error.response?.data?.error || error.message };
+    }
+  }
+
+  /** Lists queued approvals for a workspace. The backend returns summaries
+   *  only — tool arguments are deliberately absent from the list payload, so a
+   *  tray never has access to the arguments of a pending action. */
+  async listApprovals(
+    options: { workspaceId?: string; all?: boolean } = {}
+  ): Promise<{ approvals: PendingApproval[]; workspaceId?: string; error?: string }> {
+    try {
+      const params = new URLSearchParams();
+      if (options.workspaceId) params.set('workspace_id', options.workspaceId);
+      if (options.all) params.set('all', '1');
+      const qs = params.toString();
+      const response = await this.http.get(`/api/inference/approvals${qs ? `?${qs}` : ''}`);
+      return {
+        approvals: response.data.approvals || [],
+        workspaceId: response.data.workspace_id,
+      };
+    } catch (error: any) {
+      return { approvals: [], error: error.response?.data?.error || error.message };
+    }
+  }
+
+  /** Resolves a queued approval. When approved, the backend executes the action
+   *  immediately and returns the tool's result. `editedArgs` turns the decision
+   *  into an "edited" approval. */
+  async decideApproval(
+    id: string,
+    approve: boolean,
+    options: { approveForSession?: boolean; editedArgs?: unknown; workspaceId?: string } = {}
+  ): Promise<{
+    success: boolean;
+    status?: string;
+    result?: string;
+    sessionGranted?: boolean;
+    error?: string;
+  }> {
+    try {
+      const response = await this.http.post(
+        `/api/inference/approvals/${encodeURIComponent(id)}/decide`,
+        {
+          id,
+          approve,
+          approve_for_session: options.approveForSession ?? false,
+          edited_args: options.editedArgs,
+          workspace_id: options.workspaceId,
+        },
+        { timeout: this.toolCallTimeout }
+      );
+      return { success: true, ...response.data };
     } catch (error: any) {
       return { success: false, error: error.response?.data?.error || error.message };
     }

@@ -39,6 +39,7 @@ import {
   } from "../store";
 import { GhostlinkAPI, Task, ReviewPacket, TaskEvent } from "../api";
 import { ReviewPane } from "./ReviewPane";
+import { ApprovalTray } from "./ApprovalTray";
 import { useInferenceEngines } from "../hooks/useInferenceEngines";
 
 type Message = ChatMessage;
@@ -1226,6 +1227,10 @@ export const ChatTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
             </div>
           ) : (
             <div className="max-w-4xl mx-auto space-y-6">
+              {/* Gated tool calls the assistant held back for review. Renders
+                  nothing when the queue is empty, so it costs no space in the
+                  common case. */}
+              <ApprovalTray api={api} />
               {messages.map((m) => {
                 if (m.isDivider) {
                   return (

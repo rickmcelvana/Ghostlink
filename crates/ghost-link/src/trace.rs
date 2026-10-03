@@ -63,6 +63,10 @@ pub enum TraceDecision {
     Blocked,
     /// A human said yes.
     Approved,
+    /// A human edited the arguments, then allowed it.
+    Edited,
+    /// Queued for a human; not yet decided.
+    PendingApproval,
     /// A human said no.
     Denied,
     /// Approved as a standing grant for the session.
@@ -77,6 +81,8 @@ impl TraceDecision {
             Self::Allowed => "allowed",
             Self::Blocked => "blocked",
             Self::Approved => "approved",
+            Self::Edited => "edited",
+            Self::PendingApproval => "pending_approval",
             Self::Denied => "denied",
             Self::ApprovedForSession => "approved_for_session",
             Self::Failed => "failed",
@@ -175,6 +181,18 @@ impl TraceEvent {
         parts.join(" ")
     }
 
+    /// Records a tool dispatch or refusal.
+    pub fn execute_tool(
+        tool_name: &str,
+        workspace_id: &str,
+        class: Option<&str>,
+        decision: TraceDecision,
+    ) -> Self {
+        Self::new(TraceEventKind::ExecuteTool, tool_name, workspace_id)
+            .with_class(class)
+            .with_decision(decision)
+    }
+
     /// Records a chat turn.
     pub fn chat(turn_id: &str, workspace_id: &str) -> Self {
         Self::new(TraceEventKind::Chat, turn_id, workspace_id)
@@ -190,6 +208,13 @@ impl TraceEvent {
         Self::new(TraceEventKind::ToolApproval, tool_name, workspace_id)
             .with_class(class)
             .with_decision(decision)
+    }
+}
+
+impl std::fmt::Display for TraceEvent {
+    /// Same rendering as `to_detail`, so a trace can be logged inline.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_detail())
     }
 }
 
