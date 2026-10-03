@@ -244,25 +244,37 @@ $$\text{timeout\_secs} = \text{clamp}(90\text{s (floor)} + (\text{model\_size\_g
 - **Override**: Set `GHOSTLINK_MODEL_READY_TIMEOUT_SECS=<seconds>` to force a specific timeout.
 
 
-## Single Context Policy & Context Governor System
+## Context Budgeting (actual behaviour)
 
-Ghostlink features a unified, typed context policy system operating directly on the live inference path (`ChatTab / store.ts` → control-plane `:8000` → `crates/ghost-link` → `native_engine.rs` / `ollama.rs` / `vllm.rs` → `llama-server`).
+Ghostlink's context handling is **not** a typed policy system. What exists today:
 
-### Context Policy Shape
-- `n_ctx`: Context window size in tokens (`-c`).
-- `n_ctx_auto`: When `true`, automatically selects context size based on available VRAM and cluster capacity.
-- `kv_cache_type`: `"q4_0"` | `"q8_0"` | `"f16"` (`-ctk`/`-ctv`).
-- `conversation_token_limit`: Max tokens allowed for conversation history (0 = use `n_ctx`).
-- `max_tokens`: Response generation token cap.
-- `policy`: Context governor policy when budget is exceeded:
-  - `sliding_window`: Keeps system prompt, pinned messages, and the last `keep_last_turns` turns.
-  - `truncate_oldest`: Drops oldest non-system non-pinned turns until prompt fits budget.
-  - `compact`: Summarizes dropped turns into a concise memory blob (`[Memory of earlier context: ...]`).
-- `keep_last_turns`: Number of recent turns to preserve (default: `12`).
-- `reserve_completion_ratio`: Fraction of context window reserved for completion output (default: `0.2`).
-- `sticky_slot`: Pin conversation threads to llama-server KV slots (`id_slot`) with `cache_prompt: true` to accelerate repeat turns.
+### Chat path (`handle_gui_chat` → `native_engine.rs` / `ollama.rs` / `vllm.rs`)
 
-### Memory Budgeting for Large & Distributed Models
-- On single-node execution, large models (>= 10GB) on VRAM-constrained GPUs receive a safety context ceiling to avoid exhausting system RAM.
-- When distributed RPC inference (`--rpc`) is active, aggregate cluster memory capacity is evaluated. Large models are **not** hard-capped at 4096 tokens when aggregate VRAM fits weights and context.
-- If an explicitly configured `n_ctx` exceeds available memory capacity, `load_model_into_slot` returns a structured memory fit error detailing required vs available memory, preventing silent clamping or VRAM OOM crashes.
+- `conversation_token_limit`: max tokens allowed for conversation history, applied by
+  `trim_conversation_history_async`, which walks prior turns newest-first and keeps
+  whatever fits, dropping older turns. Token cost uses the native tokenizer when the
+  native engine is active and a whitespace-word estimate otherwise. There is **no**
+  reserved completion budget — the limit is spent entirely on history.
+- `kv_cache_type` (`-ctk`/`-ctv`) and `max_tokens` (response cap) are real settings.
+- **No** `sliding_window` / `truncate_oldest` / `compact` policies, **no**
+  summarization or memory-blob, **no** sticky-slot (`id_slot`) pinning, and **no**
+  `n_ctx` / `n_ctx_auto` settings. This section previously documented all of those as
+  implemented; they are not present in the codebase.
+
+### Task-agent path (`task_runtime.rs`)
+
+- `ContextGovernor` (real, added 2026-10-02) packs the agent transcript to fit a token
+  budget before every backend call, pinning the system prompt and the original task
+  goal and keeping the most recent turns. Compaction is surfaced as a `risks[]` entry
+  on the `ReviewPacket` and a `context_compacted` SSE event, so a reviewer knows the
+  agent was working from a truncated transcript.
+
+### Memory budgeting for large / distributed models
+
+The claims that previously followed here — that large models receive a VRAM-based
+"context ceiling", that distributed RPC lifts a hard 4096-token cap, and that
+`load_model_into_slot` returns a structured memory-fit error — were **not verified**
+and should not be relied on. What is real: `native_engine.rs` computes a
+model-ready timeout from model size and RPC peer count
+(`compute_model_ready_timeout`), and `rpc_cluster::compute_tensor_split` weights the
+tensor split by declared capacity.

@@ -69,11 +69,14 @@ Before running shell commands or file mutations, the runtime passes the request 
 These are real limitations of the current runtime, stated here rather than left
 implied — the same standard the rest of this repo's docs hold to:
 
-- **No conversation-window management.** The agent's `messages` vector grows
-  unbounded across steps; only individual tool *outputs* are truncated. On a
-  small local context window a long task will hit a context overflow rather
-  than compacting or summarizing. (`native_engine.rs`'s Context Governor is
-  not wired into this loop.)
+- **Conversation-window management is basic.** The agent loop now packs its
+  transcript to fit a token budget before every backend call
+  (`ContextGovernor`): the system prompt and task goal are pinned and the most
+  recent turns are kept, with older turns dropped oldest-first and the
+  compaction surfaced as a `risks[]` entry plus a `context_compacted` event.
+  What is still missing: summarization/compaction into a memory blob (dropped
+  turns are simply gone), and the budget is not yet configurable per project —
+  it uses `ContextGovernor::default()`.
 - **Checks are advisory, not enforced.** `ReviewPacket.checks` only contains
   commands the *model chose* to run. Nothing automatically runs a project's
   test suite after a mutation, and a packet with zero checks is still
