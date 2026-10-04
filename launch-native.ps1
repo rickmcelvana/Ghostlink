@@ -393,6 +393,29 @@ $env:GHOSTLINK_LLAMA_THREADS = [Math]::Max(1, $logicalCores - 1)
 # CPU-only automatically when GHOSTLINK_LLAMA_NGL is *not* set, as a safety
 # net for other deployments/hosts that haven't made this same measured
 # tradeoff; this script opts out of that default explicitly.
+
+# GHOSTLINK_FIRST_TOKEN_TIMEOUT_SECS raised from its 30s default to 120s.
+# Measured on this machine with Qwen3.8-27B-UD-IQ3_S at ngl -1 (full offload),
+# streaming through llama-server directly and then through the control-plane:
+#
+#   warm prompt cache   ~1.4s
+#   typical prompt      ~3.0s
+#   cold prompt         ~9.2s   (full prefill, no cached prefix)
+#   via control-plane   ~10.1s
+#
+# The 30s default is not comfortably above that. It fired on a real request
+# during testing -- though not because inference was slow: a model swap had left
+# llama-server answering 503 "Loading model" while it reloaded, so the request
+# waited out the whole budget on an engine that was never going to answer. 120s
+# leaves roughly 12x headroom over the worst observed case and absorbs a large
+# model's load window too.
+#
+# Only set when unset, so an explicit override from the caller still wins. This
+# is the first-token budget only; the idle timeout is unaffected.
+if (-not $env:GHOSTLINK_FIRST_TOKEN_TIMEOUT_SECS) {
+    $env:GHOSTLINK_FIRST_TOKEN_TIMEOUT_SECS = "120"
+}
+
 # GPU hardware auto-detection active by default (environment overrides respected if set)
 
 # Deliberately NOT forcing GHOSTLINK_CTX_SIZE here (this launch path used to
