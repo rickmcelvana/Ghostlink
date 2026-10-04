@@ -23,6 +23,14 @@ All notable changes to Ghostlink Studio are documented here.
   Also checked before bumping: `setup-node` v5+ auto-enables npm caching when `packageManager` or `devEngines.packageManager` is set, which would change caching behavior. No `package.json` in this repo sets either field, so the bump is inert beyond the runtime version.
 
 ### Fixed
+- **`launch-native.ps1` pins `GHOSTLINK_TLS_CERT_PATH`, without which the control-plane 503s every proxied request** (`launch-native.ps1`):
+  the control-plane starts with its working directory set to `control-plane/`, but ghost-link writes `tls_cert.pem` to the repo root. So the proxy's pinned cert pool looked in the wrong place, fell back to system roots, failed verification against the self-signed cert, and returned `Backend unreachable` for every proxied request while `/health` kept reporting ok.
+
+  This is the same cwd hazard the launcher already documents for `api_key.txt`, and it now gets the same explicit path. Verified both ways from `control-plane/` as cwd: without the variable `/api/metrics` returns 503, with it 200.
+
+  Worth noting how it slipped through: the proxy's own tests and the live check both passed, because both ran the control-plane from the repo root. Only reading the launcher's actual `-WorkingDirectory` argument exposed it.
+
+### Changed
 - **Control-plane no longer 503s every proxied request when ghost-link is on HTTPS** (`control-plane/pkg/proxy/proxy.go`):
   `NewChatProxy` computed the loopback check and threw it away (`_ = ...`), so an `https` backend URL got a default `http.Client` with full certificate verification. ghost-link serves TLS whenever `settings.enable_tls` is set, which includes loopback (`use_tls = enable_tls || !is_loopback_host(host)`), and presents a self-signed cert -- so the handshake failed and `forward()` answered `Backend unreachable` (503) for everything it proxied.
   `/health` kept reporting `status: ok` the whole time, because that handler echoes the configured backend URL without ever using the proxy client. The gateway looked healthy while every real API call failed.
