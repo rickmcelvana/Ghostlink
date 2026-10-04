@@ -37,6 +37,27 @@ All notable changes to Ghostlink Studio are documented here.
   9 tests cover single-use, expiry, loopback refusal, `X-Forwarded-For` spoofing from a remote peer, IPv6 loopback, and rejection of empty/garbage/oversized input.
 
 ### Fixed
+- **Model loads now warn before a GPU-offload OOM instead of dying inside Vulkan** (`crates/ghost-link/src/native_engine.rs`):
+  full offload allocates a *second* copy of the weights in device memory alongside the host copy, so a model that loads comfortably at `-ngl 0` can fail at `-ngl -1` purely because something else on the machine grew.
+
+  Measured on this machine with Qwen3.8-27B-UD-IQ3_S (12.04GB), 16 threads, 3 runs per configuration:
+
+  | ngl | decode | TTFT | resident | loaded |
+  |---|---|---|---|---|
+  | 0 | 2.28 / 2.37 tok/s | 1.46s | 12.24 GB | 2/2 |
+  | 12 | 2.21 tok/s | 1.64s | 12.27 GB | 1/1 |
+  | 24 | 2.28 tok/s | 1.70s | 12.29 GB | 1/1 |
+  | **-1** | **3.88 / 3.91 tok/s** | 2.25s | 12.64 GB | **2/2** |
+
+  Two findings from that, both contrary to what the repo previously documented:
+  - **Partial offload is not a middle ground here.** `ngl` 12 and 24 land within noise of CPU-only (2.21-2.28 vs 2.28-2.37). Only full offload helps, at **1.65x**.
+  - **The OOM was a memory precondition, not a bad setting.** The same `-ngl -1` load succeeded twice at ~22GB free and failed three times at ~11GB free with `vk::Device::allocateMemory: ErrorOutOfDeviceMemory`. So `-ngl -1` is kept as the default and a precondition check warns when free memory is short, naming the requirement, what is available, and `GHOSTLINK_LLAMA_NGL=0` as the escape hatch.
+
+  The check warns rather than refuses: the estimate is conservative and refusing to load a model that would in fact fit would be worse. CPU-only loads are exempt, since there is no duplicate allocation.
+
+  Also corrects a memory figure in `launch-native.ps1`: CPU-only `ngl 0` shows **12.24 GB resident**, not the ~0.5 GB previously claimed, because resident memory includes the mmap'd model file at every `ngl`. Offload saves the duplicate device copy, not the whole model.
+
+### Fixed
 - **Review pane no longer drops the verification verdict, and its note field works** (`ghostlink_gui_modern/src/components/ReviewPane.tsx`, `ghostlink_gui_modern/src/api.ts`):
   the backend's `ReviewPacket` carries `verification: Vec<VerificationResult>` and `checks`, but `api.ts` never declared either and `ReviewPane` rendered neither. A reviewer saw only `risks: ["Verification produced no results — change is UNVERIFIED"]` next to an empty diff pane -- so the one piece of information that determines whether a change was tested was invisible, and an untested change looked the same as a verified one.
 
