@@ -7,6 +7,23 @@ All notable changes to Ghostlink Studio are documented here.
 ## [Unreleased]
 
 ### Added
+- **The chat shows why it answered the way it did** (`ghostlink_gui_modern/src/components/ChatTab.tsx`, `store.ts`):
+  the server was already reporting four explanatory fields and the GUI read **none** of them — `recalled_memories`, `recalled_documents`, `action_claim_corrected` and `tools_run` were all sent on every response and all discarded. Every fact needed to answer "why did it say that" was on the wire and thrown away.
+
+  Three new badges on assistant replies, alongside the existing dropped-turns and summarized-history indicators:
+
+  | badge | meaning |
+  |---|---|
+  | **N memories recalled** | stored memories were injected as context for this turn |
+  | **N documents found** | indexed documents `rag.search` contributed |
+  | **corrected: claimed an action that didn't run** | the model asserted something no tool backed, and the server appended a correction |
+
+  The recall badges show **counts only**. The server never sends the recalled text, so the client cannot display it, store it, or leak it into browser storage — the badge confirms recall happened without duplicating the user's own memories into a second place.
+
+  The correction badge is styled distinctly (rose, not a metadata colour) because it means something different in kind: not "context was trimmed" but "this reply was wrong and the server caught it". Reading a transcript, that is the one you want to notice.
+
+  6 new tests, including singular/plural forms, the zero case rendering nothing, and that none of the three ever appears on a user message.
+
 
 - **Session titles are generated, not truncated** (`crates/ghost-link/src/title.rs`):
   the GUI named every thread from `firstUser.content.slice(0, 32)`, so a thread opened with *"can you look at why the auth middleware is failing on the staging host"* was titled **"can you look at why the auth mid"** — cut mid-word, lowercase, and identical for every thread starting with the same tokens. A thread opened with a pasted stack trace got a title made of code.

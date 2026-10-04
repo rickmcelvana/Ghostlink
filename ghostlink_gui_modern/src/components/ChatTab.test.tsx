@@ -133,6 +133,72 @@ describe('ChatTab', () => {
     ).toBeInTheDocument();
   });
 
+  it('shows how many memories were recalled, without their content', () => {
+    seedAssistantMessage({ recalledMemories: 3 });
+    render(<ChatTab api={createMockApi()} />);
+    expect(
+      screen.getByLabelText(/3 stored memories were used as context/i)
+    ).toBeInTheDocument();
+    // The count is shown; the recalled text never reaches the client at all, so
+    // there is nothing to assert beyond the count being present.
+    expect(screen.getByText(/3 memories recalled/i)).toBeInTheDocument();
+  });
+
+  it('uses the singular form for a single recalled memory', () => {
+    seedAssistantMessage({ recalledMemories: 1 });
+    render(<ChatTab api={createMockApi()} />);
+    expect(
+      screen.getByLabelText(/1 stored memory was used as context/i)
+    ).toBeInTheDocument();
+  });
+
+  it('shows how many indexed documents were retrieved', () => {
+    seedAssistantMessage({ recalledDocuments: 2 });
+    render(<ChatTab api={createMockApi()} />);
+    expect(
+      screen.getByLabelText(/2 indexed documents were retrieved/i)
+    ).toBeInTheDocument();
+  });
+
+  it('flags a reply whose action claim the server corrected', () => {
+    seedAssistantMessage({ actionClaimCorrected: true });
+    render(<ChatTab api={createMockApi()} />);
+    expect(
+      screen.getByLabelText(/claimed an action that never ran/i)
+    ).toBeInTheDocument();
+  });
+
+  it('shows no recall badge when nothing was recalled', () => {
+    seedAssistantMessage({ recalledMemories: 0, recalledDocuments: 0 });
+    render(<ChatTab api={createMockApi()} />);
+    expect(screen.queryByText(/memories recalled/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/documents found/i)).not.toBeInTheDocument();
+    expect(
+      screen.queryByLabelText(/claimed an action that never ran/i)
+    ).not.toBeInTheDocument();
+  });
+
+  it('never shows recall or correction badges on a user message', () => {
+    useAppStore.setState({
+      chatMessages: [
+        {
+          role: 'user',
+          content: 'remember this',
+          id: 'u1',
+          timestamp: '10:00',
+          recalledMemories: 5,
+          actionClaimCorrected: true,
+        },
+        { role: 'assistant', content: 'ok', id: 'a1', timestamp: '10:00' },
+      ],
+    } as never);
+    render(<ChatTab api={createMockApi()} />);
+    expect(screen.queryByText(/memories recalled/i)).not.toBeInTheDocument();
+    expect(
+      screen.queryByLabelText(/claimed an action that never ran/i)
+    ).not.toBeInTheDocument();
+  });
+
   it('shows neither indicator on an ordinary reply', () => {
     seedAssistantMessage({});
     render(<ChatTab api={createMockApi()} />);
