@@ -2682,6 +2682,109 @@ fn active_workspace() -> workspace::WorkspaceId {
     workspace::WorkspaceId::from_root(workspace_root())
 }
 
+/// Runs proactive recall for a turn and returns the assembled system block.
+///
+/// Best-effort by construction: a retriever that is disabled, disconnected, slow
+/// or failing yields `None` and the turn proceeds. Retrieval must never be able
+/// to fail a request -- the worst outcome is that the assistant forgets, which is
+/// exactly where it started.
+///
+/// Read-only. Calls only `memory_search` and `rag.search`, the two `Read`-class
+/// tools, so no approval is involved and nothing is persisted by this path. The
+/// workspace id is stamped from the request, never taken from the model.
+async fn recall_for_turn(
+    registry: &mcp::McpRegistry,
+    query: &str,
+    workspace_id: &str,
+) -> (Option<String>, recall::RecallOutcome) {
+    // A query too short to rank against is not worth two round trips.
+    let query = query.trim();
+    if query.chars().count() < 8 {
+        return (None, recall::RecallOutcome::default());
+    }
+
+    let memory_fut = async {
+        let args = capability::stamp_workspace_scope(
+            "memory",
+            "memory_search",
+            recall::memory_search_args(query, workspace_id, recall::TOP_K),
+            workspace_id,
+        );
+        registry.call_tool("memory", "memory_search", args).await
+    };
+    let rag_fut = async {
+        let args = recall::rag_search_args(query, recall::TOP_K);
+        registry.call_tool("rag", "search", args).await
+    };
+
+    // Bound the whole recall: two sequential MCP subprocess round trips on the hot
+    // path of a chat turn would be felt as TTFT. Best-effort means we also drop a
+    // slow retriever entirely rather than making the user wait for it.
+    let (memory_outcome, rag_outcome) = match tokio::time::timeout(
+        Duration::from_secs(RECALL_TIMEOUT_SECS),
+        futures::future::join(memory_fut, rag_fut),
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(_) => {
+            tracing::debug!(
+                target: "assistant_trace",
+                timeout_secs = RECALL_TIMEOUT_SECS,
+                "proactive recall timed out; continuing without it"
+            );
+            let outcome = recall::RecallOutcome {
+                retriever_failed: true,
+                ..Default::default()
+            };
+            return (None, outcome);
+        }
+    };
+
+    let memory_json = memory_outcome.map(|o| o.result);
+    let rag_json = rag_outcome.map(|o| o.result);
+
+    // `ToolCallOutcome.result` may be a string or structured JSON depending on the
+    // server, so hand both to the parser as-is; it ignores anything unrecognised.
+    let (block, outcome) = recall::build_recall_block(memory_json.as_ref(), rag_json.as_ref());
+
+    if outcome.any() {
+        // Counts only -- never the recalled text, which may contain user content.
+        tracing::info!(
+            target: "assistant_trace",
+            memory_hits = outcome.memory_hits,
+            rag_hits = outcome.rag_hits,
+            block_chars = outcome.block_chars,
+            "proactive recall injected"
+        );
+    }
+    (block, outcome)
+}
+
+/// Merges a recall block into the session summary string handed to the backends.
+///
+/// Done here rather than as a new parameter on every `generate` call because the
+/// backends already treat this string as "extra system context". Threading a
+/// second optional argument through five call sites, three backends and their
+/// streaming variants would add a parameter nobody would ever pass differently.
+fn merge_recall_into_summary(summary: Option<&str>, recall_block: Option<&str>) -> Option<String> {
+    // Whitespace-only input counts as absent. Without this, a summary that is
+    // present but blank would pass through as `Some("")` and inject an empty
+    // system message -- which still shifts the chat template, and is exactly the
+    // kind of thing that shows up as a subtly wrong prompt rather than a crash.
+    let summary = summary.map(str::trim).filter(|t| !t.is_empty());
+    let recall_block = recall_block.map(str::trim).filter(|t| !t.is_empty());
+    match (summary, recall_block) {
+        (None, None) => None,
+        (Some(s), None) => Some(s.to_string()),
+        (None, Some(r)) => Some(r.to_string()),
+        (Some(s), Some(r)) => Some(format!("{s}\n\n{r}")),
+    }
+}
+
+/// Wall-clock budget for proactive recall on the chat hot path.
+const RECALL_TIMEOUT_SECS: u64 = 4;
+
 /// Resolves the workspace a request is bound to.
 ///
 /// A client-supplied id is honored but always paired with the server's
@@ -10129,6 +10232,29 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                 .map(|s| s.text.clone())
                 .filter(|t| !t.trim().is_empty())
         };
+
+        // Proactive recall (Phase 1). Runs the retrievers server-side so the model
+        // knows what it already knows without spending a tool call discovering
+        // that it has a memory at all.
+        //
+        // Only on the first turn of a session: with no history there is nothing
+        // else to go on and recall is at its most useful, while on every later
+        // turn the transcript already carries the relevant material and a second
+        // retrieval would be latency spent for nothing.
+        let (recall_block, recall_outcome) = if req.messages.as_deref().unwrap_or(&[]).is_empty() {
+            let ws = resolve_request_workspace(req.workspace_id.as_deref());
+            let registry = {
+                let backend = lock_state(&state);
+                Arc::clone(&backend.mcp_registry)
+            };
+            recall_for_turn(&registry, &req.message, ws.id()).await
+        } else {
+            (None, recall::RecallOutcome::default())
+        };
+        // Recalled context goes into the same extra-system-message slot as the
+        // session summary, so every backend picks it up unchanged.
+        let session_summary =
+            merge_recall_into_summary(session_summary.as_deref(), recall_block.as_deref());
         let temp = req.temperature.unwrap_or(settings.temperature);
         let top_p = req.top_p.unwrap_or(settings.top_p);
         let top_k = req.top_k.unwrap_or(settings.top_k);
@@ -10941,6 +11067,10 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             // trimmed in earlier requests — the GUI can show that the model is
             // working from a condensed memory rather than the full transcript.
             "summarized_history": session_summary.is_some(),
+            // Counts only. Lets the GUI and an operator tell "remembered nothing"
+            // from "retrieval never ran" without any recalled text leaving here.
+            "recalled_memories": recall_outcome.memory_hits,
+            "recalled_documents": recall_outcome.rag_hits,
             "metrics": metrics_json
         });
 
@@ -14399,6 +14529,7 @@ mod mcp;
 mod native_engine;
 mod ollama;
 mod otel;
+mod recall;
 mod rpc_cluster;
 mod runtime;
 mod runtime_switcher;
@@ -15975,5 +16106,48 @@ mod tests {
             summaries.contains_key(&format!("s{}", SUMMARY_MAX_SESSIONS + 4)),
             "newest should survive"
         );
+    }
+
+    // --- proactive recall: summary/recall merge -----------------------------
+    //
+    // The merge is where a bug would silently drop context rather than fail
+    // loudly, so each combination of present/absent/blank is pinned.
+
+    #[test]
+    fn merge_keeps_both_summary_and_recall() {
+        let merged =
+            merge_recall_into_summary(Some("earlier we chose JWTs"), Some("- [memory] likes Rust"));
+        let m = merged.expect("both present must merge");
+        assert!(m.contains("earlier we chose JWTs"), "summary lost: {m}");
+        assert!(m.contains("likes Rust"), "recall lost: {m}");
+    }
+
+    #[test]
+    fn merge_passes_through_a_lone_summary() {
+        assert_eq!(
+            merge_recall_into_summary(Some("only summary"), None).as_deref(),
+            Some("only summary")
+        );
+    }
+
+    #[test]
+    fn merge_passes_through_a_lone_recall_block() {
+        assert_eq!(
+            merge_recall_into_summary(None, Some("only recall")).as_deref(),
+            Some("only recall")
+        );
+    }
+
+    #[test]
+    fn merge_of_neither_is_none() {
+        // A turn with no history and no recall must not inject an empty system
+        // message -- an empty string still shifts the chat template.
+        assert!(merge_recall_into_summary(None, None).is_none());
+    }
+
+    #[test]
+    fn merge_treats_blank_inputs_as_absent() {
+        assert!(merge_recall_into_summary(Some("   "), None).is_none());
+        assert!(merge_recall_into_summary(None, Some("  \n ")).is_none());
     }
 }

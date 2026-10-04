@@ -6,6 +6,25 @@ All notable changes to Ghostlink Studio are documented here.
 
 ## [Unreleased]
 
+### Added
+- **Proactive memory recall** (`crates/ghost-link/src/recall.rs`, wired in `main.rs`):
+  on the first turn of a session the server now calls `memory_search` and `rag.search` itself and injects the hits as system context, instead of waiting for the model to decide it should go looking.
+
+  Until now every reference to those tools lived in `capability.rs`, classifying them -- none of them ever called them. The model *could* search its own memory, but only if it thought to, which made the memory server a database with extra steps rather than memory.
+
+  Design points worth stating:
+  - **Bounded.** Top 5 per retriever, 600 chars per item, 2400 chars per block. Injected context is context every later turn still pays for, so an unbounded recall would be a slow leak.
+  - **Best-effort.** A missing, disconnected, slow or failing retriever yields nothing and the turn proceeds — retrieval must never be able to fail a request. A 4s budget covers both subprocess round trips; a slow retriever is dropped rather than made the user wait.
+  - **Read-only.** Only the two `Read`-class tools are called, so no approval is involved and nothing is written by this path. A test asserts no write tool appears in the call path.
+  - **Workspace-scoped.** The scope is stamped server-side from the request's `workspace_id`, exactly as a model-issued call would be, so recall cannot read another workspace's memories.
+  - **First turn only.** With no history there is nothing else to go on; on later turns the transcript already carries the material and a second retrieval would be latency for nothing.
+  - **Counts, not content.** `recalled_memories` / `recalled_documents` are exposed on the response and the log carries counts only — never the recalled text, which may contain user content.
+
+  Recalled context is merged into the existing extra-system-message slot used by the session summary, so all backends pick it up unchanged rather than threading a new parameter through five call sites and three streaming variants.
+
+  18 new tests cover both MCP envelope shapes, bare arrays, wrapped objects, unparseable payloads, the token cap, per-item truncation, top-k bounding, and that a blank summary no longer injects an empty system message (a real bug the merge tests caught).
+
+
 ### Changed
 - **`mcp-rag` can now embed via llama-server, removing the Ollama dependency** (`crates/mcp-rag/src/main.rs`, `mcp_servers.example.toml`, `mcp_servers.toml`, `.gitignore`):
   `rag_embed` now selects a backend via `GHOSTLINK_EMBED_BACKEND`. `llama` targets llama-server's OpenAI-compatible `POST /v1/embeddings` (`data[0].embedding`); `ollama` keeps the original `POST /api/embeddings` (`embedding`) untouched; `auto` tries llama then falls back. **An existing Ollama setup keeps working with no config change** -- `auto` is the default.
