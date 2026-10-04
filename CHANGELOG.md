@@ -37,6 +37,12 @@ All notable changes to Ghostlink Studio are documented here.
   9 tests cover single-use, expiry, loopback refusal, `X-Forwarded-For` spoofing from a remote peer, IPv6 loopback, and rejection of empty/garbage/oversized input.
 
 ### Fixed
+- **Bootstrap-code tests no longer fail intermittently in parallel** (`crates/ghost-link/src/bootstrap.rs`):
+  the code store is process-global — one `OnceLock<Mutex<HashMap<..>>>`, which is correct for the server since exactly one code is live per process. Under `cargo test`, though, tests share that store on parallel threads and `issue_code()` *clears* it before inserting, so one test issuing a code could wipe another's mid-assertion.
+
+  Caught on CI, not locally: `redemption_is_single_use` and `refused_from_non_loopback` failed in `Production Gate` while passing on this machine, because the two machines have different core counts and therefore different thread scheduling. The tests now hold a serialising guard. Verified with 25 consecutive runs at `--test-threads 16`.
+
+### Fixed
 - **Model loads now warn before a GPU-offload OOM instead of dying inside Vulkan** (`crates/ghost-link/src/native_engine.rs`):
   full offload allocates a *second* copy of the weights in device memory alongside the host copy, so a model that loads comfortably at `-ngl 0` can fail at `-ngl -1` purely because something else on the machine grew.
 

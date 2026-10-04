@@ -176,6 +176,27 @@ pub fn redeem(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// Serialises these tests.
+    ///
+    /// The code store is process-global (one `OnceLock<Mutex<HashMap<..>>>`), which
+    /// is correct for the server -- there is exactly one live code per process.
+    /// In tests, though, `cargo test` runs them on parallel threads, and
+    /// `issue_code()` *clears* the map before inserting. So one test issuing a code
+    /// can wipe another test's code mid-assertion, making a correct
+    /// implementation fail intermittently.
+    ///
+    /// That is exactly what happened on CI: `redemption_is_single_use` and
+    /// `refused_from_non_loopback` both failed there while passing locally, because
+    /// a concurrent `issue_code()` replaced their code between the issue and the
+    /// redeem. Sharing global state across parallel tests needs a lock; this is the
+    /// standard one.
+    fn test_guard() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let m = LOCK.get_or_init(|| Mutex::new(()));
+        m.lock().unwrap_or_else(|p| p.into_inner())
+    }
 
     fn loopback_v4() -> std::net::SocketAddr {
         "127.0.0.1:5000".parse().unwrap()
@@ -187,6 +208,7 @@ mod tests {
 
     #[test]
     fn issued_code_is_128_bits_of_hex() {
+        let _guard = test_guard();
         let c = issue_code();
         assert_eq!(c.len(), 32);
         assert!(c.chars().all(|ch| ch.is_ascii_hexdigit()));
@@ -194,11 +216,13 @@ mod tests {
 
     #[test]
     fn two_issues_differ() {
+        let _guard = test_guard();
         assert_ne!(issue_code(), issue_code());
     }
 
     #[test]
     fn redemption_is_single_use() {
+        let _guard = test_guard();
         let code = issue_code();
         assert!(redeem(&code, &loopback_v4(), None).is_ok());
         // Second attempt with the same code must fail.
@@ -207,6 +231,7 @@ mod tests {
 
     #[test]
     fn refused_from_non_loopback() {
+        let _guard = test_guard();
         let code = issue_code();
         assert!(redeem(&code, &remote(), None).is_err());
         // ...and the code survives, because it was not consumed.
@@ -215,6 +240,7 @@ mod tests {
 
     #[test]
     fn forwarded_for_cannot_spoof_loopback() {
+        let _guard = test_guard();
         let code = issue_code();
         // Remote peer claiming to be loopback in the header: still refused.
         assert!(redeem(&code, &remote(), Some("127.0.0.1")).is_err());
@@ -224,6 +250,7 @@ mod tests {
 
     #[test]
     fn forwarded_for_from_loopback_peer_is_honoured() {
+        let _guard = test_guard();
         let code = issue_code();
         // Local control-plane forwarding a loopback client: allowed.
         assert!(redeem(&code, &loopback_v4(), Some("127.0.0.1")).is_ok());
@@ -231,6 +258,7 @@ mod tests {
 
     #[test]
     fn ipv6_loopback_counts() {
+        let _guard = test_guard();
         let code = issue_code();
         let v6: std::net::SocketAddr = "[::1]:5000".parse().unwrap();
         assert!(redeem(&code, &v6, None).is_ok());
@@ -238,6 +266,7 @@ mod tests {
 
     #[test]
     fn garbage_and_empty_are_rejected() {
+        let _guard = test_guard();
         let _ = issue_code();
         assert!(redeem("", &loopback_v4(), None).is_err());
         assert!(redeem("deadbeef", &loopback_v4(), None).is_err());
@@ -246,6 +275,7 @@ mod tests {
 
     #[test]
     fn expired_code_is_rejected() {
+        let _guard = test_guard();
         // Rather than sleeping, plant an already-expired entry directly.
         let code = "expired-code-for-test".to_string();
         store().lock().unwrap().insert(
