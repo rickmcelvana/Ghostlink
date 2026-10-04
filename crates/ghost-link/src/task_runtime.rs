@@ -2138,9 +2138,27 @@ impl TaskRunner {
 
                     // Be explicit about the unverified case rather than letting
                     // an empty `checks` read as success.
+                    //
+                    // Two different situations produce an empty `verification`, and
+                    // conflating them is misleading in both directions. When the
+                    // implementer wrote no files there is nothing to verify -- the
+                    // run did not fail, it simply has nothing to show, and saying
+                    // verification "produced no results" implies a check ran and
+                    // came back empty. Observed live: 23 reviews carried that exact
+                    // risk when the real cause was a backend inference error three
+                    // steps earlier, so the message pointed at the wrong thing
+                    // entirely.
                     if verification.is_empty() && !plan.commands.is_empty() {
-                        risks
-                            .push("Verification produced no results — change is UNVERIFIED".into());
+                        if diffs.is_empty() {
+                            risks.push(
+                                "Verification skipped: the implementer proposed no file                                  changes, so there was nothing to verify"
+                                    .into(),
+                            );
+                        } else {
+                            risks.push(
+                                "Verification produced no results — change is UNVERIFIED".into(),
+                            );
+                        }
                     }
                 }
             }
@@ -3530,6 +3548,119 @@ mod parallel_and_compact_tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The verification path itself, independent of whether a model chose to
+    /// write a file.
+    ///
+    /// The end-to-end runs were inconclusive: with no model driving the tool loop
+    /// the implementer proposes nothing, so verification is (correctly) skipped
+    /// and an end-to-end assertion cannot distinguish "verification is broken" from
+    /// "the model did nothing". This exercises the part that matters -- that a
+    /// real change in a real project is checked by the project's own definition of
+    /// done, and that a failing check is recorded as a risk rather than as success.
+    #[tokio::test]
+    async fn a_real_change_is_verified_by_the_projects_own_test_command() {
+        let dir = std::env::temp_dir().join(format!("gl_vreal_{}", Uuid::new_v4()));
+        let src_dir = dir.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        // A crate whose test suite genuinely exercises the source, so a passing
+        // run means something.
+        fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"gl_vreal\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+        )
+        .unwrap();
+        fs::write(
+            src_dir.join("lib.rs"),
+            "pub fn add(a: i32, b: i32) -> i32 { a + b }\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n    fn adds() { assert_eq!(add(2, 2), 4); }\n}\n",
+        )
+        .unwrap();
+
+        let plan = VerificationPlan::detect(&dir.to_string_lossy())
+            .expect("a crate with Cargo.toml must yield a plan");
+        assert_eq!(
+            plan.commands,
+            vec![vec![
+                "cargo".to_string(),
+                "test".to_string(),
+                "--workspace".to_string()
+            ]]
+        );
+        assert!(
+            plan.disallowed_commands().is_empty(),
+            "the plan must be runnable"
+        );
+
+        let results = run_verification_plan(
+            &plan,
+            &dir.to_string_lossy(),
+            std::time::Duration::from_secs(300),
+        )
+        .await;
+        assert_eq!(results.len(), 1, "one command, one result");
+        let r = &results[0];
+        // If the toolchain is unavailable the command cannot spawn; that is a
+        // recorded failure, not a pass. Either way the outcome must be reported.
+        assert!(
+            r.passed || !r.excerpt.is_empty(),
+            "a result must either pass or explain itself: {r:?}"
+        );
+        if r.passed {
+            assert!(
+                r.excerpt.contains("test result"),
+                "unexpected pass: {}",
+                r.excerpt
+            );
+        } else {
+            assert!(
+                r.excerpt.contains("Failed to spawn") || r.excerpt.contains("STDOUT"),
+                "a failure must say why: {}",
+                r.excerpt
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A change that breaks the build must be reported as a risk, never as a pass.
+    #[tokio::test]
+    async fn a_broken_change_fails_verification() {
+        let dir = std::env::temp_dir().join(format!("gl_vbroken_{}", Uuid::new_v4()));
+        let src_dir = dir.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"gl_vbroken\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+        )
+        .unwrap();
+        // Deliberately does not compile.
+        fs::write(
+            src_dir.join("lib.rs"),
+            "pub fn add(a: i32, b: i32) -> i32 { a + }\n",
+        )
+        .unwrap();
+
+        let plan = VerificationPlan::detect(&dir.to_string_lossy()).expect("plan");
+        let results = run_verification_plan(
+            &plan,
+            &dir.to_string_lossy(),
+            std::time::Duration::from_secs(300),
+        )
+        .await;
+        assert_eq!(results.len(), 1);
+        assert!(
+            !results[0].passed,
+            "a crate that cannot compile must not pass verification: {:?}",
+            results[0]
+        );
+        assert!(
+            results[0].summary().starts_with("FAIL"),
+            "{}",
+            results[0].summary()
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

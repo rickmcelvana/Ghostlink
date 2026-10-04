@@ -168,3 +168,5 @@ test_curl_cleaned.js
 # SQLite WAL sidecars for the memory store.
 ghostlink_memory.db-*
 session_summaries.json
+# Ad-hoc audit/PR scratch notes; the durable record is CHANGELOG.md
+docs/PR_NOTE_*.md

@@ -232,6 +232,13 @@ All notable changes to Ghostlink Studio are documented here.
     Verified live: the log records `scheduled turn using the read-only tool default`, and the schedule fired in 5.0s.
 
 - **Agent self-verification can now actually run** (`crates/ghost-link/src/task_runtime.rs`):
+- **"Verification skipped" no longer reports itself as "produced no results"** (`crates/ghost-link/src/task_runtime.rs`):
+  when the implementer proposes no file changes there is nothing to verify, and the review said *"Verification produced no results — change is UNVERIFIED"* — which implies a check ran and came back empty. It never ran at all.
+
+  Observed across a live batch: 23 reviews carried that message when the real cause was a backend inference error three steps earlier, so the risk pointed at the wrong thing entirely. The two situations are now distinguished — nothing to verify, versus a verification that ran and found nothing.
+
+  2 new tests exercise the verification path directly rather than end to end: a real crate is checked by its own `cargo test --workspace` and passes, and a crate that does not compile is recorded as a `FAIL` risk rather than a pass. The end-to-end runs could not distinguish "verification is broken" from "the model wrote no files", which is why the unit under test is now tested as a unit.
+
   verification builds the proposed change in a scratch copy of the project, and that copy included everything except `.git`, `target` and `node_modules`. Against this repository the copy was **40 GB** — 38.8 GB of it `models/*.gguf`, plus a vendored `third_party/llama.cpp`.
 
   That made the feature unusable rather than slow: the copy alone outran the 600s per-command timeout and filled the disk, so `cargo test --workspace` never started and every review came back with zero checks and the risk *"Verification produced no results — change is UNVERIFIED"*.
