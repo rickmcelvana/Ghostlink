@@ -2,12 +2,28 @@ package proxy
 
 import (
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 )
+
+// backendCertPath is ghost-link's self-signed certificate, resolved the same way
+// crates/ghost-link/src/tls.rs::cert_path does so both sides agree on the file.
+var backendCertPath = func() string {
+	if p := os.Getenv("GHOSTLINK_TLS_CERT_PATH"); p != "" {
+		return p
+	}
+	if wd, err := os.Getwd(); err == nil {
+		return filepath.Join(wd, "tls_cert.pem")
+	}
+	return "tls_cert.pem"
+}()
 
 type ChatProxy struct {
 	BackendURL string
@@ -24,13 +40,46 @@ var corsHeaders = map[string]bool{
 	http.CanonicalHeaderKey("Access-Control-Expose-Headers"):    true,
 }
 
+// loopbackCertPool builds a cert pool trusting exactly ghost-link's self-signed
+// certificate.
+//
+// ghost-link serves TLS whenever settings.enable_tls is set, which includes
+// loopback: its listener choice is `enable_tls || !is_loopback_host(host)`. So a
+// loopback backend is HTTPS too, presenting the self-signed cert written to
+// tls_cert.pem (SANs: localhost, 127.0.0.1 — see crates/ghost-link/src/tls.rs).
+// A default http.Client fails verification against that cert and every forwarded
+// request comes back as "Backend unreachable" (503), while /health still reports
+// ok because that handler never uses this client.
+//
+// Trusting that one certificate is deliberate rather than InsecureSkipVerify:
+// verification stays ON, and the trust is pinned to a specific local cert instead
+// of disabled wholesale. A non-loopback backend keeps the system roots untouched.
+func loopbackCertPool() *x509.CertPool {
+	pool := x509.NewCertPool()
+	pem, err := os.ReadFile(backendCertPath)
+	if err != nil {
+		return nil
+	}
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil
+	}
+	return pool
+}
+
 func NewChatProxy(backendURL string) *ChatProxy {
 	client := &http.Client{}
 	parsedURL, parseErr := url.Parse(backendURL)
 	if parseErr == nil && strings.EqualFold(parsedURL.Scheme, "https") {
 		host := parsedURL.Hostname()
 		ip := net.ParseIP(host)
-		_ = strings.EqualFold(host, "localhost") || (ip != nil && ip.IsLoopback())
+		isLoopback := strings.EqualFold(host, "localhost") || (ip != nil && ip.IsLoopback())
+		if isLoopback {
+			if pool := loopbackCertPool(); pool != nil {
+				client.Transport = &http.Transport{
+					TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
+				}
+			}
+		}
 	}
 	return &ChatProxy{
 		BackendURL: strings.TrimRight(backendURL, "/"),

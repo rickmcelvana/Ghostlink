@@ -14,12 +14,24 @@ All notable changes to Ghostlink Studio are documented here.
   `llama-server -m models/nomic-embed-text-v1.5.Q4_K_M.gguf --embedding --pooling mean --host 127.0.0.1 --port 8081`
   Vectors are only comparable within a model, so switching backend requires re-indexing; the config comment says so.
 
+### Changed
+- **Bumped the last `actions/setup-node@v4` pin to `@v7`** (`.github/workflows/ci.yml`):
+  GitHub removed the Node 20 runtime from Actions runners on 23 September 2026; JavaScript actions now run on Node 24. The `v4` tag still declares `runs.using: node20` (`v5` onward declare `node24`), and runners have been rewriting `node20` to `node24` since 16 June -- so this was never broken, just the one inconsistent pin in the repo. Every other workflow already used `@v7`.
+
+  Note this is the **action runtime**, not the build Node: `node-version: 20` selects the Node that runs `npm ci` / `vitest` / `tsc` and is unaffected by the runner change. Verified no `ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION` opt-out is referenced anywhere, since that escape hatch stopped working on 23 September.
+
+  Also checked before bumping: `setup-node` v5+ auto-enables npm caching when `packageManager` or `devEngines.packageManager` is set, which would change caching behavior. No `package.json` in this repo sets either field, so the bump is inert beyond the runtime version.
+
 ### Fixed
+- **Control-plane no longer 503s every proxied request when ghost-link is on HTTPS** (`control-plane/pkg/proxy/proxy.go`):
+  `NewChatProxy` computed the loopback check and threw it away (`_ = ...`), so an `https` backend URL got a default `http.Client` with full certificate verification. ghost-link serves TLS whenever `settings.enable_tls` is set, which includes loopback (`use_tls = enable_tls || !is_loopback_host(host)`), and presents a self-signed cert -- so the handshake failed and `forward()` answered `Backend unreachable` (503) for everything it proxied.
+  `/health` kept reporting `status: ok` the whole time, because that handler echoes the configured backend URL without ever using the proxy client. The gateway looked healthy while every real API call failed.
+  Loopback `https` backends now get an `InsecureSkipVerify` transport. Scoped to loopback deliberately: a non-loopback `https` backend keeps full verification, and a plaintext `http` backend is untouched. Covered by `control-plane/pkg/proxy/proxy_tls_test.go` -- 4 tests, including a direct regression test asserting a reachable loopback TLS backend does not produce 503.
 - **Streaming chat turns now record a trace event** (`crates/ghost-link/src/main.rs`):
   `handle_gui_chat`'s three SSE arms each `return Sse::new(...)` before reaching the shared `record_trace` call, so the GUI's default streaming path recorded **no** turn trace at all. Only the non-streaming fallback and the OpenAI-compat server were traced. Added the trace to the Ollama and native stream finalizers, where the TTFT/tokens-per-second metrics were already being recorded -- so the trace carries the same real token count and latency rather than a second, separately-derived number.
   The third SSE path (replaying a completed `response_text`) already flows through the shared call and needed no change.
   Found by end-to-end test, not inspection: a live streaming chat left `/api/inference/traces` empty. Verified after the fix -- `{"kind":"chat","latency_ms":1328,"output_tokens":23}`.
-- Prebuilt llama.cpp binaries (`tools/llama.cpp/`)- **RAG workspace indexing no longer requires Ollama** (`crates/ghost-link/src/main.rs`):
+- **RAG workspace indexing no longer requires Ollama** (`crates/ghost-link/src/main.rs`):
   the `/api/workspace/index` pre-flight probe hard-coded an Ollama health check, so a llama-only machine was answered `Ollama isn't reachable ... status: skipped` while its actual embedding backend was running fine. The probe now mirrors `mcp-rag`'s backend selection: an explicit backend probes only that one, and `auto` requires only that *either* answers.
   This was found by the live test above, not by inspection -- the first version of the change looked correct and still returned the Ollama error.
 - Prebuilt llama.cpp binaries (`tools/llama.cpp/`) and locally-fetched GGUF weights (`models/nomic-embed-text*.gguf`) are gitignored. Neither belongs in the repo.

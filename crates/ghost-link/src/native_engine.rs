@@ -717,6 +717,33 @@ impl NativeEngineClient {
             .unwrap_or(false)
     }
 
+    /// Whether llama-server can actually *serve* a request yet, as opposed to
+    /// merely running.
+    ///
+    /// `/health` answers 200 as soon as the HTTP listener is up, which happens
+    /// before the model finishes loading. During that window the inference
+    /// endpoints answer `503 {"message":"Loading model"}`. A load path that trusts
+    /// `/health` alone therefore reports the model ready and then immediately
+    /// issues its warmup generation into a server that is still loading -- which
+    /// is how `[model-load] Warmup request failed (ignored)` happens, and why the
+    /// first real request after a swap pays a cold-start penalty the warmup was
+    /// supposed to remove.
+    ///
+    /// `/slots` is served only once the slots exist, and while loading it returns
+    /// the same 503 as the inference endpoints, so it distinguishes the two states
+    /// without generating anything.
+    async fn check_llama_server_serving(url: &str) -> bool {
+        let base = Self::normalize_llama_base_url(url);
+        let client = reqwest::Client::new();
+        client
+            .get(format!("{base}/slots"))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+    }
+
     /// Model-ready timeout, in seconds, for a specific `llama-server` launch
     /// arg set. Real distributed (`--rpc`) loads take far longer than
     /// single-node loads of the same-sized file — confirmed this session:
@@ -789,8 +816,15 @@ impl NativeEngineClient {
         let timeout = Duration::from_secs(timeout_secs);
         let base = Self::normalize_llama_base_url(url);
 
+        // Two gates: `/health` (process listening) then `/slots` (model actually
+        // servable). The second one is what makes the post-load warmup meaningful.
+        let mut listening = false;
         while start.elapsed() < timeout {
-            if Self::check_llama_server_health(&base).await {
+            if !listening {
+                if Self::check_llama_server_health(&base).await {
+                    listening = true;
+                }
+            } else if Self::check_llama_server_serving(&base).await {
                 return Ok(());
             }
             match child.try_wait() {
@@ -808,8 +842,14 @@ impl NativeEngineClient {
         }
 
         Err(format!(
-            "llama-server did not become ready within {} seconds at {}/health",
-            timeout_secs, base
+            "llama-server did not become ready within {} seconds at {} ({})",
+            timeout_secs,
+            base,
+            if listening {
+                "/health answered but /slots never did (model still loading?)"
+            } else {
+                "/health never answered (process not listening?)"
+            }
         ))
     }
 
