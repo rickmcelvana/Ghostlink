@@ -14,6 +14,14 @@ All notable changes to Ghostlink Studio are documented here.
   `llama-server -m models/nomic-embed-text-v1.5.Q4_K_M.gguf --embedding --pooling mean --host 127.0.0.1 --port 8081`
   Vectors are only comparable within a model, so switching backend requires re-indexing; the config comment says so.
 
+### Changed
+- **Bumped the last `actions/setup-node@v4` pin to `@v7`** (`.github/workflows/ci.yml`):
+  GitHub removed the Node 20 runtime from Actions runners on 23 September 2026; JavaScript actions now run on Node 24. The `v4` tag still declares `runs.using: node20` (`v5` onward declare `node24`), and runners have been rewriting `node20` to `node24` since 16 June -- so this was never broken, just the one inconsistent pin in the repo. Every other workflow already used `@v7`.
+
+  Note this is the **action runtime**, not the build Node: `node-version: 20` selects the Node that runs `npm ci` / `vitest` / `tsc` and is unaffected by the runner change. Verified no `ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION` opt-out is referenced anywhere, since that escape hatch stopped working on 23 September.
+
+  Also checked before bumping: `setup-node` v5+ auto-enables npm caching when `packageManager` or `devEngines.packageManager` is set, which would change caching behavior. No `package.json` in this repo sets either field, so the bump is inert beyond the runtime version.
+
 ### Fixed
 - **Control-plane no longer 503s every proxied request when ghost-link is on HTTPS** (`control-plane/pkg/proxy/proxy.go`):
   `NewChatProxy` computed the loopback check and threw it away (`_ = ...`), so an `https` backend URL got a default `http.Client` with full certificate verification. ghost-link serves TLS whenever `settings.enable_tls` is set, which includes loopback (`use_tls = enable_tls || !is_loopback_host(host)`), and presents a self-signed cert -- so the handshake failed and `forward()` answered `Backend unreachable` (503) for everything it proxied.
