@@ -22,6 +22,8 @@ import {
   Paperclip,
   FileText,
   Search,
+  AlertTriangle,
+  Layers,
   Pin,
   PinOff,
   Square,
@@ -578,6 +580,7 @@ export const ChatTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
                 toolCalls: data.tool_results,
                 pendingToolCall: data.pending_tool_call,
                 truncatedBefore: !!data.truncated,
+                summarizedHistory: !!data.summarized_history,
                 timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
               }
             : m
@@ -1266,6 +1269,39 @@ export const ChatTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
                         <span>{m.timestamp}</span>
                         {m.model && <span className="text-[10px] bg-slate-900 border border-slate-800 px-1.5 py-0.2 rounded">{m.model.split("/").pop()}</span>}
                       </div>
+
+                      {/* Context indicators, assistant turns only.
+                          Two distinct states, deliberately not merged: `truncatedBefore`
+                          means older turns were dropped to fit this turn's token limit,
+                          while `summarizedHistory` means the model answered from a
+                          running summary of turns trimmed in *earlier* requests. Showing
+                          only the second would hide the case where the gap is still
+                          growing; showing only the first would imply nothing is being
+                          retained. */}
+                      {!isUser && (m.truncatedBefore || m.summarizedHistory) && (
+                        <div className="mb-1.5 flex flex-wrap items-center gap-1.5">
+                          {m.truncatedBefore && (
+                            <span
+                              title="Older turns in this conversation were dropped from the model's context to fit the token limit. They are not in the transcript the model saw."
+                              aria-label="Earlier turns were dropped from this reply's context to fit the token limit"
+                              className="inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded-full border border-amber-500/30 bg-amber-500/10 text-amber-300"
+                            >
+                              <AlertTriangle size={10} aria-hidden="true" />
+                              earlier turns dropped
+                            </span>
+                          )}
+                          {m.summarizedHistory && (
+                            <span
+                              title="The model is answering from a condensed summary of earlier turns rather than the full transcript."
+                              aria-label="This reply was produced from a condensed summary of earlier turns"
+                              className="inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded-full border border-indigo-500/30 bg-indigo-500/10 text-indigo-300"
+                            >
+                              <Layers size={10} aria-hidden="true" />
+                              answering from summary
+                            </span>
+                          )}
+                        </div>
+                      )}
 
                       {isEditing ? (
                         <div className="space-y-2 bg-slate-900 p-3 rounded-2xl border border-slate-800">

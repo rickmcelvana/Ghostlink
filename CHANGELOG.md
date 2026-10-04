@@ -36,6 +36,18 @@ All notable changes to Ghostlink Studio are documented here.
 
   9 tests cover single-use, expiry, loopback refusal, `X-Forwarded-For` spoofing from a remote peer, IPv6 loopback, and rejection of empty/garbage/oversized input.
 
+### Added
+- **The chat now shows when context was dropped or condensed** (`ghostlink_gui_modern/src/components/ChatTab.tsx`, `ghostlink_gui_modern/src/store.ts`):
+  two indicators above an assistant reply, kept deliberately distinct:
+  - **earlier turns dropped** (amber) — the server trimmed older turns from *this* reply's context to fit the token limit.
+  - **answering from summary** (indigo) — the model answered from a running summary of turns trimmed in *earlier* requests.
+
+  Merging them would hide the case where the gap is still growing: "we dropped something" and "we are still holding a condensed memory" are different facts, and a user debugging a forgotten detail needs to tell them apart.
+
+  `summarized_history` was already in the API response but nothing consumed it, and `truncatedBefore` was being set on the message but never rendered -- so both signals were invisible. Both now surface, with `title` and `aria-label` text explaining what actually happened.
+
+  5 new tests cover each indicator, both together, neither, and that a user message never shows them.
+
 ### Fixed
 - **Conversation summaries now survive a restart** (`crates/ghost-link/src/main.rs`, `.gitignore`):
   `BackendState::session_summaries` was in-memory only, so a long session that had been trimmed lost its condensed memory on restart and the next turn re-read from scratch — the summarization work was effectively undone by a crash or a redeploy.
