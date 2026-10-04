@@ -11703,26 +11703,32 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         session_summaries: HashMap::new(),
     }));
 
-    // Start the scheduler driver. The executor runs a real agent turn
-    // through the native path, so a scheduled run gets the same capability
-    // gate, approval queue, and workspace scoping as interactive chat --
-    // a schedule is not a privileged route.
-    {
-        let exec_state = Arc::clone(&state);
-        let schedules = active_schedules();
-        tokio::spawn(async move {
-            schedule_driver_loop(schedules, move |schedule| {
-                let state = Arc::clone(&exec_state);
-                async move { run_scheduled_turn(state, schedule).await }
-            })
-            .await;
-        });
-    }
-
     // Background CPU/RAM/GPU sampler — keeps /api/metrics non-blocking.
     host_metrics::ensure_host_sampler();
 
+    // Built here, spawned inside `rt.block_on` below: `tokio::spawn` panics with
+    // "there is no reactor running" if called before the runtime is entered, and
+    // this function constructs the runtime itself. The CI backend smoke test
+    // caught that the hard way.
+    let scheduler_state = Arc::clone(&state);
+
     rt.block_on(async {
+        // The scheduler driver. Each run is a real agent turn through the native
+        // path, so a scheduled run gets the same capability gate, approval
+        // queue, and workspace scoping as interactive chat -- a schedule is not
+        // a privileged route.
+        {
+            let exec_state = Arc::clone(&scheduler_state);
+            let schedules = active_schedules();
+            tokio::spawn(async move {
+                schedule_driver_loop(schedules, move |schedule| {
+                    let state = Arc::clone(&exec_state);
+                    async move { run_scheduled_turn(state, schedule).await }
+                })
+                .await;
+            });
+        }
+
         // Connects every enabled server in mcp_servers.toml (spawning stdio
         // child processes, some of which pull an npx package on first run) —
         // done in the background so a slow/misconfigured server can't delay
