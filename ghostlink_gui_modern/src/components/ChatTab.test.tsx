@@ -88,6 +88,75 @@ describe('ChatTab', () => {
     });
   });
 
+  // Context indicators. The two states are deliberately distinct: `truncated`
+  // means older turns were dropped to fit THIS reply's token limit, while
+  // `summarized_history` means the model answered from a running summary of turns
+  // trimmed in EARLIER requests. Merging them would hide the case where the gap
+  // is still growing.
+  function seedAssistantMessage(extra: Record<string, unknown>) {
+    useAppStore.setState({
+      chatMessages: [
+        { role: 'user', content: 'hi', id: 'u1', timestamp: '10:00' },
+        { role: 'assistant', content: 'hello', id: 'a1', timestamp: '10:00', ...extra },
+      ],
+    } as never);
+  }
+
+  afterEach(() => {
+    useAppStore.setState({ chatMessages: [] } as never);
+  });
+
+  it('shows the dropped-turns indicator when the server trimmed this turn', () => {
+    seedAssistantMessage({ truncatedBefore: true });
+    render(<ChatTab api={createMockApi()} />);
+    expect(
+      screen.getByLabelText(/earlier turns were dropped from this reply/i)
+    ).toBeInTheDocument();
+  });
+
+  it('shows the summary indicator when answering from condensed memory', () => {
+    seedAssistantMessage({ summarizedHistory: true });
+    render(<ChatTab api={createMockApi()} />);
+    expect(
+      screen.getByLabelText(/produced from a condensed summary of earlier turns/i)
+    ).toBeInTheDocument();
+  });
+
+  it('shows both indicators when both conditions apply', () => {
+    seedAssistantMessage({ truncatedBefore: true, summarizedHistory: true });
+    render(<ChatTab api={createMockApi()} />);
+    expect(
+      screen.getByLabelText(/earlier turns were dropped from this reply/i)
+    ).toBeInTheDocument();
+    expect(
+      screen.getByLabelText(/produced from a condensed summary of earlier turns/i)
+    ).toBeInTheDocument();
+  });
+
+  it('shows neither indicator on an ordinary reply', () => {
+    seedAssistantMessage({});
+    render(<ChatTab api={createMockApi()} />);
+    expect(
+      screen.queryByLabelText(/earlier turns were dropped from this reply/i)
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByLabelText(/produced from a condensed summary of earlier turns/i)
+    ).not.toBeInTheDocument();
+  });
+
+  it('never shows context indicators on a user message', () => {
+    useAppStore.setState({
+      chatMessages: [
+        { role: 'user', content: 'hi', id: 'u1', timestamp: '10:00', summarizedHistory: true },
+        { role: 'assistant', content: 'hello', id: 'a1', timestamp: '10:00' },
+      ],
+    } as never);
+    render(<ChatTab api={createMockApi()} />);
+    expect(
+      screen.queryByLabelText(/produced from a condensed summary of earlier turns/i)
+    ).not.toBeInTheDocument();
+  });
+
   it('renders the chat interface', () => {
     const api = createMockApi();
     render(<ChatTab api={api} />);
