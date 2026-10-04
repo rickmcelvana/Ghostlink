@@ -372,27 +372,41 @@ $env:GHOSTLINK_LLAMA_THREADS = [Math]::Max(1, $logicalCores - 1)
 # micro-batch (-b 1024 -ub 512 vs -b 512 -ub 256) measured ~2.3x the
 # throughput (31.3 -> 71.8 tok/s).
 #
-# GHOSTLINK_LLAMA_NGL is pinned to -1 (offload every layer) as a deliberate,
-# *measured* choice, not the default get_ngl() in native_engine.rs would
-# pick on its own for a large model. This machine's GPU is integrated --
-# "VRAM" is the same physical RAM as everything else, so llama.cpp's Vulkan
-# backend offloading a layer doesn't move its weights out of system RAM, it
-# duplicates them into a separate device-local allocation. Measured with a
-# controlled back-to-back comparison (same 13.6GB model, same prompt, same
-# seed, same direct llama-server timings) at ngl 0 / 24 / -1:
+# GHOSTLINK_LLAMA_NGL is pinned to -1 (offload every layer) rather than the
+# default get_ngl() in native_engine.rs would pick on its own for a large model.
+# This machine's GPU is integrated -- "VRAM" is the same physical RAM as
+# everything else, so llama.cpp's Vulkan backend offloading a layer does not
+# move its weights out of system RAM, it duplicates them into a separate
+# device-local allocation.
 #
-#   ngl    decode speed   committed memory   free system RAM while loaded
-#   0      8.78 tok/s     0.54GB             ~18GB
-#   24     8.03 tok/s     7.35GB             ~11GB   (worse than 0 -- not a viable middle ground)
-#   -1     16.84 tok/s    14.15GB            ~0.4GB  (reproduced twice)
+# Measured 2026-10-04 on this machine, Qwen3.8-27B-UD-IQ3_S (12.04GB), 16
+# threads, -b 1024 -ub 512 -fa on, 96 generated tokens, median of 3 runs each:
 #
-# Full offload is genuinely ~1.9x faster, at the cost of leaving well under
-# 1GB free for everything else on this 27.6GB host while a model is loaded.
-# That's a real, known, accepted risk on this machine -- not an oversight --
-# chosen for the throughput. get_ngl() still defaults large models toward
-# CPU-only automatically when GHOSTLINK_LLAMA_NGL is *not* set, as a safety
-# net for other deployments/hosts that haven't made this same measured
-# tradeoff; this script opts out of that default explicitly.
+#   ngl    decode speed   median TTFT   free system RAM while loaded
+#   0      2.52 tok/s     1.23s         9.0GB
+#   -1     3.53 tok/s     2.13s         8.6GB   (66/66 layers offloaded, 10.6GB Vulkan0 buffer)
+#
+# So full offload is ~1.4x faster here, and costs ~10.6GB of duplicated weights.
+#
+# CORRECTION: an earlier version of this comment claimed 8.78 / 8.03 / 16.84
+# tok/s at ngl 0 / 24 / -1, from a 13.6GB Qwen3-Coder-30B. Those figures did not
+# reproduce -- on this model they are off by ~3-5x in the launcher's favour. The
+# original run may have measured something else (a warm slot, a different prompt
+# length, a sampling path that skipped work), or may simply have been wrong; it
+# was reproduced twice at the time and should have caught that. Treat the table
+# above as the current measurement and re-run it rather than trusting either set
+# of numbers on a different model or driver.
+#
+# The ngl -1 default is kept: 1.4x throughput is worth the duplicated allocation
+# on a 31GB host, and get_ngl() still defaults large models toward CPU-only when
+# GHOSTLINK_LLAMA_NGL is *not* set, as a safety net for other hosts that have not
+# made this same tradeoff. This script opts out of that default explicitly.
+#
+# Note the absolute numbers are still low: ~3.5 tok/s is roughly 20s for a
+# paragraph. On this hardware the 27B is compute-bound, not memory-bound, so
+# offload helps TTFT and warm-cache reuse more than it helps decode. If
+# interactive speed matters more than model size, a smaller model is the lever --
+# Llama-3.2-3B measured ~0.5s TTFT on this machine.
 
 # GHOSTLINK_FIRST_TOKEN_TIMEOUT_SECS raised from its 30s default to 120s.
 # Measured on this machine with Qwen3.8-27B-UD-IQ3_S at ngl -1 (full offload),
@@ -465,6 +479,17 @@ $env:GHOSTLINK_BACKEND_URL = "${ApiScheme}://${ApiHost}:${ApiPort}"
 # fall through and consume rate-limit budget instead, so ordinary polling
 # load can trip the rate limiter far sooner than it's supposed to.
 $env:GHOSTLINK_API_KEY_PATH = Join-Path $RootDir "api_key.txt"
+
+# Same cwd problem, and this one breaks the proxy outright. To reach an HTTPS
+# ghost-link on loopback, control-plane pins that certificate rather than
+# disabling verification, and resolves it from GHOSTLINK_TLS_CERT_PATH -- falling
+# back to "tls_cert.pem" relative to its own working directory, which is
+# $ControlPlaneDir, not $RootDir where ghost-link actually writes it. Unset, the
+# pin finds no cert, falls back to system roots, fails verification, and every
+# proxied request returns "Backend unreachable" (503) -- while /health keeps
+# reporting ok, because that handler never uses the proxy client. Pin it
+# explicitly for the same reason as the API key path above.
+$env:GHOSTLINK_TLS_CERT_PATH = Join-Path $RootDir "tls_cert.pem"
 
 $cpLog = Join-Path $LogDir "control_plane.log"
 $cpProc = Start-Process -FilePath $ControlPlaneBin `

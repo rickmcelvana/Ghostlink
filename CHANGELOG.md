@@ -22,7 +22,68 @@ All notable changes to Ghostlink Studio are documented here.
 
   Also checked before bumping: `setup-node` v5+ auto-enables npm caching when `packageManager` or `devEngines.packageManager` is set, which would change caching behavior. No `package.json` in this repo sets either field, so the bump is inert beyond the runtime version.
 
+### Added
+- **One-time bootstrap code so the GUI can authenticate without the raw API key** (`crates/ghost-link/src/bootstrap.rs`, `crates/ghost-link/src/main.rs`):
+  the GUI holds credentials in memory only (`api.ts` keeps `apiKey` out of `localStorage` deliberately), so a freshly loaded page has none and every request 401s until an operator pastes the Admin key into SecurityTab. The symptom was a bare `Failed to load agent task execution (401)`.
+
+  The obvious fix -- an endpoint returning `api_key.txt` -- is the wrong shape: it makes a permanent, full-privilege credential retrievable over HTTP, and ghost-link's TLS is self-signed, so a client that cannot pin the cert cannot verify the channel either.
+
+  Instead the server prints a single-use bootstrap code at startup, and `POST /api/security/bootstrap` trades it for a **short-lived JWT** through the existing `auth::issue_jwt` path. `auth::authenticate` already accepts a JWT as a bearer token, honours it only while its subject key still exists, and reads role fresh from the live record.
+
+  The code is single-use (consumed on redemption, whatever the outcome), expires after `GHOSTLINK_BOOTSTRAP_TTL_SECS` (default 300), is 128 bits from the OS CSPRNG via `rand::rngs::OsRng`, and is **refused from anything but loopback**. `X-Forwarded-For` is honoured only when the immediate peer is itself loopback, so a remote caller cannot spoof loopback to get past that check.
+
+  `/api/security/bootstrap` is unauthenticated by necessity, not oversight -- the caller has no credential yet, which is why it is calling. It is constrained by the properties above and returns a JWT, never key material. Audited on both success and failure like any other auth event.
+
+  9 tests cover single-use, expiry, loopback refusal, `X-Forwarded-For` spoofing from a remote peer, IPv6 loopback, and rejection of empty/garbage/oversized input.
+
 ### Fixed
+- **Bootstrap-code tests no longer fail intermittently in parallel** (`crates/ghost-link/src/bootstrap.rs`):
+  the code store is process-global — one `OnceLock<Mutex<HashMap<..>>>`, which is correct for the server since exactly one code is live per process. Under `cargo test`, though, tests share that store on parallel threads and `issue_code()` *clears* it before inserting, so one test issuing a code could wipe another's mid-assertion.
+
+  Caught on CI, not locally: `redemption_is_single_use` and `refused_from_non_loopback` failed in `Production Gate` while passing on this machine, because the two machines have different core counts and therefore different thread scheduling. The tests now hold a serialising guard. Verified with 25 consecutive runs at `--test-threads 16`.
+
+### Fixed
+- **Model loads now warn before a GPU-offload OOM instead of dying inside Vulkan** (`crates/ghost-link/src/native_engine.rs`):
+  full offload allocates a *second* copy of the weights in device memory alongside the host copy, so a model that loads comfortably at `-ngl 0` can fail at `-ngl -1` purely because something else on the machine grew.
+
+  Measured on this machine with Qwen3.8-27B-UD-IQ3_S (12.04GB), 16 threads, 3 runs per configuration:
+
+  | ngl | decode | TTFT | resident | loaded |
+  |---|---|---|---|---|
+  | 0 | 2.28 / 2.37 tok/s | 1.46s | 12.24 GB | 2/2 |
+  | 12 | 2.21 tok/s | 1.64s | 12.27 GB | 1/1 |
+  | 24 | 2.28 tok/s | 1.70s | 12.29 GB | 1/1 |
+  | **-1** | **3.88 / 3.91 tok/s** | 2.25s | 12.64 GB | **2/2** |
+
+  Two findings from that, both contrary to what the repo previously documented:
+  - **Partial offload is not a middle ground here.** `ngl` 12 and 24 land within noise of CPU-only (2.21-2.28 vs 2.28-2.37). Only full offload helps, at **1.65x**.
+  - **The OOM was a memory precondition, not a bad setting.** The same `-ngl -1` load succeeded twice at ~22GB free and failed three times at ~11GB free with `vk::Device::allocateMemory: ErrorOutOfDeviceMemory`. So `-ngl -1` is kept as the default and a precondition check warns when free memory is short, naming the requirement, what is available, and `GHOSTLINK_LLAMA_NGL=0` as the escape hatch.
+
+  The check warns rather than refuses: the estimate is conservative and refusing to load a model that would in fact fit would be worse. CPU-only loads are exempt, since there is no duplicate allocation.
+
+  Also corrects a memory figure in `launch-native.ps1`: CPU-only `ngl 0` shows **12.24 GB resident**, not the ~0.5 GB previously claimed, because resident memory includes the mmap'd model file at every `ngl`. Offload saves the duplicate device copy, not the whole model.
+
+### Fixed
+- **Review pane no longer drops the verification verdict, and its note field works** (`ghostlink_gui_modern/src/components/ReviewPane.tsx`, `ghostlink_gui_modern/src/api.ts`):
+  the backend's `ReviewPacket` carries `verification: Vec<VerificationResult>` and `checks`, but `api.ts` never declared either and `ReviewPane` rendered neither. A reviewer saw only `risks: ["Verification produced no results — change is UNVERIFIED"]` next to an empty diff pane -- so the one piece of information that determines whether a change was tested was invisible, and an untested change looked the same as a verified one.
+
+  The pane now renders a tri-state verdict banner in the header, matching the backend's `verification_passed() -> Option<bool>`, which deliberately returns `None` when nothing ran: **passed**, **failed**, or **NOT run — UNVERIFIED**. Each verification command shows pass / exit code / timeout plus the captured excerpt on failure, since the backend truncates output specifically so a reviewer can see *why* something failed. `checks` is now rendered too.
+
+  Also fixed a typo that made the "Request Changes" note field unreachable: the setter was declared `setShowNoteNoteInput` (doubled `Note`) while the button called `setShowNoteInput`, so clicking it threw instead of opening the input.
+
+  `ReviewPacket` was also not exported from `api.ts` despite being imported by `ChatTab`, `ReviewPane` and `TaskView`; it now is.
+
+- Empty-diff state explains itself ("this run produced no diffs to review... check the verification panel") instead of showing a bare blank pane.
+
+### Fixed
+- **`launch-native.ps1` pins `GHOSTLINK_TLS_CERT_PATH`, without which the control-plane 503s every proxied request** (`launch-native.ps1`):
+  the control-plane starts with its working directory set to `control-plane/`, but ghost-link writes `tls_cert.pem` to the repo root. So the proxy's pinned cert pool looked in the wrong place, fell back to system roots, failed verification against the self-signed cert, and returned `Backend unreachable` for every proxied request while `/health` kept reporting ok.
+
+  This is the same cwd hazard the launcher already documents for `api_key.txt`, and it now gets the same explicit path. Verified both ways from `control-plane/` as cwd: without the variable `/api/metrics` returns 503, with it 200.
+
+  Worth noting how it slipped through: the proxy's own tests and the live check both passed, because both ran the control-plane from the repo root. Only reading the launcher's actual `-WorkingDirectory` argument exposed it.
+
+### Changed
 - **Control-plane no longer 503s every proxied request when ghost-link is on HTTPS** (`control-plane/pkg/proxy/proxy.go`):
   `NewChatProxy` computed the loopback check and threw it away (`_ = ...`), so an `https` backend URL got a default `http.Client` with full certificate verification. ghost-link serves TLS whenever `settings.enable_tls` is set, which includes loopback (`use_tls = enable_tls || !is_loopback_host(host)`), and presents a self-signed cert -- so the handshake failed and `forward()` answered `Backend unreachable` (503) for everything it proxied.
   `/health` kept reporting `status: ok` the whole time, because that handler echoes the configured backend URL without ever using the proxy client. The gateway looked healthy while every real API call failed.

@@ -4554,6 +4554,11 @@ struct ChatHistoryTurn {
 }
 
 #[derive(Debug, Deserialize)]
+struct BootstrapExchangeRequest {
+    code: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct GuiChatRequest {
     message: String,
     #[serde(default)]
@@ -5101,7 +5106,12 @@ async fn auth_middleware(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    if req.uri().path() == "/health" {
+    // `/health` and the bootstrap exchange are the only unauthenticated routes.
+    // The exchange is unauthenticated by necessity, not by oversight: the caller
+    // has no credential yet, which is why it is calling. It is constrained instead
+    // by being single-use, loopback-only and short-lived (see `bootstrap`), and it
+    // returns a JWT rather than key material.
+    if req.uri().path() == "/health" || req.uri().path() == "/api/security/bootstrap" {
         return next.run(req).await;
     }
 
@@ -8425,6 +8435,69 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                     Some(err.clone()),
                 );
                 Json(serde_json::json!({ "status": "error", "error": err }))
+            }
+        }
+    }
+
+    /// Exchanges a one-time bootstrap code for a short-lived JWT.
+    ///
+    /// The GUI keeps credentials in memory only, so a freshly loaded page has none
+    /// and every request 401s. Rather than exposing the raw `api_key.txt` over HTTP
+    /// -- which would turn a permanent Admin credential into something retrievable --
+    /// the operator gets a single-use, short-lived code printed at startup and the
+    /// GUI trades it for a JWT via this endpoint. See `bootstrap` for the
+    /// single-use/loopback/expiry properties.
+    ///
+    /// Deliberately unauthenticated (see `auth_middleware`): the caller has no
+    /// credential yet, which is the whole reason the endpoint exists. It returns a
+    /// JWT and nothing else -- never key material.
+    async fn handle_bootstrap_exchange(
+        State(state): State<Arc<Mutex<BackendState>>>,
+        ConnectInfo(addr): ConnectInfo<SocketAddr>,
+        headers: axum::http::HeaderMap,
+        Json(req): Json<BootstrapExchangeRequest>,
+    ) -> Json<serde_json::Value> {
+        let forwarded = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
+        match bootstrap::redeem(&req.code, &addr, forwarded) {
+            Ok(code) => {
+                // The code is the JWT subject. Tying the minted token to the code
+                // rather than to a shared placeholder means revoking it means
+                // restarting the server, which is exactly the lifetime we want.
+                match auth::issue_jwt(&format!("bootstrap:{code}")) {
+                    Ok(token) => {
+                        record_audit_event(
+                            &mut lock_state(&state),
+                            "bootstrap_exchange",
+                            "SUCCESS",
+                            addr.ip().to_string(),
+                            None,
+                        );
+                        Json(serde_json::json!({
+                            "status": "ok",
+                            "token": token,
+                        }))
+                    }
+                    Err(err) => {
+                        record_audit_event(
+                            &mut lock_state(&state),
+                            "bootstrap_exchange",
+                            "FAILED",
+                            addr.ip().to_string(),
+                            Some(err.clone()),
+                        );
+                        Json(serde_json::json!({ "status": "error", "error": err }))
+                    }
+                }
+            }
+            Err(reason) => {
+                record_audit_event(
+                    &mut lock_state(&state),
+                    "bootstrap_exchange",
+                    "FAILED",
+                    addr.ip().to_string(),
+                    Some(reason.to_string()),
+                );
+                Json(serde_json::json!({ "status": "error", "error": reason }))
             }
         }
     }
@@ -12012,6 +12085,7 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                 post(handle_tool_confirm),
             )
             .route("/api/inference/capabilities", get(handle_capabilities))
+            .route("/api/security/bootstrap", post(handle_bootstrap_exchange))
             .route("/api/inference/traces", get(handle_traces))
             .route("/api/inference/skills", get(handle_skills))
             .route("/api/inference/schedules", get(handle_schedules_list))
@@ -12096,6 +12170,19 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             // (see otel.rs); otherwise it's just a normal tracing event, no
             // behavior change from before this existed.
             .layer(TraceLayer::new_for_http());
+
+        // Printed rather than written anywhere durable: the GUI's in-memory-only
+        // credential means a fresh page load has none, and this code is how it
+        // obtains a short-lived JWT without ever exposing the raw API key. Single
+        // use, expires in a few minutes, refused from anywhere but loopback.
+        let bootstrap_code = bootstrap::issue_code();
+        println!(
+            "\nGUI bootstrap code (valid {}s, single use, loopback only): {bootstrap_code}",
+            std::env::var("GHOSTLINK_BOOTSTRAP_TTL_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(300)
+        );
 
         // addr already parsed above; `use_tls` computed earlier alongside
         // `BackendState.enable_tls_active`.
@@ -14166,6 +14253,7 @@ mod backend_api;
 mod backend_config;
 mod backend_plugin;
 mod backend_registry;
+mod bootstrap;
 mod capability;
 mod host_metrics;
 mod inference_engine;

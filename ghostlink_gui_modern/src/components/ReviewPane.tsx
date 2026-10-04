@@ -2,7 +2,7 @@ import { resolveApiBase } from '../config';
 import React, { useState } from 'react';
 import { DiffEditor } from '@monaco-editor/react';
 import { Check, X, RefreshCw, AlertTriangle, Terminal, Shield, FileText } from 'lucide-react';
-import { ReviewPacket, ReviewDiff, GhostlinkAPI } from '../api';
+import { ReviewPacket, ReviewDiff, VerificationResult, GhostlinkAPI } from '../api';
 import { useAppStore } from '../store';
 
 function guessLanguage(path: string): string {
@@ -52,10 +52,18 @@ export const ReviewPane: React.FC<ReviewPaneProps> = ({ packet, api: propApi, on
   const [selectedDiffIndex, setSelectedDiffIndex] = useState<number>(0);
   const [activeAction, setActiveAction] = useState<'accept' | 'request_changes' | 'reject' | null>(null);
   const [note, setNote] = useState<string>('');
-  const [showNoteInput, setShowNoteNoteInput] = useState<boolean>(false);
+  const [showNoteInput, setShowNoteInput] = useState<boolean>(false);
 
   const addToast = useAppStore((state) => state.addToast);
   const currentDiff: ReviewDiff | undefined = packet.diffs[selectedDiffIndex];
+
+  // Tri-state, matching the backend's `verification_passed() -> Option<bool>`:
+  // undefined means no verification was run at all, which is NOT a pass. Rendering
+  // that as green is how an unverified change gets accepted.
+  const verification: VerificationResult[] = packet.verification ?? [];
+  const verificationRan = verification.length > 0;
+  const verificationPassed = verificationRan && verification.every((v) => v.passed);
+  const verificationFailed = verificationRan && !verificationPassed;
 
   const handleDecide = async (decision: 'accept' | 'request_changes' | 'reject') => {
     setActiveAction(decision);
@@ -88,6 +96,39 @@ export const ReviewPane: React.FC<ReviewPaneProps> = ({ packet, api: propApi, on
             <h2 className="text-lg font-bold text-slate-100">ReviewPacket #{packet.id.slice(0, 8)}</h2>
           </div>
           <p className="text-sm text-slate-400 mt-1">{packet.summary}</p>
+          {/* Verification verdict, surfaced at the top rather than in the sidebar.
+              The three states are deliberately distinct: "not run" must never read
+              as "passed". */}
+          <div
+            className={`mt-2 inline-flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs font-bold ${
+              verificationPassed
+                ? 'bg-green-500/15 text-green-300 border border-green-500/30'
+                : verificationFailed
+                ? 'bg-rose-500/15 text-rose-300 border border-rose-500/30'
+                : 'bg-amber-500/15 text-amber-300 border border-amber-500/30'
+            }`}
+            role="status"
+            aria-label={
+              verificationPassed
+                ? `Verification passed: ${verification.length} command(s)`
+                : verificationFailed
+                ? `Verification failed: ${verification.filter((v) => !v.passed).length} of ${verification.length} command(s) failed`
+                : 'Verification not run: this change is UNVERIFIED'
+            }
+          >
+            {verificationPassed ? (
+              <Check size={13} aria-hidden="true" />
+            ) : verificationFailed ? (
+              <X size={13} aria-hidden="true" />
+            ) : (
+              <AlertTriangle size={13} aria-hidden="true" />
+            )}
+            {verificationPassed
+              ? `Verification passed (${verification.length})`
+              : verificationFailed
+              ? `Verification failed (${verification.filter((v) => !v.passed).length}/${verification.length})`
+              : 'Verification NOT run — UNVERIFIED'}
+          </div>
         </div>
 
         {/* Action Buttons */}
@@ -124,7 +165,7 @@ export const ReviewPane: React.FC<ReviewPaneProps> = ({ packet, api: propApi, on
           <button
             onClick={() => {
               if (!showNoteInput) {
-                setShowNoteNoteInput(true);
+                setShowNoteInput(true);
               } else {
                 handleDecide('request_changes');
               }
@@ -202,6 +243,65 @@ export const ReviewPane: React.FC<ReviewPaneProps> = ({ packet, api: propApi, on
             )}
           </div>
 
+          {/* Verification detail */}
+          <div className="p-4 border-b border-slate-800">
+            <h3 className="text-xs font-semibold uppercase text-slate-400 mb-2 flex items-center gap-1.5">
+              <Shield size={14} aria-hidden="true" /> Verification
+            </h3>
+            {!verificationRan ? (
+              <p className="text-xs text-amber-400/90 italic">
+                No verification commands were run for this change.
+              </p>
+            ) : (
+              <div className="space-y-2">
+                {verification.map((v, idx) => (
+                  <div
+                    key={idx}
+                    className={`p-2 rounded border text-xs ${
+                      v.passed
+                        ? 'bg-green-500/5 border-green-500/20'
+                        : 'bg-rose-500/5 border-rose-500/20'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-mono text-slate-200 truncate" title={v.argv.join(' ')}>
+                        {v.argv.join(' ')}
+                      </span>
+                      <span
+                        className={`text-[10px] px-1.5 py-0.5 rounded font-bold uppercase shrink-0 ${
+                          v.passed ? 'bg-green-500/20 text-green-400' : 'bg-rose-500/20 text-rose-400'
+                        }`}
+                      >
+                        {v.timed_out ? 'timeout' : v.passed ? 'pass' : `exit ${v.exit}`}
+                      </span>
+                    </div>
+                    {/* The excerpt is why the backend captured it: a bare
+                        "FAIL" does not tell a reviewer what to fix. */}
+                    {!v.passed && v.excerpt && (
+                      <pre className="mt-1.5 p-1.5 bg-slate-950 rounded text-[10px] text-slate-400 overflow-x-auto max-h-24 whitespace-pre-wrap">
+                        {v.excerpt}
+                      </pre>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Checks */}
+          {packet.checks && packet.checks.length > 0 && (
+            <div className="p-4 border-b border-slate-800">
+              <h3 className="text-xs font-semibold uppercase text-slate-400 mb-2 flex items-center gap-1.5">
+                <Check size={14} aria-hidden="true" /> Checks ({packet.checks.length})
+              </h3>
+              <ul className="list-disc list-inside text-xs text-slate-400 space-y-1">
+                {packet.checks.map((check, idx) => (
+                  <li key={idx}>{check}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+
           {/* Commands Run */}
           {packet.commands && packet.commands.length > 0 && (
             <div className="p-4 border-b border-slate-800">
@@ -257,8 +357,18 @@ export const ReviewPane: React.FC<ReviewPaneProps> = ({ packet, api: propApi, on
               options={{ readOnly: true, renderSideBySide: true, minimap: { enabled: false } }}
             />
           ) : (
-            <div className="h-full flex items-center justify-center text-slate-500 text-sm">
-              Select a diff file to review
+            <div className="h-full flex flex-col items-center justify-center gap-1 text-slate-500 text-sm px-6 text-center">
+              {packet.diffs.length === 0 ? (
+                <>
+                  <span className="font-medium text-slate-400">No file changes proposed</span>
+                  <span className="text-xs">
+                    This run produced no diffs to review. Check the verification panel for
+                    whether anything was actually tested.
+                  </span>
+                </>
+              ) : (
+                'Select a diff file to review'
+              )}
             </div>
           )}
         </div>

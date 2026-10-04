@@ -560,6 +560,53 @@ impl NativeEngineClient {
     /// modest speed gain, and at 24GB+ of duplicated weights left a 27.6GB
     /// host under 1GB free. So large models are capped toward CPU-only here,
     /// independent of the VRAM tier, unless `GHOSTLINK_LLAMA_NGL` overrides it.
+    /// Available system RAM and the rough amount a GPU-offloaded load of this model
+    /// needs, or `None` when it cannot be determined.
+    ///
+    /// Returns `(available_gb, needed_gb)`. The estimate is deliberately
+    /// conservative -- `needed` is the model size plus headroom for the KV cache and
+    /// compute buffers, and the duplicate device allocation is folded into the
+    /// headroom rather than computed exactly. Used only to warn, never to refuse.
+    fn check_offload_memory_headroom(model_size_gb: f32) -> Option<(f32, f32)> {
+        let ngl = Self::get_ngl(model_size_gb);
+        let (needed_gb, _) = Self::check_offload_memory_headroom_for_ngl(model_size_gb, ngl)?;
+        let available_gb = Self::available_system_memory_gb()?;
+        Some((available_gb, needed_gb))
+    }
+
+    /// Pure part of the headroom check, split out so the arithmetic is testable
+    /// without depending on live machine state.
+    ///
+    /// Returns `(needed_gb, model_size_gb)`, or `None` when the load is CPU-only
+    /// and therefore has no duplicate allocation to make room for.
+    fn check_offload_memory_headroom_for_ngl(model_size_gb: f32, ngl: i32) -> Option<(f32, f32)> {
+        if ngl == 0 {
+            return None;
+        }
+        // 1.35x covers the host copy plus a conservative share of the device copy.
+        // On a unified-memory iGPU the device buffer is carved out of the same pool,
+        // so this is the number that actually has to clear.
+        Some((model_size_gb * 1.35, model_size_gb))
+    }
+
+    /// Whether to warn. Split out for the same reason.
+    fn should_warn_about_memory(available_gb: f32, needed_gb: f32) -> bool {
+        available_gb < needed_gb
+    }
+
+    /// Free physical memory in GB, via `sysinfo` (already a dependency).
+    fn available_system_memory_gb() -> Option<f32> {
+        use sysinfo::System;
+        let mut sys = System::new();
+        // This sysinfo version's `refresh_memory` returns `()`, not a Result.
+        sys.refresh_memory();
+        let bytes = sys.available_memory();
+        if bytes == 0 {
+            return None;
+        }
+        Some(bytes as f32 / (1024.0 * 1024.0 * 1024.0))
+    }
+
     fn get_ngl(model_size_gb: f32) -> i32 {
         if let Ok(val) = std::env::var("GHOSTLINK_LLAMA_NGL") {
             if let Ok(n) = val.trim().parse::<i32>() {
@@ -1157,6 +1204,31 @@ impl NativeEngineClient {
         // staging load makes this second load fast.
         Self::stop_owned_llama_server();
         Self::free_llama_port(port);
+
+        // Memory precondition check, after staging proved the arg set works and
+        // immediately before the real spawn.
+        //
+        // Full GPU offload allocates a *second* copy of the weights in device
+        // memory alongside the host copy, so a model that loads comfortably at
+        // `-ngl 0` can fail at `-ngl -1` purely because something else grew.
+        // Observed on this machine: the 12GB IQ3_S 27B loaded at -ngl -1 twice
+        // with ~22GB free, and failed three times with
+        // `vk::Device::allocateMemory: ErrorOutOfDeviceMemory` at ~11GB free.
+        //
+        // The failure mode without this check is nasty: llama-server dies inside
+        // Vulkan with a message most operators cannot connect to "something else
+        // on the machine is using RAM". So warn while there is still a chance to
+        // act -- and warn rather than refuse, because the estimate is conservative
+        // and refusing to load a model that would in fact fit would be worse.
+        if let Some((available_gb, needed_gb)) = Self::check_offload_memory_headroom(model_size_gb)
+        {
+            if Self::should_warn_about_memory(available_gb, needed_gb) {
+                eprintln!(
+                    "[model-load] WARNING: {} GPU-offloaded needs roughly {:.1}GB free (host copy +                      device copy) but only {:.1}GB is available. If this load fails with a Vulkan                      out-of-memory error, close memory-heavy apps or set                      GHOSTLINK_LLAMA_NGL=0 to load CPU-only.",
+                    normalized_path, needed_gb, available_gb
+                );
+            }
+        }
 
         eprintln!("[model-load] Starting llama-server on {port}: {normalized_path}");
         let mut child = build_cmd(port, winning_args).spawn().map_err(|err| {
@@ -2936,5 +3008,46 @@ mod tests {
             NativeEngineClient::compute_model_ready_timeout(&args_huge, 200.0),
             1800
         );
+    }
+
+    /// The memory precondition must not fire for CPU-only loads -- there is no
+    /// duplicate device allocation to make room for.
+    #[test]
+    fn memory_headroom_check_is_skipped_for_cpu_only() {
+        // get_ngl returns 0 for large models when GHOSTLINK_LLAMA_NGL is unset,
+        // so drive the branch directly rather than depending on env.
+        assert_eq!(
+            NativeEngineClient::check_offload_memory_headroom_for_ngl(12.0, 0),
+            None
+        );
+    }
+
+    /// When offloading, the requirement must exceed the model's own size: the
+    /// device buffer is a *second* allocation, not a move.
+    #[test]
+    fn memory_headroom_required_exceeds_model_size() {
+        let (needed, model) = NativeEngineClient::check_offload_memory_headroom_for_ngl(12.0, -1)
+            .expect("offloaded load should require a headroom figure");
+        assert!(
+            needed > model,
+            "needed must exceed model size to cover the device copy"
+        );
+        // 1.35x for a 12GB model.
+        assert!(
+            (needed - 16.2).abs() < 0.05,
+            "expected roughly 16.2GB of headroom"
+        );
+    }
+
+    /// 12GB at -ngl -1 needs ~16.3GB. Anything below that should warn; this is
+    /// the arithmetic that was never visible when llama-server died inside Vulkan.
+    #[test]
+    fn memory_headroom_flags_the_observed_failure_condition() {
+        // Comfortable: 22GB free was observed to load fine, so no warning.
+        assert!(!NativeEngineClient::should_warn_about_memory(22.0, 16.2));
+        // Tight: ~11GB free produced ErrorOutOfDeviceMemory three times, so warn.
+        assert!(NativeEngineClient::should_warn_about_memory(11.0, 16.2));
+        // Exactly at the line is not a warning (the test is strictly-less-than).
+        assert!(!NativeEngineClient::should_warn_about_memory(16.2, 16.2));
     }
 }
