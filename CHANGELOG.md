@@ -202,6 +202,15 @@ All notable changes to Ghostlink Studio are documented here.
 
 ### Fixed
 
+- **Scheduled turns now fire promptly instead of up to five minutes late** (`crates/ghost-link/src/main.rs`):
+  the scheduler driver slept `MAX_TICK` (300s) whenever nothing was due, and nothing could interrupt it. A schedule created just after a tick therefore went unnoticed for up to five minutes — long enough that a freshly created `at` schedule looked broken, and a 09:00 cron entry could fire materially late.
+
+  Verified live: a due `at` schedule took **over four minutes** to fire. Instrumenting the driver showed a single tick with `sleep_ms=300000` followed by nothing at all. After the fix the same schedule fires in **5.0s**.
+
+  The driver now selects on its timer *or* a `tokio::sync::Notify` that the create / enable / disable / delete routes trip. A `Notify` rather than a `Condvar` because the driver is async and awaiting a notification must not block a runtime worker thread.
+
+  2 new tests: a nudge wakes a driver that has nothing due (asserting the dispatch happens in ~5s, so a regression fails by timeout rather than passing slowly), and repeated nudges against an empty store are harmless.
+
 - **The native launcher no longer serves a stale binary** (`launch-native.ps1`):
   the build step was guarded by `if (-not (Test-Path $ApiBin))`, so `ghost-link.exe` was compiled on first run only. Every launch after that reused whatever binary happened to exist — an edited source tree kept serving the code from whenever that file was created.
 

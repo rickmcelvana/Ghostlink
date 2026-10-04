@@ -1841,6 +1841,99 @@ mod scheduler_driver_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// Regression test for the wakeup nudge.
+    ///
+    /// Without it the driver sleeps `MAX_TICK` (300s) whenever nothing is due, so
+    /// a schedule created just after a tick goes unnoticed for five minutes. That
+    /// was not theoretical: a live `at` schedule took over four minutes to fire,
+    /// and the driver's own log showed a single tick with `sleep_ms=300000`
+    /// followed by nothing. A cron entry set for 09:00 could fire materially late
+    /// for the same reason.
+    ///
+    /// The driver here has no schedules at all when it starts, so its first sleep
+    /// is the full `MAX_TICK`. The nudge must cut that short.
+    #[tokio::test]
+    async fn a_nudge_wakes_a_driver_that_has_nothing_due() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(scheduler::ScheduleStore::open(dir.path().join("s.json")));
+        assert!(
+            store.due(scheduler::now_secs()).is_empty(),
+            "precondition: the store starts empty, so the driver would sleep MAX_TICK"
+        );
+
+        let ran = Arc::new(AtomicUsize::new(0));
+        let exec_store = Arc::clone(&store);
+        let exec_ran = Arc::clone(&ran);
+        let driver_store = Arc::clone(&store);
+        let driver = tokio::spawn(schedule_driver_loop(driver_store, move |_s| {
+            let ran = Arc::clone(&exec_ran);
+            let store = Arc::clone(&exec_store);
+            async move {
+                ran.fetch_add(1, Ordering::SeqCst);
+                store.record_run("ws", "x", scheduler::RunStatus::Ok, true);
+                (scheduler::RunStatus::Ok, true)
+            }
+        }));
+
+        // Let the driver reach its (long) sleep.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "nothing is due, so nothing should have run yet"
+        );
+
+        // Now do what the create route does: add a due schedule and nudge.
+        let sched = store
+            .add(
+                "ws",
+                "n",
+                "do it",
+                scheduler::Trigger::At(scheduler::now_secs() - 1),
+            )
+            .unwrap();
+        nudge_schedule_driver();
+
+        // Well under MAX_TICK: if this only passes because 300s elapsed, the test
+        // would have timed out instead.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            1,
+            "the nudge should have woken the driver and dispatched the schedule"
+        );
+        assert!(store.get("ws", &sched.id).is_some());
+
+        driver.abort();
+    }
+
+    /// A nudge with nothing to run must not crash or spin the driver.
+    #[tokio::test]
+    async fn a_nudge_with_no_due_schedule_is_harmless() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(scheduler::ScheduleStore::open(dir.path().join("s.json")));
+        let ran = Arc::new(AtomicUsize::new(0));
+        let exec_ran = Arc::clone(&ran);
+        let driver = tokio::spawn(schedule_driver_loop(store, move |_s| {
+            let ran = Arc::clone(&exec_ran);
+            async move {
+                ran.fetch_add(1, Ordering::SeqCst);
+                (scheduler::RunStatus::Ok, true)
+            }
+        }));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        for _ in 0..5 {
+            nudge_schedule_driver();
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "an empty store has nothing to run, however often it is nudged"
+        );
+        driver.abort();
+    }
+
     /// The driver must dispatch a due schedule through the injected executor and
     /// record the result -- that wiring is what makes a schedule a real agent
     /// turn rather than a row nobody acts on.
@@ -4402,12 +4495,51 @@ where
             .map(|t| (t - scheduler::now_secs()).max(0) as u64)
             .map(|s| Duration::from_secs(s).clamp(MIN_TICK, MAX_TICK))
             .unwrap_or(MAX_TICK);
-        tokio::time::sleep(sleep).await;
+        // Wake on either the timer or an out-of-band nudge (a schedule was just
+        // created or changed), whichever comes first. `enable`/`Notify` pairing
+        // matters: without it a nudge arriving during `due()` could be missed and
+        // the driver would still sleep out the full tick.
+        // Bound first: the future returned by `notified()` borrows the
+        // `Notify`, and `schedule_wakeup()` hands back a temporary Arc.
+        let wakeup = schedule_wakeup();
+        tokio::select! {
+            _ = tokio::time::sleep(sleep) => {}
+            _ = wakeup.notified() => {
+                tracing::info!(
+                    target: "assistant_trace",
+                    "scheduler driver woken by a schedule change"
+                );
+            }
+        }
     }
 }
 
 /// The active schedule store.
 static ACTIVE_SCHEDULES: OnceLock<Arc<scheduler::ScheduleStore>> = OnceLock::new();
+
+/// Tripped whenever a schedule is created, removed, enabled or disabled.
+///
+/// Without this the driver sleeps out `MAX_TICK` (5 minutes) whenever it has
+/// nothing due, so a schedule created a second after a tick waits nearly five
+/// minutes before it is even noticed -- long enough that a freshly created `at`
+/// schedule looks broken, and a 09:00 cron entry can fire materially late. The
+/// store has no way to interrupt the driver's sleep, so the nudge is a channel
+/// rather than a return value.
+///
+/// A `tokio::sync::Notify` rather than a `Condvar`: the driver is async, and
+/// awaiting a notification cannot block a runtime worker thread.
+static SCHEDULE_WAKEUP: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
+
+fn schedule_wakeup() -> Arc<tokio::sync::Notify> {
+    SCHEDULE_WAKEUP
+        .get_or_init(|| Arc::new(tokio::sync::Notify::new()))
+        .clone()
+}
+
+/// Wakes the driver so it re-evaluates due schedules immediately.
+fn nudge_schedule_driver() {
+    schedule_wakeup().notify_one();
+}
 
 fn active_schedules() -> Arc<scheduler::ScheduleStore> {
     ACTIVE_SCHEDULES
@@ -9281,12 +9413,16 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                 }))
             }
         };
-        match active_schedules().add(
+        let result = active_schedules().add(
             &workspace_id,
             req.name.as_deref().unwrap_or(""),
             &req.prompt,
             trigger,
-        ) {
+        );
+        // A newly created schedule may already be due, so wake the driver instead
+        // of letting it sit unnoticed until its next tick.
+        nudge_schedule_driver();
+        match result {
             Ok(s) => Json(serde_json::json!({ "schedule": s.to_summary() })),
             Err(e) => Json(serde_json::json!({ "error": e })),
         }
@@ -9312,6 +9448,9 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
     ) -> Json<serde_json::Value> {
         let workspace_id = scheduler::requested_workspace(req.workspace_id.as_deref());
         if active_schedules().set_enabled(&workspace_id, &req.id, req.enabled) {
+            // A change can make a schedule due (or remove one), so wake
+            // the driver rather than leaving it asleep until its next tick.
+            nudge_schedule_driver();
             Json(serde_json::json!({ "success": true }))
         } else {
             Json(serde_json::json!({ "success": false, "error": "no such schedule" }))
@@ -9323,6 +9462,9 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
     ) -> Json<serde_json::Value> {
         let workspace_id = scheduler::requested_workspace(req.workspace_id.as_deref());
         if active_schedules().remove(&workspace_id, &req.id) {
+            // A change can make a schedule due (or remove one), so wake
+            // the driver rather than leaving it asleep until its next tick.
+            nudge_schedule_driver();
             Json(serde_json::json!({ "success": true }))
         } else {
             Json(serde_json::json!({ "success": false, "error": "no such schedule" }))
