@@ -6,6 +6,18 @@ All notable changes to Ghostlink Studio are documented here.
 
 ## [Unreleased]
 
+### Changed
+- **Replaced `brave-search` with a local, keyless web search** (`mcp_servers.example.toml`, `crates/ghost-link/src/capability.rs`):
+  `brave-search` required `BRAVE_API_KEY` and a paid account, which sat awkwardly against this project's all-local constraint. It is replaced by `duckduckgo-mcp-server` (`npx -y duckduckgo-mcp-server`), verified live: it handshakes, advertises a single tool `duckduckgo_web_search`, and returns real results with no API key.
+  **Stated plainly because it matters operationally:** DuckDuckGo's free HTML endpoint rate-limits aggressively and answers `DDG detected an anomaly in the request, you are likely making requests too quickly` under load. That was observed directly during verification. It suits occasional lookups and is not a high-throughput search backend. A self-hosted SearXNG instance is the sturdier option if that becomes a problem -- it needs a container but no account.
+  Two other candidates were evaluated and rejected on evidence rather than reputation: `free-search-mcp` fails at import (its `selectolax` Modest backend was deprecated at 1.0 and now raises), and `one-search-mcp` requires a `.env` file plus a Chromium install before it will start.
+  Classified `Read`: it queries the public web and writes nothing local.
+
+- **Docker MCP Toolkit gateway connected and classified from its live tool set** (`mcp_servers.toml`, `mcp_servers.example.toml`, `crates/ghost-link/src/capability.rs`):
+  `docker mcp gateway run` (Docker 29.8.1) serves 8 tools, all now classified `Exec`: `mcp-exec`, `code-mode`, `mcp-add`, `mcp-remove`, `mcp-config-set`, `mcp-create-profile`, `mcp-activate-profile`, `mcp-find`. `mcp-exec` and `code-mode` run commands outright; the config-mutating ones decide what the gateway is able to run; `mcp-find` is included as Exec rather than Read because it queries the catalog of servers the gateway can activate.
+  The gateway's *dynamically* activated tools (containers, images, compose) arrive at runtime with names this table has never seen, so they hit the unknown-tool default of `Exec`. That fail-closed behavior is the point -- a tool the gateway invents at runtime cannot be quietly treated as a read.
+  Also worth recording: `docker-code-execution`, `docker-terminal`, and `docker-mcp-gateway` were three entries running the **identical** command, `docker mcp gateway run` -- three duplicate connections to one gateway. The two redundant entries are disabled in the active config; `docker-mcp-gateway` is the one to enable.
+
 ### Fixed
 - **Windows: the three `uvx`-backed MCP servers could not start at all** (`mcp_servers.example.toml`, `mcp_servers.toml`):
   `mcp.os.win32.utilities` imports `pywintypes`, which `uvx`'s ephemeral environment does not include, so `fetch`, `git`, and `sqlite` died at import with `ModuleNotFoundError: No module named 'pywintypes'`. Adding `--with pywin32` to each fixes it; verified by MCP handshake, not by assuming.

@@ -149,14 +149,18 @@ fn build_table() -> ClassTable {
 
     // Web fetch and search are reads with respect to *local* state.
     //
-    // `fetch` and `brave-search` are separate servers and the table keys on
-    // `(server, tool)`, so each needs its own entries. The previous loop filed
+    // `fetch` and `duckduckgo` are separate servers and the table keys on
+    // `(server, tool)`, so each needs its own entries. An earlier version filed
     // `brave_web_search` under `fetch` AND under `brave-search`, which left
-    // `fetch.fetch` — the tool that actually exists — unclassified.
+    // `fetch.fetch` -- the tool that actually exists -- unclassified.
     t.insert(("fetch".into(), "fetch".into()), CapabilityClass::Read);
-    for tool in ["brave_web_search", "brave_web_search_stats", "web_search"] {
-        t.insert(("brave-search".into(), tool.into()), CapabilityClass::Read);
-    }
+    // Verified live from `duckduckgo-mcp-server`: a single tool,
+    // `duckduckgo_web_search`. It queries DuckDuckGo's free HTML endpoint, so
+    // it observes the public web and writes nothing local -- Read.
+    t.insert(
+        ("duckduckgo".into(), "duckduckgo_web_search".into()),
+        CapabilityClass::Read,
+    );
 
     // Sequential thinking is pure inference.
     t.insert(
@@ -196,11 +200,33 @@ fn build_table() -> ClassTable {
     // --- Exec: command or code execution. Never auto-applied, never
     // session-granted. Listed explicitly so the intent is auditable, even
     // though the unknown-tool default already lands here.
+    //
+    // The `docker-mcp-gateway` names are the LIVE tool set from
+    // `docker mcp gateway run` (Docker 29.8.1, MCP Toolkit), not a guess. All
+    // eight are Exec: `mcp-exec` and `code-mode` run arbitrary commands and
+    // code outright, and the `mcp-add`/`mcp-remove`/`mcp-config-set`/
+    // `mcp-create-profile`/`mcp-activate-profile` tools mutate the gateway's own
+    // configuration -- which decides what the gateway is able to run. `mcp-find`
+    // is included rather than treated as a read, because it queries the catalog
+    // of servers the gateway can activate, and a catalog read that reveals what
+    // can be executed is not an observation with no effect.
+    //
+    // Left out: the dynamically activated tools the gateway exposes after
+    // `mcp-add` (containers, images, compose). Those arrive at runtime with
+    // names this table has never seen, so they hit the unknown-tool default --
+    // which is Exec. That fail-closed behavior is the point: a tool the gateway
+    // invents at runtime cannot be quietly treated as a read.
     for (server, tool) in [
         ("terminal", "run_command"),
-        ("docker-terminal", "execute"),
         ("code_execution", "execute_code"),
-        ("docker-code-execution", "execute"),
+        ("docker-mcp-gateway", "mcp-exec"),
+        ("docker-mcp-gateway", "code-mode"),
+        ("docker-mcp-gateway", "mcp-add"),
+        ("docker-mcp-gateway", "mcp-remove"),
+        ("docker-mcp-gateway", "mcp-config-set"),
+        ("docker-mcp-gateway", "mcp-create-profile"),
+        ("docker-mcp-gateway", "mcp-activate-profile"),
+        ("docker-mcp-gateway", "mcp-find"),
     ] {
         t.insert((server.into(), tool.into()), CapabilityClass::Exec);
     }
@@ -663,7 +689,7 @@ mod tests {
     /// an approval for a harmless read.
     ///
     /// Falling back to `Exec` is safe, not correct: it blocked `git_diff_unstaged`,
-    /// `list_tables`, `describe_table`, `fetch.fetch`, and both brave-search
+    /// `list_tables`, `describe_table`, `fetch.fetch`, and `duckduckgo
     /// tools, every one of which is an ordinary observation.
     /// Every tool a configured MCP server actually exposes must be classified.
     ///
@@ -743,14 +769,9 @@ mod tests {
         ("memory", "memory_catalog", CapabilityClass::Read),
         ("memory", "memory_search", CapabilityClass::Read),
         ("memory", "memory_remember", CapabilityClass::Write),
-        ("memory", "memory_forget", CapabilityClass::Write),
-        // brave-search is disabled by default but classified for completeness
-        ("brave-search", "brave_web_search", CapabilityClass::Read),
-        (
-            "brave-search",
-            "brave_web_search_stats",
-            CapabilityClass::Read,
-        ),
+        // duckduckgo (live-verified single tool; replaces brave-search, which
+        // needed BRAVE_API_KEY and a paid account)
+        ("duckduckgo", "duckduckgo_web_search", CapabilityClass::Read),
     ];
 
     #[test]
@@ -780,7 +801,6 @@ mod tests {
             ("sqlite", "list_tables"),
             ("sqlite", "describe_table"),
             ("fetch", "fetch"),
-            ("brave-search", "brave_web_search"),
             // Found only by connecting the servers, not from docs:
             ("filesystem", "read_file"),
         ] {

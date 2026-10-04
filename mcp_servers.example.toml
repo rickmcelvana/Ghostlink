@@ -94,20 +94,26 @@ timeout_secs = 30
 [mcp_servers.env]
 
 [[mcp_servers]]
-name = "brave-search"
+name = "duckduckgo"
+# Local-first web search, no API key. Replaces brave-search, which needed
+# BRAVE_API_KEY and a paid account -- against this project's "all local, no
+# cloud dependency" constraint.
+#
+# Caveat worth knowing: DuckDuckGo's free HTML endpoint rate-limits aggressively
+# and returns "DDG detected an anomaly in the request" under load. It works for
+# occasional lookups; it is not a high-throughput search backend. The capability
+# class is still Read, so a rate-limited response is an observation, not an
+# action needing approval.
 slot = "web_search"
 enabled = false
 transport = "stdio"
 command = "npx"
-args = [
-    "-y",
-    "@modelcontextprotocol/server-brave-search",
-]
+args = ["-y", "duckduckgo-mcp-server"]
 requires_confirmation = false
-timeout_secs = 30
+timeout_secs = 60
 
 [mcp_servers.env]
-BRAVE_API_KEY = "${BRAVE_API_KEY}"
+
 
 [[mcp_servers]]
 name = "docker-code-execution"
