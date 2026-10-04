@@ -287,6 +287,7 @@ export const ChatTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
     threads, activeThreadId, selectThread, createThread, renameThread, deleteThread, togglePinThread,
     updateActiveThread, presets, userPrompts,
     addToast, setActiveTab, metrics,
+    applyServerTitle,
   } = useAppStore();
 
   const activeThread = useMemo(() => threads.find((t) => t.id === activeThreadId), [threads, activeThreadId]);
@@ -571,6 +572,13 @@ export const ChatTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
 
     if (result.success) {
       const data = result.data || {};
+
+      // Adopt a server-generated session title. The server generates one on the
+      // first turn of a session; it names the subject, where the local fallback
+      // (first 30 chars of the opening message) often cut mid-word.
+      if (typeof data.session_title === "string" && data.session_title.trim()) {
+        applyServerTitle(activeThreadId ?? "", data.session_title);
+      }
       setMessages((prev) =>
         prev.map((m) =>
           m.id === assistantId

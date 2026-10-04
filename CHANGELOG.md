@@ -8,6 +8,17 @@ All notable changes to Ghostlink Studio are documented here.
 
 ### Added
 
+- **Session titles are generated, not truncated** (`crates/ghost-link/src/title.rs`):
+  the GUI named every thread from `firstUser.content.slice(0, 32)`, so a thread opened with *"can you look at why the auth middleware is failing on the staging host"* was titled **"can you look at why the auth mid"** — cut mid-word, lowercase, and identical for every thread starting with the same tokens. A thread opened with a pasted stack trace got a title made of code.
+
+  The server now generates a 3-6 word title on a session's first turn, writing it to `SessionRecord::name` and returning it as `session_title`. The GUI adopts it via `applyServerTitle`, which **never overwrites a title the user set by hand** — a late-arriving generation cannot clobber a manual name.
+
+  Generation is detached and bounded: 32 max tokens, low temperature, and a 5s ceiling on the wait, because a title is cosmetic and a chat turn must not block on it. On failure it falls back to a local word-bounded derivation, which still beats a raw character slice. A 9B/3B model asked for a title also tends to answer with prose, so `clean_title` strips labels, markdown, quotes and trailing sentences, and rejects refusals outright rather than rendering *"I cannot generate a title"* in a sidebar.
+
+  The GUI keeps its own first-30-characters fallback for the streaming path, where the title has not arrived yet; the server title replaces it on the next turn.
+
+  16 new Rust tests and 5 new GUI store tests, including that a user-set title wins over a generated one.
+
 - **Proactive memory recall** (`crates/ghost-link/src/recall.rs`, wired in `main.rs`):
   on the first turn of a session the server now calls `memory_search` and `rag.search` itself and injects the hits as system context, instead of waiting for the model to decide it should go looking.
 
@@ -190,6 +201,7 @@ All notable changes to Ghostlink Studio are documented here.
   Also worth recording: `docker-code-execution`, `docker-terminal`, and `docker-mcp-gateway` were three entries running the **identical** command, `docker mcp gateway run` -- three duplicate connections to one gateway. The two redundant entries are disabled in the active config; `docker-mcp-gateway` is the one to enable.
 
 ### Fixed
+
 - **The native launcher no longer serves a stale binary** (`launch-native.ps1`):
   the build step was guarded by `if (-not (Test-Path $ApiBin))`, so `ghost-link.exe` was compiled on first run only. Every launch after that reused whatever binary happened to exist — an edited source tree kept serving the code from whenever that file was created.
 
@@ -200,8 +212,6 @@ All notable changes to Ghostlink Studio are documented here.
   - The MCP servers referenced by path from `mcp_servers.toml` (`mcp-memory`, `mcp-rag`, `mcp-calculator`, `mcp-vision`) are now built too, guarded by a source-vs-binary timestamp check so a normal launch stays fast but a source change is never served stale. A failed MCP build warns rather than aborting: a missing optional server costs tools, not the server.
 
   Note the package name is `ghost-link`, not `ghostlink`. `cargo build -p ghostlink` matches no package and builds nothing — a silent no-op rather than an error.
-
-### Fixed
 
 - **RAG search no longer returns irrelevant documents** (`crates/mcp-rag/src/main.rs`):
   `search` had no relevance floor — it always returned the top-k *closest* entries, even when none of them matched. Measured on a one-document index: a topically unrelated query (*"quantum chromodynamics lattice gauge theory"*) still scored **0.454** against the only chunk, so the "closest" result was a document about credential rotation.

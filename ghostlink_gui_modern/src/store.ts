@@ -373,6 +373,10 @@ interface AppState {
   selectThread: (id: string) => void;
   updateActiveThread: (updater: (thread: Thread) => Thread) => void;
   renameThread: (id: string, title: string) => void;
+  /** Adopt a title the server generated for a session. No-ops when the thread has
+   *  already been renamed by the user, so a manual name is never overwritten by a
+   *  late-arriving generation. */
+  applyServerTitle: (id: string, title: string) => void;
   deleteThread: (id: string) => void;
   togglePinThread: (id: string) => void;
   addPreset: (preset: Omit<SystemPromptPreset, "id">) => void;
@@ -585,6 +589,26 @@ export const useAppStore = create<AppState>((set) => ({
       saveThreadsToStorage(threads);
       return { threads };
     }),
+  applyServerTitle: (id, title) => {
+      const t = title?.trim();
+      if (!t) return;
+      set((state) => {
+        const thread = state.threads.find((x) => x.id === id);
+        if (!thread) return state;
+        // A user-set title wins. `renameThread` sets an explicit title; the
+        // auto-title path leaves "New Chat"/"Session ..." placeholders.
+        const untouched =
+          thread.title === "New Chat" ||
+          thread.title.startsWith("Session ") ||
+          thread.title.trim() === "";
+        if (!untouched || thread.title === t) return state;
+        const threads = state.threads.map((x) =>
+          x.id === id ? { ...x, title: t } : x
+        );
+        saveThreadsToStorage(threads);
+        return { ...state, threads };
+      });
+  },
 
   deleteThread: (id) =>
     set((state) => {

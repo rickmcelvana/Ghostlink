@@ -10008,6 +10008,82 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         (kept, truncated)
     }
 
+    /// Generates a short title for a session and returns it.
+    ///
+    /// Runs detached from the request path, like `summarize_dropped_turns`: a chat turn
+    /// must never wait on an extra generation, and a title is cosmetic. Failure is
+    /// silent by design -- the caller falls back to the first few words of the message,
+    /// which is what the GUI already did.
+    ///
+    /// The result is written back to `SessionRecord::name`, which is the server's own
+    /// record of the session. The response also carries it so a streaming client can
+    /// apply the title immediately without a follow-up request.
+    async fn generate_session_title(
+        state: Arc<Mutex<BackendState>>,
+        session_id: String,
+        turns: Vec<(String, String)>,
+    ) -> Option<String> {
+        if turns.is_empty() {
+            return None;
+        }
+        let (native_engine_client, model, engine_kind) = {
+            let backend = lock_state(&state);
+            (
+                backend.native_engine_client.clone(),
+                backend.current_model.clone(),
+                backend.settings.native_engine.clone(),
+            )
+        };
+
+        // Small and low-temperature: a title is 3-6 words, and a longer budget only
+        // buys prose that `clean_title` then throws away.
+        let generated = native_engine_client
+            .generate(
+                &model,
+                &title::build_title_prompt(&turns),
+                32,
+                0.3,
+                0.9,
+                40,
+                1.1,
+                &engine_kind,
+                &[],
+                None,
+                None,
+                false,
+                None,
+            )
+            .await;
+
+        let title_text = match generated {
+            Ok(gen) if gen.real_inference => title::clean_title(&gen.text),
+            _ => None,
+        }
+        // Nothing usable from the model: derive one locally rather than leaving the
+        // session nameless.
+        .or_else(|| {
+            turns
+                .iter()
+                .find(|(role, _)| !role.eq_ignore_ascii_case("assistant"))
+                .map(|(_, content)| title::fallback_title(content))
+        })?;
+
+        {
+            let mut backend = lock_state(&state);
+            let session = backend.sessions.iter_mut().find(|s| s.id == session_id)?;
+            // Never overwrite a title the user set by hand.
+            let is_untouched = session.name.trim().is_empty()
+                || session.name == "New Chat"
+                || session.name.starts_with("Session ");
+            if !is_untouched {
+                return None;
+            }
+            session.name = title_text.clone();
+        }
+        save_persistent_sessions(&lock_state(&state).sessions);
+        Some(title_text)
+    }
+
     /// Generates a summary for `new_turns` and folds it into `session_id`'s
     /// running summary. Runs detached from the request path (spawned by the
     /// caller) so a chat turn never waits on an extra generation.
@@ -10303,6 +10379,24 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         // session summary, so every backend picks it up unchanged.
         let session_summary =
             merge_recall_into_summary(session_summary.as_deref(), recall_block.as_deref());
+
+        // Title generation, on a session's first turn only. Detached, so the turn
+        // never waits on it; the title arrives on a later response (or is fetched
+        // from /api/sessions). Previously the GUI derived it from
+        // `firstUser.content.slice(0, 32)`, which cut mid-word and named every
+        // thread after its opening tokens.
+        let first_turn_of_session = req.messages.as_deref().unwrap_or(&[]).is_empty();
+        let title_task = if first_turn_of_session && !req.message.trim().is_empty() {
+            let title_state = Arc::clone(&state);
+            let title_session = chat_session_id.clone();
+            let first_exchange: Vec<(String, String)> =
+                vec![("user".to_string(), req.message.clone())];
+            Some(tokio::spawn(async move {
+                generate_session_title(title_state, title_session, first_exchange).await
+            }))
+        } else {
+            None
+        };
         let temp = req.temperature.unwrap_or(settings.temperature);
         let top_p = req.top_p.unwrap_or(settings.top_p);
         let top_k = req.top_k.unwrap_or(settings.top_k);
@@ -11129,6 +11223,18 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             (request_seq, session_id, metrics_json)
         };
 
+        // Collect the title if this turn spawned one. Bounded: the generation is
+        // capped at 32 tokens, and a hung title task must not delay the response,
+        // so a short wait and then give up on it.
+        let generated_title = match title_task {
+            Some(handle) => tokio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .flatten(),
+            None => None,
+        };
+
         // Ground the reply against what actually ran.
         //
         // A model with no tools will confidently describe having saved, written or
@@ -11190,6 +11296,10 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             "summarized_history": session_summary.is_some(),
             // Counts only. Lets the GUI and an operator tell "remembered nothing"
             // from "retrieval never ran" without any recalled text leaving here.
+            // Present only when the first turn of a session just generated one.
+            // The GUI applies it to the thread title; `renameThread` still wins if
+            // the user has already named the thread.
+            "session_title": generated_title,
             // True when the model asserted a completed action with no tool
             // behind it and `response` now carries a server-authored correction.
             "action_claim_corrected": claim_audit.unsupported,
@@ -14661,6 +14771,7 @@ mod runtime;
 mod runtime_switcher;
 mod scheduler;
 mod skills;
+mod title;
 mod tls;
 mod toolselect;
 mod trace;
