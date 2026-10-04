@@ -1734,6 +1734,24 @@ const SUMMARY_MAX_SESSIONS: usize = 64;
 /// condensed memory cannot itself grow without bound.
 const SUMMARY_MAX_CHARS: usize = 4000;
 
+/// Whether an HTTP endpoint answers at all.
+///
+/// Used for the RAG pre-flight check, where "is the embedding backend up" is the
+/// only question. Deliberately a bare GET with no auth: these are local
+/// single-purpose servers, and reusing the authenticated API client here would
+/// mean holding the lock across an unrelated network call.
+async fn http_endpoint_reachable(url: &str) -> bool {
+    match reqwest::Client::new()
+        .get(url)
+        .timeout(Duration::from_secs(4))
+        .send()
+        .await
+    {
+        Ok(resp) => resp.status().is_success() || resp.status().as_u16() == 401,
+        Err(_) => false,
+    }
+}
+
 fn record_audit_event(
     backend: &mut BackendState,
     event: &str,
@@ -8237,25 +8255,86 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             }));
         }
 
-        // `rag`'s own MCP handshake never actually touches Ollama (its tools
-        // are registered eagerly, connectivity is only checked lazily on the
-        // first embed call) — so `rag_connected` above is true even on a
-        // native-llama.cpp-only machine with no Ollama running at all. Probe
-        // Ollama directly here so that case still gets the same graceful
-        // "skipped" response instead of a wall of per-file failures.
-        let ollama_url = mcp_registry
-            .env_var_for("rag", "OLLAMA_URL")
-            .filter(|u| !u.is_empty())
-            .unwrap_or_else(|| "http://127.0.0.1:11434".to_string());
-        let ollama_reachable = ollama::OllamaClient::new(ollama_url.clone())
-            .health()
-            .await
-            .unwrap_or(false);
-        if !ollama_reachable {
-            return Json(serde_json::json!({
-                "status": "skipped",
-                "reason": format!("Ollama isn't reachable at {ollama_url} — is `ollama serve` running?")
-            }));
+        // `rag`'s own MCP handshake never touches its embedding backend (tools
+        // are registered eagerly; connectivity is only checked lazily on the
+        // first embed call) — so `rag_connected` above is true even when no
+        // embedding backend is running at all. Probe the *configured* backend
+        // here so that case still gets a graceful "skipped" response instead of
+        // a wall of per-file failures.
+        //
+        // Which backend that is depends on `GHOSTLINK_EMBED_BACKEND`, mirroring
+        // `mcp-rag`'s own `EmbedBackend::parse`. Probing Ollama unconditionally
+        // was correct when rag only spoke Ollama; now that it can use a
+        // llama-server embedding instance instead, a llama-only machine would
+        // have been told "Ollama isn't reachable" while its actual backend was
+        // working fine.
+        let embed_backend = mcp_registry
+            .env_var_for("rag", "GHOSTLINK_EMBED_BACKEND")
+            .unwrap_or_else(|| "auto".to_string());
+        let uses_llama = matches!(
+            embed_backend.trim().to_ascii_lowercase().as_str(),
+            "llama" | "llamacpp" | "llama-server"
+        );
+        let uses_ollama = matches!(embed_backend.trim().to_ascii_lowercase().as_str(), "ollama");
+
+        if uses_llama || uses_ollama {
+            // An explicit backend: probe only that one, so a `llama` config on a
+            // machine with Ollama also running isn't skipped by the other's state.
+            let reachable = if uses_llama {
+                let embed_url = mcp_registry
+                    .env_var_for("rag", "EMBEDDING_URL")
+                    .filter(|u| !u.is_empty())
+                    .unwrap_or_else(|| "http://127.0.0.1:8081".to_string());
+                http_endpoint_reachable(&format!("{}/health", embed_url.trim_end_matches('/')))
+                    .await
+            } else {
+                let ollama_url = mcp_registry
+                    .env_var_for("rag", "OLLAMA_URL")
+                    .filter(|u| !u.is_empty())
+                    .unwrap_or_else(|| "http://127.0.0.1:11434".to_string());
+                ollama::OllamaClient::new(ollama_url.clone())
+                    .health()
+                    .await
+                    .unwrap_or(false)
+            };
+            if !reachable {
+                return Json(serde_json::json!({
+                    "status": "skipped",
+                    "reason": if uses_llama {
+                        format!("the llama-server embedding backend ({embed_backend}) isn't reachable — start it with `llama-server -m <embedding-model>.gguf --embedding --pooling mean --port 8081`")
+                    } else {
+                        format!("Ollama isn't reachable ({embed_backend}) — is `ollama serve` running?")
+                    }
+                }));
+            }
+        } else {
+            // `auto`: either backend satisfies the requirement, so require only
+            // that at least one answers. Probing only Ollama here is what made a
+            // llama-only machine look unindexable.
+            let embed_url = mcp_registry
+                .env_var_for("rag", "EMBEDDING_URL")
+                .filter(|u| !u.is_empty())
+                .unwrap_or_else(|| "http://127.0.0.1:8081".to_string());
+            let llama_up =
+                http_endpoint_reachable(&format!("{}/health", embed_url.trim_end_matches('/')))
+                    .await;
+            let ollama_url = mcp_registry
+                .env_var_for("rag", "OLLAMA_URL")
+                .filter(|u| !u.is_empty())
+                .unwrap_or_else(|| "http://127.0.0.1:11434".to_string());
+            let ollama_up = ollama::OllamaClient::new(ollama_url.clone())
+                .health()
+                .await
+                .unwrap_or(false);
+            if !llama_up && !ollama_up {
+                return Json(serde_json::json!({
+                    "status": "skipped",
+                    "reason": format!(
+                        "no embedding backend reachable — tried llama-server at {embed_url} \
+                         and Ollama at {ollama_url}"
+                    )
+                }));
+            }
         }
 
         let root = match workspace_root().canonicalize() {
@@ -10132,6 +10211,21 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                                                     true,
                                                 );
                                             }
+                                            // The non-streaming arms below fall through to
+                                            // the shared `record_trace` call, but each
+                                            // streaming arm returns its own `Sse` response
+                                            // before reaching it. Without this, the GUI's
+                                            // streaming path -- the default one -- recorded no
+                                            // turn trace at all.
+                                            record_trace(
+                                                &mut backend,
+                                                trace::TraceEvent::chat(
+                                                    &chat_session_id,
+                                                    chat_workspace.id(),
+                                                )
+                                                .with_tokens(None, Some(accumulated_tokens))
+                                                .with_latency(stream_started.elapsed()),
+                                            );
                                         });
 
                                         request_tracker.decrement().await;
@@ -10375,6 +10469,16 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                                     true,
                                 );
                             }
+                            // See the matching note on the Ollama streaming arm: every
+                            // streaming path returns its own `Sse` before the shared
+                            // `record_trace`, so the trace has to be emitted from the
+                            // finalizer too.
+                            record_trace(
+                                &mut backend,
+                                trace::TraceEvent::chat(&chat_session_id, chat_workspace.id())
+                                    .with_tokens(None, Some(accumulated_tokens))
+                                    .with_latency(stream_started.elapsed()),
+                            );
                         });
 
                         let sse_stream = tokio_stream::wrappers::ReceiverStream::new(rx);

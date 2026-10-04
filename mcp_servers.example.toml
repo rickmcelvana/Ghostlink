@@ -51,7 +51,7 @@ command = "uvx"
 # built against and fail to import. Pin a known-compatible version with `==`,
 # not `<`/`>` — this command runs via `cmd /C` on Windows (see client.rs
 # build_command) and cmd.exe reads a bare `<` as stdin redirection.
-args = ["--with", "mcp==1.9.4", "mcp-server-fetch"]
+args = ["--with", "mcp==1.9.4", "--with", "pywin32", "mcp-server-fetch"]
 requires_confirmation = false
 timeout_secs = 30
 
@@ -74,8 +74,16 @@ name = "sqlite"
 slot = "database_query"
 enabled = true
 transport = "stdio"
+# mcp==1.9.4 is required: unpinned, mcp-server-sqlite resolves against a newer
+# `mcp` whose decorator API dropped `Server.list_resources`, and it dies at import.
+# pywin32 is required on Windows: `mcp.os.win32.utilities` imports `pywintypes`,
+# which is not present in uvx's ephemeral environment by default.
 command = "uvx"
 args = [
+    "--with",
+    "mcp==1.9.4",
+    "--with",
+    "pywin32",
     "mcp-server-sqlite",
     "--db-path",
     "./mcp_workspace/ghostlink.db",
@@ -86,20 +94,26 @@ timeout_secs = 30
 [mcp_servers.env]
 
 [[mcp_servers]]
-name = "brave-search"
+name = "duckduckgo"
+# Local-first web search, no API key. Replaces brave-search, which needed
+# BRAVE_API_KEY and a paid account -- against this project's "all local, no
+# cloud dependency" constraint.
+#
+# Caveat worth knowing: DuckDuckGo's free HTML endpoint rate-limits aggressively
+# and returns "DDG detected an anomaly in the request" under load. It works for
+# occasional lookups; it is not a high-throughput search backend. The capability
+# class is still Read, so a rate-limited response is an observation, not an
+# action needing approval.
 slot = "web_search"
 enabled = false
 transport = "stdio"
 command = "npx"
-args = [
-    "-y",
-    "@modelcontextprotocol/server-brave-search",
-]
+args = ["-y", "duckduckgo-mcp-server"]
 requires_confirmation = false
-timeout_secs = 30
+timeout_secs = 60
 
 [mcp_servers.env]
-BRAVE_API_KEY = "${BRAVE_API_KEY}"
+
 
 [[mcp_servers]]
 name = "docker-code-execution"
@@ -171,27 +185,32 @@ OLLAMA_VISION_MODEL = "llava"
 
 [[mcp_servers]]
 name = "rag"
-# A real slot pulls this out of the always-on chat path and into a Tools-panel
-# checkbox — doesn't affect the Editor tab's auto-index (POST
-# /api/workspace/index), which calls "rag"/"index_document" directly by
-# server name, not through this slot lookup.
 slot = "rag"
-# Local retrieval-augmented generation: chunks + embeds documents via a local
-# Ollama embedding model into a brute-force cosine-similarity index (JSON
-# file, no external vector DB) so chat can look them up later with search().
-# Enabled by default — the Editor tab's auto-index (POST /api/workspace/index)
-# needs it connected to do anything; requires `ollama pull nomic-embed-text`
-# (or override OLLAMA_EMBED_MODEL below) or it just fails to connect quietly.
-enabled = true
+enabled = false
 transport = "stdio"
 command = "target/release/mcp-rag.exe"
 args = []
-requires_confirmation = false
-timeout_secs = 30
+timeout_secs = 120
 
 [mcp_servers.env]
+# Embedding backend: `llama` removes the Ollama dependency entirely.
+#
+# Requires a SECOND llama-server, separate from the chat model on :8080 -- an
+# embedding model and a chat model cannot share one instance:
+#
+#   llama-server -m models/nomic-embed-text-v1.5.Q4_K_M.gguf \
+#     --embedding --pooling mean --host 127.0.0.1 --port 8081
+#
+# `auto` (the default) tries llama first and falls back to Ollama. Set `ollama`
+# to pin the legacy path. Embedding vectors are only comparable within a model,
+# so changing backend means re-indexing -- see GHOSTLINK_RAG_INDEX_PATH.
+GHOSTLINK_EMBED_BACKEND = "llama"
+EMBEDDING_URL = "http://127.0.0.1:8081"
+GHOSTLINK_RAG_INDEX_PATH = "rag_index.json"
+# Only consulted by the `ollama` / `auto` fallback.
 OLLAMA_URL = "http://127.0.0.1:11434"
 OLLAMA_EMBED_MODEL = "nomic-embed-text"
+
 
 [[mcp_servers]]
 name = "docker-mcp-gateway"
@@ -221,7 +240,15 @@ slot = "git_tools"
 enabled = true
 transport = "stdio"
 command = "uvx"
-args = ["--with", "mcp==1.9.4", "mcp-server-git", "--repository", "."]
+args = [
+    "--with",
+    "mcp==1.9.4",
+    "--with",
+    "pywin32",
+    "mcp-server-git",
+    "--repository",
+    ".",
+]
 requires_confirmation = false
 timeout_secs = 30
 

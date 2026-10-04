@@ -80,6 +80,9 @@ fn build_table() -> ClassTable {
     // --- Read: inspection with no durable side effects ---
     for tool in [
         "read_text_file",
+        // The live server advertises BOTH `read_file` and `read_text_file`;
+        // only the latter was classified, so the alias fell through to Exec.
+        "read_file",
         "read_media_file",
         "read_multiple_files",
         "list_directory",
@@ -116,7 +119,18 @@ fn build_table() -> ClassTable {
     }
 
     // Git: inspection reads, anything that moves refs or the worktree writes.
-    for tool in ["git_status", "git_log", "git_diff", "git_show", "git_blame"] {
+    // `git_diff_unstaged` / `git_diff_staged` are real tools on mcp-server-git
+    // alongside the combined `git_diff`. Without them they fell through to the
+    // Exec default, so an ordinary diff needed an approval.
+    for tool in [
+        "git_status",
+        "git_log",
+        "git_diff",
+        "git_diff_unstaged",
+        "git_diff_staged",
+        "git_show",
+        "git_blame",
+    ] {
         t.insert(("git".into(), tool.into()), CapabilityClass::Read);
     }
     for tool in [
@@ -125,15 +139,28 @@ fn build_table() -> ClassTable {
         "git_checkout",
         "git_reset",
         "git_push",
+        // Branch creation is a ref write like checkout/push, not a command
+        // execution: it moves no worktree content and runs nothing.
+        "git_create_branch",
+        "git_branch",
     ] {
         t.insert(("git".into(), tool.into()), CapabilityClass::Write);
     }
 
     // Web fetch and search are reads with respect to *local* state.
-    for tool in ["fetch", "brave_web_search", "web_search"] {
-        t.insert(("fetch".into(), tool.into()), CapabilityClass::Read);
-        t.insert(("brave-search".into(), tool.into()), CapabilityClass::Read);
-    }
+    //
+    // `fetch` and `duckduckgo` are separate servers and the table keys on
+    // `(server, tool)`, so each needs its own entries. An earlier version filed
+    // `brave_web_search` under `fetch` AND under `brave-search`, which left
+    // `fetch.fetch` -- the tool that actually exists -- unclassified.
+    t.insert(("fetch".into(), "fetch".into()), CapabilityClass::Read);
+    // Verified live from `duckduckgo-mcp-server`: a single tool,
+    // `duckduckgo_web_search`. It queries DuckDuckGo's free HTML endpoint, so
+    // it observes the public web and writes nothing local -- Read.
+    t.insert(
+        ("duckduckgo".into(), "duckduckgo_web_search".into()),
+        CapabilityClass::Read,
+    );
 
     // Sequential thinking is pure inference.
     t.insert(
@@ -151,15 +178,21 @@ fn build_table() -> ClassTable {
     for tool in ["write_file", "edit_file", "create_directory", "move_file"] {
         t.insert(("filesystem".into(), tool.into()), CapabilityClass::Write);
     }
-    t.insert(
-        ("sqlite".into(), "read_query".into()),
-        CapabilityClass::Read,
-    );
+    // Schema inspection reads. mcp-server-sqlite ships `list_tables` and
+    // `describe_table` alongside the query tools, and both were falling through
+    // to Exec -- so merely listing tables demanded an approval, which is the
+    // kind of false gate that teaches people to approve without reading.
+    for tool in ["read_query", "list_tables", "describe_table"] {
+        t.insert(("sqlite".into(), tool.into()), CapabilityClass::Read);
+    }
     for tool in [
         "write_query",
         "execute_query",
         "create_table",
         "modify_table",
+        // `append_insight` writes to the server's memory file, so it is a
+        // durable write like the rest.
+        "append_insight",
     ] {
         t.insert(("sqlite".into(), tool.into()), CapabilityClass::Write);
     }
@@ -167,11 +200,33 @@ fn build_table() -> ClassTable {
     // --- Exec: command or code execution. Never auto-applied, never
     // session-granted. Listed explicitly so the intent is auditable, even
     // though the unknown-tool default already lands here.
+    //
+    // The `docker-mcp-gateway` names are the LIVE tool set from
+    // `docker mcp gateway run` (Docker 29.8.1, MCP Toolkit), not a guess. All
+    // eight are Exec: `mcp-exec` and `code-mode` run arbitrary commands and
+    // code outright, and the `mcp-add`/`mcp-remove`/`mcp-config-set`/
+    // `mcp-create-profile`/`mcp-activate-profile` tools mutate the gateway's own
+    // configuration -- which decides what the gateway is able to run. `mcp-find`
+    // is included rather than treated as a read, because it queries the catalog
+    // of servers the gateway can activate, and a catalog read that reveals what
+    // can be executed is not an observation with no effect.
+    //
+    // Left out: the dynamically activated tools the gateway exposes after
+    // `mcp-add` (containers, images, compose). Those arrive at runtime with
+    // names this table has never seen, so they hit the unknown-tool default --
+    // which is Exec. That fail-closed behavior is the point: a tool the gateway
+    // invents at runtime cannot be quietly treated as a read.
     for (server, tool) in [
         ("terminal", "run_command"),
-        ("docker-terminal", "execute"),
         ("code_execution", "execute_code"),
-        ("docker-code-execution", "execute"),
+        ("docker-mcp-gateway", "mcp-exec"),
+        ("docker-mcp-gateway", "code-mode"),
+        ("docker-mcp-gateway", "mcp-add"),
+        ("docker-mcp-gateway", "mcp-remove"),
+        ("docker-mcp-gateway", "mcp-config-set"),
+        ("docker-mcp-gateway", "mcp-create-profile"),
+        ("docker-mcp-gateway", "mcp-activate-profile"),
+        ("docker-mcp-gateway", "mcp-find"),
     ] {
         t.insert((server.into(), tool.into()), CapabilityClass::Exec);
     }
@@ -621,5 +676,145 @@ mod tests {
             CapabilityClass::Write
         );
         assert_eq!(classify("memory", "memory_forget"), CapabilityClass::Write);
+    }
+
+    /// Every tool a configured MCP server actually exposes must be classified.
+    ///
+    /// This is the test that keeps the table honest against the servers in
+    /// `mcp_servers.example.toml`. The list is the real tool set of each server
+    /// (the Ghostlink crates' names come from their `#[tool]` attributes; the
+    /// third-party names from the packages pinned there), NOT a copy of the
+    /// table above -- so adding a tool upstream without classifying it here
+    /// fails the build rather than silently falling back to `Exec` and demanding
+    /// an approval for a harmless read.
+    ///
+    /// Falling back to `Exec` is safe, not correct: it blocked `git_diff_unstaged`,
+    /// `list_tables`, `describe_table`, `fetch.fetch`, and `duckduckgo
+    /// tools, every one of which is an ordinary observation.
+    /// Every tool a configured MCP server actually exposes must be classified.
+    ///
+    /// Verified against a LIVE server with all seven runnable MCP servers
+    /// connected (calculator, memory, fetch, git, sqlite, filesystem,
+    /// sequential-thinking) -- 39 tools total -- rather than against a table
+    /// transcribed from upstream docs. That pass found seven tools the docs
+    /// didn't mention: `git.git_create_branch`, `git.git_branch`,
+    /// `sqlite.append_insight`, `filesystem.read_file`, and the three git diff
+    /// variants. Each had been silently defaulting to `Exec`, so a branch
+    /// listing or a plain file read demanded an approval.
+    ///
+    /// Keep this in sync by re-running the connected-server check rather than by
+    /// reading upstream documentation: the docs and the served tool list disagree.
+    const REAL_TOOLS: &[(&str, &str, CapabilityClass)] = &[
+        // filesystem (14 advertised)
+        ("filesystem", "read_text_file", CapabilityClass::Read),
+        ("filesystem", "read_file", CapabilityClass::Read),
+        ("filesystem", "read_media_file", CapabilityClass::Read),
+        ("filesystem", "read_multiple_files", CapabilityClass::Read),
+        ("filesystem", "list_directory", CapabilityClass::Read),
+        (
+            "filesystem",
+            "list_directory_with_sizes",
+            CapabilityClass::Read,
+        ),
+        ("filesystem", "directory_tree", CapabilityClass::Read),
+        ("filesystem", "search_files", CapabilityClass::Read),
+        ("filesystem", "get_file_info", CapabilityClass::Read),
+        (
+            "filesystem",
+            "list_allowed_directories",
+            CapabilityClass::Read,
+        ),
+        ("filesystem", "write_file", CapabilityClass::Write),
+        ("filesystem", "edit_file", CapabilityClass::Write),
+        ("filesystem", "create_directory", CapabilityClass::Write),
+        ("filesystem", "move_file", CapabilityClass::Write),
+        // calculator (Ghostlink crate)
+        ("calculator", "calculate", CapabilityClass::Read),
+        // fetch -- the tool is named `fetch` on a server named `fetch`
+        ("fetch", "fetch", CapabilityClass::Read),
+        // git (12 advertised)
+        ("git", "git_status", CapabilityClass::Read),
+        ("git", "git_log", CapabilityClass::Read),
+        ("git", "git_diff", CapabilityClass::Read),
+        ("git", "git_diff_unstaged", CapabilityClass::Read),
+        ("git", "git_diff_staged", CapabilityClass::Read),
+        ("git", "git_show", CapabilityClass::Read),
+        ("git", "git_blame", CapabilityClass::Read),
+        ("git", "git_add", CapabilityClass::Write),
+        ("git", "git_commit", CapabilityClass::Write),
+        ("git", "git_checkout", CapabilityClass::Write),
+        ("git", "git_reset", CapabilityClass::Write),
+        ("git", "git_push", CapabilityClass::Write),
+        ("git", "git_create_branch", CapabilityClass::Write),
+        ("git", "git_branch", CapabilityClass::Write),
+        // sqlite (6 advertised)
+        ("sqlite", "read_query", CapabilityClass::Read),
+        ("sqlite", "list_tables", CapabilityClass::Read),
+        ("sqlite", "describe_table", CapabilityClass::Read),
+        ("sqlite", "write_query", CapabilityClass::Write),
+        ("sqlite", "create_table", CapabilityClass::Write),
+        ("sqlite", "append_insight", CapabilityClass::Write),
+        // rag (Ghostlink crate)
+        ("rag", "search", CapabilityClass::Read),
+        ("rag", "index_document", CapabilityClass::Write),
+        // vision (Ghostlink crate)
+        ("vision", "analyze_image", CapabilityClass::Read),
+        // sequential-thinking
+        (
+            "sequential-thinking",
+            "sequentialthinking",
+            CapabilityClass::Read,
+        ),
+        // memory (Ghostlink crate, phase 1)
+        ("memory", "memory_catalog", CapabilityClass::Read),
+        ("memory", "memory_search", CapabilityClass::Read),
+        ("memory", "memory_remember", CapabilityClass::Write),
+        // duckduckgo (live-verified single tool; replaces brave-search, which
+        // needed BRAVE_API_KEY and a paid account)
+        ("duckduckgo", "duckduckgo_web_search", CapabilityClass::Read),
+    ];
+
+    #[test]
+    fn every_real_tool_is_classified_as_expected() {
+        let mut wrong = Vec::new();
+        for (server, tool, expected) in REAL_TOOLS {
+            let actual = classify(server, tool);
+            if actual != *expected {
+                wrong.push(format!(
+                    "{server}.{tool}: expected {expected:?}, got {actual:?}"
+                ));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "capability table disagrees with the real tool set:\n  {}",
+            wrong.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn no_ordinary_operation_is_left_to_the_exec_default() {
+        // The specific regression: these all silently became Exec.
+        for (server, tool) in [
+            ("git", "git_diff_unstaged"),
+            ("git", "git_diff_staged"),
+            ("sqlite", "list_tables"),
+            ("sqlite", "describe_table"),
+            ("fetch", "fetch"),
+            // Found only by connecting the servers, not from docs:
+            ("filesystem", "read_file"),
+        ] {
+            assert_ne!(
+                classify(server, tool),
+                CapabilityClass::Exec,
+                "{server}.{tool} fell through to Exec and would demand approval"
+            );
+        }
+        // Branch ops are writes, not reads -- but they must not be Exec either:
+        // creating a branch runs no command and moves no worktree content.
+        for tool in ["git_create_branch", "git_branch"] {
+            assert_eq!(classify("git", tool), CapabilityClass::Write);
+        }
+        assert_eq!(classify("sqlite", "append_insight"), CapabilityClass::Write);
     }
 }

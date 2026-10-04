@@ -6,6 +6,52 @@ All notable changes to Ghostlink Studio are documented here.
 
 ## [Unreleased]
 
+### Changed
+- **`mcp-rag` can now embed via llama-server, removing the Ollama dependency** (`crates/mcp-rag/src/main.rs`, `mcp_servers.example.toml`, `mcp_servers.toml`, `.gitignore`):
+  `rag_embed` now selects a backend via `GHOSTLINK_EMBED_BACKEND`. `llama` targets llama-server's OpenAI-compatible `POST /v1/embeddings` (`data[0].embedding`); `ollama` keeps the original `POST /api/embeddings` (`embedding`) untouched; `auto` tries llama then falls back. **An existing Ollama setup keeps working with no config change** -- `auto` is the default.
+  Verified live with Ollama pointed at a dead port: indexed and searched in 0.0s, 768-dim vectors from `nomic-embed-text-v1.5.Q4_K_M` (84MB), with real semantic separation (cosine 0.918 for a paraphrase vs 0.407 across unrelated topics).
+  Requires a **second** llama-server on its own port -- an embedding model and a chat model cannot share one instance:
+  `llama-server -m models/nomic-embed-text-v1.5.Q4_K_M.gguf --embedding --pooling mean --host 127.0.0.1 --port 8081`
+  Vectors are only comparable within a model, so switching backend requires re-indexing; the config comment says so.
+
+### Fixed
+- **Streaming chat turns now record a trace event** (`crates/ghost-link/src/main.rs`):
+  `handle_gui_chat`'s three SSE arms each `return Sse::new(...)` before reaching the shared `record_trace` call, so the GUI's default streaming path recorded **no** turn trace at all. Only the non-streaming fallback and the OpenAI-compat server were traced. Added the trace to the Ollama and native stream finalizers, where the TTFT/tokens-per-second metrics were already being recorded -- so the trace carries the same real token count and latency rather than a second, separately-derived number.
+  The third SSE path (replaying a completed `response_text`) already flows through the shared call and needed no change.
+  Found by end-to-end test, not inspection: a live streaming chat left `/api/inference/traces` empty. Verified after the fix -- `{"kind":"chat","latency_ms":1328,"output_tokens":23}`.
+- Prebuilt llama.cpp binaries (`tools/llama.cpp/`)- **RAG workspace indexing no longer requires Ollama** (`crates/ghost-link/src/main.rs`):
+  the `/api/workspace/index` pre-flight probe hard-coded an Ollama health check, so a llama-only machine was answered `Ollama isn't reachable ... status: skipped` while its actual embedding backend was running fine. The probe now mirrors `mcp-rag`'s backend selection: an explicit backend probes only that one, and `auto` requires only that *either* answers.
+  This was found by the live test above, not by inspection -- the first version of the change looked correct and still returned the Ollama error.
+- Prebuilt llama.cpp binaries (`tools/llama.cpp/`) and locally-fetched GGUF weights (`models/nomic-embed-text*.gguf`) are gitignored. Neither belongs in the repo.
+
+### Changed
+- **Replaced `brave-search` with a local, keyless web search** (`mcp_servers.example.toml`, `crates/ghost-link/src/capability.rs`):
+  `brave-search` required `BRAVE_API_KEY` and a paid account, which sat awkwardly against this project's all-local constraint. It is replaced by `duckduckgo-mcp-server` (`npx -y duckduckgo-mcp-server`), verified live: it handshakes, advertises a single tool `duckduckgo_web_search`, and returns real results with no API key.
+  **Stated plainly because it matters operationally:** DuckDuckGo's free HTML endpoint rate-limits aggressively and answers `DDG detected an anomaly in the request, you are likely making requests too quickly` under load. That was observed directly during verification. It suits occasional lookups and is not a high-throughput search backend. A self-hosted SearXNG instance is the sturdier option if that becomes a problem -- it needs a container but no account.
+  Two other candidates were evaluated and rejected on evidence rather than reputation: `free-search-mcp` fails at import (its `selectolax` Modest backend was deprecated at 1.0 and now raises), and `one-search-mcp` requires a `.env` file plus a Chromium install before it will start.
+  Classified `Read`: it queries the public web and writes nothing local.
+
+- **Docker MCP Toolkit gateway connected and classified from its live tool set** (`mcp_servers.toml`, `mcp_servers.example.toml`, `crates/ghost-link/src/capability.rs`):
+  `docker mcp gateway run` (Docker 29.8.1) serves 8 tools, all now classified `Exec`: `mcp-exec`, `code-mode`, `mcp-add`, `mcp-remove`, `mcp-config-set`, `mcp-create-profile`, `mcp-activate-profile`, `mcp-find`. `mcp-exec` and `code-mode` run commands outright; the config-mutating ones decide what the gateway is able to run; `mcp-find` is included as Exec rather than Read because it queries the catalog of servers the gateway can activate.
+  The gateway's *dynamically* activated tools (containers, images, compose) arrive at runtime with names this table has never seen, so they hit the unknown-tool default of `Exec`. That fail-closed behavior is the point -- a tool the gateway invents at runtime cannot be quietly treated as a read.
+  Also worth recording: `docker-code-execution`, `docker-terminal`, and `docker-mcp-gateway` were three entries running the **identical** command, `docker mcp gateway run` -- three duplicate connections to one gateway. The two redundant entries are disabled in the active config; `docker-mcp-gateway` is the one to enable.
+
+### Fixed
+- **Windows: the three `uvx`-backed MCP servers could not start at all** (`mcp_servers.example.toml`, `mcp_servers.toml`):
+  `mcp.os.win32.utilities` imports `pywintypes`, which `uvx`'s ephemeral environment does not include, so `fetch`, `git`, and `sqlite` died at import with `ModuleNotFoundError: No module named 'pywintypes'`. Adding `--with pywin32` to each fixes it; verified by MCP handshake, not by assuming.
+  `mcp-server-sqlite` additionally needs an explicit `mcp` pin. Unpinned it resolves against a newer `mcp` whose decorator API dropped `Server.list_resources` and it dies at import; `mcp==1.9.4` works, as do 1.10.1/1.12.0/1.13.0. The existing `mcp==1.9.4` pins on `fetch` and `git` were already correct for a different reason and are kept.
+
+- **Four more tools were defaulting to `Exec`, found by connecting the servers** (`crates/ghost-link/src/capability.rs`):
+  auditing upstream documentation was not enough. Connecting all seven runnable MCP servers exposed **39 tools**, and four were unclassified: `git.git_create_branch`, `git.git_branch`, `sqlite.append_insight`, and `filesystem.read_file` (an alias of `read_text_file` the docs don't mention). Listing branches or reading a file demanded an approval.
+  Branch creation and `append_insight` are classified `Write`, not `Read`: they move refs and append to a durable file respectively. `REAL_TOOLS` is now the live-observed tool set rather than a transcription, and the module comment says to re-derive it by connecting servers rather than by reading docs -- because the docs and the served tool list disagree.
+  Verified live after the fix: 7/7 servers connected, 39/39 tools classified, **24 read / 15 write / 0 spurious exec**.
+
+- **Six ordinary read tools were falling through to the `Exec` default** (`crates/ghost-link/src/capability.rs`):
+  auditing the classification table against the *actual* tool set of every server in `mcp_servers.example.toml` found `git_diff_unstaged`, `git_diff_staged`, `sqlite.list_tables`, `sqlite.describe_table`, `fetch.fetch`, and both `brave-search` tools were unclassified and so defaulted to `Exec`.
+  Failing closed is safe -- no read was wrongly permitted -- but it is not correct: each of these demanded a human approval just to look at a diff, list tables, or fetch a URL. That is exactly the routine false gate that trains people to click Approve without reading, which is the habit the approval tray depends on.
+  `fetch.fetch` was missed for a structural reason worth recording: the table keys on `(server, tool)`, and the old loop filed `brave_web_search` under both `fetch` and `brave-search` while never filing the `fetch` tool that actually exists on the `fetch` server. A `REAL_TOOLS` table in the test module now pins every real tool name to its expected class, so adding a tool upstream without classifying it fails the build instead of silently demanding an approval.
+  Also adds the `memory` server to the active `mcp_servers.toml`, which had only been added to `mcp_servers.example.toml` -- so the phase-1 memory tools were unreachable in a real deployment despite being implemented and classified.
+
 ### Added
 - **Local schedule driver** (`crates/ghost-link/src/scheduler.rs`, `crates/ghost-link/src/main.rs`, `.gitignore`):
   schedules are JSON rows plus a tokio task that sleeps until the next firing. Each run is an ordinary agent turn through the native path, so the capability gate, approval queue, and workspace scoping apply exactly as they do to interactive chat -- **a schedule is not a privileged route**. A schedule that produces a write or exec call lands in the approval queue rather than executing; the run is recorded as `needs_approval`, and `last_run_was_read_only` is what distinguishes a schedule safe to repeat unattended from one that isn't.
