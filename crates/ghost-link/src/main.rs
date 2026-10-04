@@ -1724,8 +1724,15 @@ struct SessionSummary {
     text: String,
     /// Total turns folded into `text` so far.
     turns_summarized: usize,
-    /// When the summary last changed — drives LRU eviction.
+    /// When the summary last changed — drives LRU eviction within this process.
     updated_at: Option<Instant>,
+    /// Wall-clock time of the last change, for persistence. `Instant` cannot be
+    /// serialised and carries no meaning across a restart, so the durable ordering
+    /// signal is tracked separately and `updated_at` is left unset on load.
+    ///
+    /// No serde attribute: `SessionSummary` itself is never serialised --
+    /// `PersistedSessionSummary` is the on-disk shape.
+    last_touched: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Cap on the number of sessions whose summaries are retained in memory.
@@ -3997,6 +4004,129 @@ fn sessions_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("sessions.json"))
 }
 
+fn session_summaries_path() -> PathBuf {
+    std::env::var("GHOSTLINK_SESSION_SUMMARIES_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("session_summaries.json"))
+}
+
+/// On-disk form of a [`SessionSummary`].
+///
+/// Separate from the in-memory struct because `Instant` cannot be serialised and
+/// has no meaning across a restart anyway: `updated_at` exists to drive LRU
+/// eviction *within* a process lifetime, while the durable field is a wall-clock
+/// timestamp used only to restore a sensible eviction order on the next start.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedSessionSummary {
+    text: String,
+    turns_summarized: usize,
+    /// RFC3339. Absent on rows written by an older build; treated as "oldest".
+    #[serde(default)]
+    updated_at: Option<String>,
+}
+
+/// Loads persisted summaries, capped to `SUMMARY_MAX_SESSIONS` newest-first.
+///
+/// Returns an empty map on any read or parse failure: a corrupt or partially
+/// written store degrades to "no summaries", which is the pre-existing behaviour
+/// on a cold start, rather than refusing to boot.
+fn load_persistent_summaries() -> HashMap<String, SessionSummary> {
+    let data = match fs::read_to_string(session_summaries_path()) {
+        Ok(d) => d,
+        Err(_) => return HashMap::new(),
+    };
+    let rows: HashMap<String, PersistedSessionSummary> = match serde_json::from_str(&data) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "[summaries] ignoring unreadable {}: {e}",
+                session_summaries_path().display()
+            );
+            return HashMap::new();
+        }
+    };
+
+    let mut parsed: Vec<(String, SessionSummary, Option<std::time::SystemTime>)> = rows
+        .into_iter()
+        .map(|(id, row)| {
+            let when = row
+                .updated_at
+                .as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&chrono::Utc).into());
+            // Reuse the live struct's own cap so a summary written by an older
+            // build cannot come back longer than the current limit allows.
+            let text = if row.text.chars().count() > SUMMARY_MAX_CHARS {
+                row.text
+                    .chars()
+                    .rev()
+                    .take(SUMMARY_MAX_CHARS)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect()
+            } else {
+                row.text
+            };
+            (
+                id,
+                SessionSummary {
+                    text,
+                    turns_summarized: row.turns_summarized,
+                    updated_at: None,
+                    last_touched: None,
+                },
+                when,
+            )
+        })
+        .collect();
+
+    // Keep the SUMMARY_MAX_SESSIONS *newest* rows, then restore oldest-first order
+    // so the next `put_session_summary` evicts the genuinely oldest of the
+    // survivors.
+    //
+    // Dropping from the tail of an ascending sort would keep the OLDEST rows and
+    // silently discard the most recent work on load -- the exact opposite of what
+    // the cap is for. `None` timestamps (rows from a build that predates the
+    // field) sort first, so they are the ones dropped.
+    parsed.sort_by_key(|(_, _, when)| *when);
+    let excess = parsed.len().saturating_sub(SUMMARY_MAX_SESSIONS);
+    if excess > 0 {
+        parsed.drain(..excess);
+    }
+
+    let mut out: HashMap<String, SessionSummary> = HashMap::new();
+    for (id, summary, _) in parsed {
+        out.insert(id, summary);
+    }
+    out
+}
+
+/// Writes summaries to disk, best-effort.
+///
+/// `put_session_summary` is called on the hot path of a chat turn, so a failed
+/// write must never propagate; the next successful turn retries. Summaries are a
+/// convenience (they save the model re-reading trimmed turns), so losing one is
+/// strictly worse than not having written it but never worse than a failed request.
+fn save_persistent_summaries(summaries: &HashMap<String, SessionSummary>) {
+    let rows: HashMap<String, PersistedSessionSummary> = summaries
+        .iter()
+        .map(|(id, s)| {
+            (
+                id.clone(),
+                PersistedSessionSummary {
+                    text: s.text.clone(),
+                    turns_summarized: s.turns_summarized,
+                    updated_at: s.last_touched.map(|t| t.to_rfc3339()),
+                },
+            )
+        })
+        .collect();
+    if let Ok(data) = serde_json::to_string_pretty(&rows) {
+        let _ = fs::write(session_summaries_path(), data);
+    }
+}
+
 /// Prunes resolved approvals older than the configured age, at startup.
 ///
 /// Pending actions are never pruned regardless of age (see
@@ -5283,6 +5413,7 @@ fn put_session_summary(
     entry.text = capped;
     entry.turns_summarized += turns_added;
     entry.updated_at = Some(Instant::now());
+    entry.last_touched = Some(chrono::Utc::now());
 
     if summaries.len() > SUMMARY_MAX_SESSIONS {
         let mut by_age: Vec<(String, Option<Instant>)> = summaries
@@ -9821,6 +9952,10 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                     gen.text.trim().to_string(),
                     new_turns.len(),
                 );
+                // Persist after mutating, and while the state lock is still held,
+                // so two concurrent trims cannot interleave a read-modify-write
+                // and lose one another's summary.
+                save_persistent_summaries(&backend.session_summaries);
             }
             Ok(_) => {
                 tracing::debug!(
@@ -11877,7 +12012,10 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         trace_events: std::collections::VecDeque::new(),
         api_keys,
         models_scan_cache: ApiResponseCache::new(),
-        session_summaries: HashMap::new(),
+        // Restored from disk so a conversation's condensed memory survives a
+        // restart. Previously in-memory only, which meant a long session that had
+        // been trimmed lost its summary and the next turn re-read from scratch.
+        session_summaries: load_persistent_summaries(),
     }));
 
     // Background CPU/RAM/GPU sampler — keeps /api/metrics non-blocking.
@@ -15651,6 +15789,156 @@ mod tests {
             "prompt should be bounded, was {} chars",
             prompt.len()
         );
+    }
+
+    /// Points the summary store at a temp file for the duration of `body`.
+    ///
+    /// `session_summaries_path` reads the environment on every call (no cached
+    /// OnceLock), so overriding it here is enough -- and unlike the production code
+    /// these tests must not touch the real `session_summaries.json` next to the
+    /// repo. Serialised through the same shared lock the runtime tests use, since
+    /// the variable is process-global.
+    fn with_summary_store<R>(body: impl FnOnce(&std::path::Path) -> R) -> R {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _held = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("ghostlink-summary-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join(format!("summaries-{}.json", body_marker()));
+        std::env::set_var("GHOSTLINK_SESSION_SUMMARIES_PATH", &file);
+        let out = body(&file);
+        std::env::remove_var("GHOSTLINK_SESSION_SUMMARIES_PATH");
+        let _ = std::fs::remove_dir_all(&dir);
+        out
+    }
+
+    /// Monotonic per-call counter, so parallel tests get distinct filenames.
+    fn body_marker() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        N.fetch_add(1, Ordering::Relaxed)
+    }
+
+    #[test]
+    fn summaries_survive_a_restart_round_trip() {
+        with_summary_store(|_| {
+            let mut summaries: HashMap<String, SessionSummary> = HashMap::new();
+            put_session_summary(&mut summaries, "s1", "the user is Dana".to_string(), 4);
+            put_session_summary(&mut summaries, "s2", "debugging auth".to_string(), 2);
+            save_persistent_summaries(&summaries);
+
+            // A fresh process would start from an empty map and load from disk.
+            let restored = load_persistent_summaries();
+            assert_eq!(restored.len(), 2, "both summaries restored");
+            assert_eq!(restored.get("s1").unwrap().text, "the user is Dana");
+            assert_eq!(restored.get("s1").unwrap().turns_summarized, 4);
+            assert_eq!(restored.get("s2").unwrap().text, "debugging auth");
+            assert_eq!(restored.get("s2").unwrap().turns_summarized, 2);
+
+            // `Instant` is process-local, so it must NOT be restored -- a stale
+            // Instant from a previous boot would make eviction order nonsense.
+            assert!(
+                restored.get("s1").unwrap().updated_at.is_none(),
+                "Instant must not be restored across a restart"
+            );
+        });
+    }
+
+    #[test]
+    fn accumulating_across_restarts_keeps_the_turn_count() {
+        with_summary_store(|_| {
+            let mut first: HashMap<String, SessionSummary> = HashMap::new();
+            put_session_summary(&mut first, "s1", "part one".to_string(), 3);
+            save_persistent_summaries(&first);
+
+            // Restart: load, then a later trim adds to the same summary.
+            let mut second = load_persistent_summaries();
+            assert_eq!(second.get("s1").unwrap().turns_summarized, 3);
+            put_session_summary(&mut second, "s1", "part two".to_string(), 2);
+            assert_eq!(second.get("s1").unwrap().turns_summarized, 5);
+            assert_eq!(second.get("s1").unwrap().text, "part two");
+        });
+    }
+
+    #[test]
+    fn a_corrupt_store_degrades_to_no_summaries_rather_than_failing() {
+        with_summary_store(|file| {
+            std::fs::write(file, b"{ this is not json").unwrap();
+            let restored = load_persistent_summaries();
+            assert!(
+                restored.is_empty(),
+                "unreadable store must yield no summaries, not an error"
+            );
+        });
+    }
+
+    #[test]
+    fn a_missing_store_is_not_an_error() {
+        with_summary_store(|file| {
+            let _ = std::fs::remove_file(file);
+            assert!(load_persistent_summaries().is_empty());
+        });
+    }
+
+    #[test]
+    fn restored_summaries_still_respect_the_text_cap() {
+        with_summary_store(|file| {
+            // A store written by a build with a larger cap must not bring an
+            // oversized summary back into the current process.
+            let rows = serde_json::json!({
+                "s1": {
+                    "text": "a".repeat(SUMMARY_MAX_CHARS + 1000),
+                    "turns_summarized": 9,
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                }
+            });
+            std::fs::write(file, serde_json::to_string(&rows).unwrap()).unwrap();
+
+            let restored = load_persistent_summaries();
+            assert_eq!(
+                restored.get("s1").unwrap().text.chars().count(),
+                SUMMARY_MAX_CHARS,
+                "restored text must be trimmed to the current cap"
+            );
+            assert_eq!(restored.get("s1").unwrap().turns_summarized, 9);
+        });
+    }
+
+    #[test]
+    fn load_keeps_only_the_newest_sessions_beyond_the_cap() {
+        with_summary_store(|file| {
+            // More rows than SUMMARY_MAX_SESSIONS, with increasing timestamps.
+            let mut rows = serde_json::Map::new();
+            let total = SUMMARY_MAX_SESSIONS + 10;
+            for i in 0..total {
+                let ts = chrono::Utc::now() - chrono::Duration::seconds((total - i) as i64);
+                rows.insert(
+                    format!("s{i}"),
+                    serde_json::json!({
+                        "text": "summary",
+                        "turns_summarized": 1,
+                        "updated_at": ts.to_rfc3339(),
+                    }),
+                );
+            }
+            std::fs::write(file, serde_json::to_string(&rows).unwrap()).unwrap();
+
+            let restored = load_persistent_summaries();
+            assert_eq!(
+                restored.len(),
+                SUMMARY_MAX_SESSIONS,
+                "load must cap to SUMMARY_MAX_SESSIONS"
+            );
+            // The newest row (s{total-1}) must survive; the oldest must not.
+            assert!(
+                restored.contains_key(&format!("s{}", total - 1)),
+                "newest summary must be kept"
+            );
+            assert!(
+                !restored.contains_key("s0"),
+                "oldest summary must be dropped"
+            );
+        });
     }
 
     #[test]

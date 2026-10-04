@@ -37,6 +37,18 @@ All notable changes to Ghostlink Studio are documented here.
   9 tests cover single-use, expiry, loopback refusal, `X-Forwarded-For` spoofing from a remote peer, IPv6 loopback, and rejection of empty/garbage/oversized input.
 
 ### Fixed
+- **Conversation summaries now survive a restart** (`crates/ghost-link/src/main.rs`, `.gitignore`):
+  `BackendState::session_summaries` was in-memory only, so a long session that had been trimmed lost its condensed memory on restart and the next turn re-read from scratch — the summarization work was effectively undone by a crash or a redeploy.
+
+  Summaries are now written to `session_summaries.json` (`GHOSTLINK_SESSION_SUMMARIES_PATH`) after each successful trim and loaded at startup. The on-disk shape is a separate `PersistedSessionSummary`, because the in-memory struct carries an `Instant` for LRU eviction that cannot be serialized and means nothing across a restart; wall-clock time is tracked separately for durable ordering.
+
+  Failure paths degrade rather than break: an unreadable or corrupt store loads as "no summaries", which is exactly the pre-existing cold-start behavior, instead of failing boot. Text over `SUMMARY_MAX_CHARS` is trimmed on load too, so a store written by a build with a larger cap cannot reintroduce an oversized summary.
+
+  Verified: a live restart returns `summarized_history: true` for `sess_local_001` purely from the restored file, and 6 new tests cover the round-trip, accumulation across restarts, corrupt/missing stores, oversized rows, and the cap.
+
+  One bug caught by those tests and fixed here: the loader sorted ascending and truncated, which kept the **oldest** rows and silently discarded the most recent work — the opposite of what the cap is for. It now drops the excess oldest and keeps the newest.
+
+### Fixed
 - **Bootstrap-code tests no longer fail intermittently in parallel** (`crates/ghost-link/src/bootstrap.rs`):
   the code store is process-global — one `OnceLock<Mutex<HashMap<..>>>`, which is correct for the server since exactly one code is live per process. Under `cargo test`, though, tests share that store on parallel threads and `issue_code()` *clears* it before inserting, so one test issuing a code could wipe another's mid-assertion.
 
