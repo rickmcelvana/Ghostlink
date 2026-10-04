@@ -40,7 +40,7 @@ describe('ApprovalTray', () => {
     expect(container.querySelector('.approval-tray')).toBeNull();
   });
 
-  it('lists a pending approval with its class and preview', async () => {
+  it('lists a pending approval with its class, preview, and accessible action buttons', async () => {
     const api = makeApi({
       listApprovals: vi.fn().mockResolvedValue({ approvals: [approval()] }),
     } as unknown as Partial<GhostlinkAPI>);
@@ -49,8 +49,19 @@ describe('ApprovalTray', () => {
     await screen.findByText('write_file');
     expect(screen.getByText('Write')).toBeTruthy();
     expect(screen.getByText('write_file on notes.md')).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'Approve' })).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'Deny' })).toBeTruthy();
+
+    const approveBtn = screen.getByRole('button', { name: 'Approve write_file' });
+    expect(approveBtn).toHaveAttribute('title', 'Approve write_file execution');
+    expect(approveBtn).toHaveAttribute('aria-busy', 'false');
+
+    const approveSessionBtn = screen.getByRole('button', { name: 'Approve write_file for session' });
+    expect(approveSessionBtn).toHaveAttribute('title', 'Approve write_file for current session');
+
+    const denyBtn = screen.getByRole('button', { name: 'Deny write_file' });
+    expect(denyBtn).toHaveAttribute('title', 'Deny write_file execution');
+
+    const showResolvedCheckbox = screen.getByRole('checkbox', { name: 'Show resolved approvals' });
+    expect(showResolvedCheckbox).toHaveAttribute('title', 'Toggle showing resolved approvals');
   });
 
   it('never offers a session grant for an exec-class tool', async () => {
@@ -64,8 +75,8 @@ describe('ApprovalTray', () => {
     render(<ApprovalTray api={api} />);
 
     await screen.findByText('run_command');
-    expect(screen.queryByRole('button', { name: 'Approve for session' })).toBeNull();
-    expect(screen.getByRole('button', { name: 'Approve' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /Approve run_command for session/ })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Approve run_command' })).toBeTruthy();
   });
 
   it('offers a session grant for a write-class tool', async () => {
@@ -74,7 +85,7 @@ describe('ApprovalTray', () => {
     } as unknown as Partial<GhostlinkAPI>);
     render(<ApprovalTray api={api} />);
     await screen.findByText('write_file');
-    expect(screen.getByRole('button', { name: 'Approve for session' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Approve write_file for session' })).toBeTruthy();
   });
 
   it('sends approve=true with the session flag when requested', async () => {
@@ -85,7 +96,7 @@ describe('ApprovalTray', () => {
     } as unknown as Partial<GhostlinkAPI>);
     render(<ApprovalTray api={api} />);
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Approve for session' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Approve write_file for session' }));
     await waitFor(() =>
       expect(decide).toHaveBeenCalledWith('a1', true, { approveForSession: true })
     );
@@ -99,7 +110,7 @@ describe('ApprovalTray', () => {
     } as unknown as Partial<GhostlinkAPI>);
     render(<ApprovalTray api={api} />);
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Deny' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Deny write_file' }));
     await waitFor(() =>
       expect(decide).toHaveBeenCalledWith('a1', false, { approveForSession: false })
     );
@@ -120,7 +131,7 @@ describe('ApprovalTray', () => {
     const api = makeApi({ listApprovals, decideApproval: decide } as unknown as Partial<GhostlinkAPI>);
     render(<ApprovalTray api={api} />);
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Approve' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Approve write_file' }));
     // Approving should not be a blind act — the user sees what happened.
     expect(await screen.findByText('wrote 12 bytes')).toBeTruthy();
   });
@@ -132,7 +143,7 @@ describe('ApprovalTray', () => {
     } as unknown as Partial<GhostlinkAPI>);
     render(<ApprovalTray api={api} />);
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Approve' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Approve write_file' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('server exploded');
   });
 
@@ -145,7 +156,7 @@ describe('ApprovalTray', () => {
     render(<ApprovalTray api={api} />);
 
     await screen.findByText('Denied');
-    expect(screen.queryByRole('button', { name: 'Approve' })).toBeNull();
-    expect(screen.queryByRole('button', { name: 'Deny' })).toBeNull();
+    expect(screen.queryByRole('button', { name: /Approve/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: /Deny/ })).toBeNull();
   });
 });

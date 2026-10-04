@@ -97,6 +97,8 @@ export const ApprovalTray: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
             type="checkbox"
             checked={showResolved}
             onChange={(e) => setShowResolved(e.target.checked)}
+            aria-label="Show resolved approvals"
+            title="Toggle showing resolved approvals"
           />
           Show resolved
         </label>
@@ -132,9 +134,12 @@ export const ApprovalTray: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
                   <button
                     type="button"
                     disabled={busy}
+                    aria-busy={busy}
+                    aria-label={busy ? `Approving ${a.tool}...` : `Approve ${a.tool}`}
+                    title={busy ? `Approving ${a.tool}...` : `Approve ${a.tool} execution`}
                     onClick={() => void decide(a, true)}
                   >
-                    Approve
+                    {busy ? 'Approving...' : 'Approve'}
                   </button>
                   {/* Session grants are never offered for exec: an "always allow"
                       on a command runner is a standing shell. The backend refuses
@@ -143,18 +148,24 @@ export const ApprovalTray: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
                     <button
                       type="button"
                       disabled={busy}
+                      aria-busy={busy}
+                      aria-label={busy ? `Approving ${a.tool} for session...` : `Approve ${a.tool} for session`}
+                      title={busy ? `Approving ${a.tool} for session...` : `Approve ${a.tool} for current session`}
                       onClick={() => void decide(a, true, true)}
                     >
-                      Approve for session
+                      {busy ? 'Approving...' : 'Approve for session'}
                     </button>
                   )}
                   <button
                     type="button"
                     disabled={busy}
+                    aria-busy={busy}
+                    aria-label={busy ? `Denying ${a.tool}...` : `Deny ${a.tool}`}
+                    title={busy ? `Denying ${a.tool}...` : `Deny ${a.tool} execution`}
                     className="approval-tray__deny"
                     onClick={() => void decide(a, false)}
                   >
-                    Deny
+                    {busy ? 'Denying...' : 'Deny'}
                   </button>
                 </div>
               ) : (
