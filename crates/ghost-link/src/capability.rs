@@ -116,7 +116,18 @@ fn build_table() -> ClassTable {
     }
 
     // Git: inspection reads, anything that moves refs or the worktree writes.
-    for tool in ["git_status", "git_log", "git_diff", "git_show", "git_blame"] {
+    // `git_diff_unstaged` / `git_diff_staged` are real tools on mcp-server-git
+    // alongside the combined `git_diff`. Without them they fell through to the
+    // Exec default, so an ordinary diff needed an approval.
+    for tool in [
+        "git_status",
+        "git_log",
+        "git_diff",
+        "git_diff_unstaged",
+        "git_diff_staged",
+        "git_show",
+        "git_blame",
+    ] {
         t.insert(("git".into(), tool.into()), CapabilityClass::Read);
     }
     for tool in [
@@ -130,8 +141,13 @@ fn build_table() -> ClassTable {
     }
 
     // Web fetch and search are reads with respect to *local* state.
-    for tool in ["fetch", "brave_web_search", "web_search"] {
-        t.insert(("fetch".into(), tool.into()), CapabilityClass::Read);
+    //
+    // `fetch` and `brave-search` are separate servers and the table keys on
+    // `(server, tool)`, so each needs its own entries. The previous loop filed
+    // `brave_web_search` under `fetch` AND under `brave-search`, which left
+    // `fetch.fetch` — the tool that actually exists — unclassified.
+    t.insert(("fetch".into(), "fetch".into()), CapabilityClass::Read);
+    for tool in ["brave_web_search", "brave_web_search_stats", "web_search"] {
         t.insert(("brave-search".into(), tool.into()), CapabilityClass::Read);
     }
 
@@ -151,10 +167,13 @@ fn build_table() -> ClassTable {
     for tool in ["write_file", "edit_file", "create_directory", "move_file"] {
         t.insert(("filesystem".into(), tool.into()), CapabilityClass::Write);
     }
-    t.insert(
-        ("sqlite".into(), "read_query".into()),
-        CapabilityClass::Read,
-    );
+    // Schema inspection reads. mcp-server-sqlite ships `list_tables` and
+    // `describe_table` alongside the query tools, and both were falling through
+    // to Exec -- so merely listing tables demanded an approval, which is the
+    // kind of false gate that teaches people to approve without reading.
+    for tool in ["read_query", "list_tables", "describe_table"] {
+        t.insert(("sqlite".into(), tool.into()), CapabilityClass::Read);
+    }
     for tool in [
         "write_query",
         "execute_query",
@@ -621,5 +640,126 @@ mod tests {
             CapabilityClass::Write
         );
         assert_eq!(classify("memory", "memory_forget"), CapabilityClass::Write);
+    }
+
+    /// Every tool a configured MCP server actually exposes must be classified.
+    ///
+    /// This is the test that keeps the table honest against the servers in
+    /// `mcp_servers.example.toml`. The list is the real tool set of each server
+    /// (the Ghostlink crates' names come from their `#[tool]` attributes; the
+    /// third-party names from the packages pinned there), NOT a copy of the
+    /// table above -- so adding a tool upstream without classifying it here
+    /// fails the build rather than silently falling back to `Exec` and demanding
+    /// an approval for a harmless read.
+    ///
+    /// Falling back to `Exec` is safe, not correct: it blocked `git_diff_unstaged`,
+    /// `list_tables`, `describe_table`, `fetch.fetch`, and both brave-search
+    /// tools, every one of which is an ordinary observation.
+    const REAL_TOOLS: &[(&str, &str, CapabilityClass)] = &[
+        // filesystem
+        ("filesystem", "read_text_file", CapabilityClass::Read),
+        ("filesystem", "read_media_file", CapabilityClass::Read),
+        ("filesystem", "read_multiple_files", CapabilityClass::Read),
+        ("filesystem", "list_directory", CapabilityClass::Read),
+        (
+            "filesystem",
+            "list_directory_with_sizes",
+            CapabilityClass::Read,
+        ),
+        ("filesystem", "directory_tree", CapabilityClass::Read),
+        ("filesystem", "search_files", CapabilityClass::Read),
+        ("filesystem", "get_file_info", CapabilityClass::Read),
+        (
+            "filesystem",
+            "list_allowed_directories",
+            CapabilityClass::Read,
+        ),
+        ("filesystem", "write_file", CapabilityClass::Write),
+        ("filesystem", "edit_file", CapabilityClass::Write),
+        ("filesystem", "create_directory", CapabilityClass::Write),
+        ("filesystem", "move_file", CapabilityClass::Write),
+        // calculator (Ghostlink crate)
+        ("calculator", "calculate", CapabilityClass::Read),
+        // fetch -- the tool is named `fetch` on a server named `fetch`
+        ("fetch", "fetch", CapabilityClass::Read),
+        // brave-search is a separate server from fetch
+        ("brave-search", "brave_web_search", CapabilityClass::Read),
+        (
+            "brave-search",
+            "brave_web_search_stats",
+            CapabilityClass::Read,
+        ),
+        // sqlite: reads, including schema inspection
+        ("sqlite", "read_query", CapabilityClass::Read),
+        ("sqlite", "list_tables", CapabilityClass::Read),
+        ("sqlite", "describe_table", CapabilityClass::Read),
+        ("sqlite", "write_query", CapabilityClass::Write),
+        ("sqlite", "create_table", CapabilityClass::Write),
+        // git
+        ("git", "git_status", CapabilityClass::Read),
+        ("git", "git_diff", CapabilityClass::Read),
+        ("git", "git_diff_unstaged", CapabilityClass::Read),
+        ("git", "git_diff_staged", CapabilityClass::Read),
+        ("git", "git_log", CapabilityClass::Read),
+        ("git", "git_show", CapabilityClass::Read),
+        ("git", "git_blame", CapabilityClass::Read),
+        ("git", "git_add", CapabilityClass::Write),
+        ("git", "git_commit", CapabilityClass::Write),
+        ("git", "git_checkout", CapabilityClass::Write),
+        ("git", "git_reset", CapabilityClass::Write),
+        ("git", "git_push", CapabilityClass::Write),
+        // rag (Ghostlink crate)
+        ("rag", "search", CapabilityClass::Read),
+        ("rag", "index_document", CapabilityClass::Write),
+        // vision (Ghostlink crate)
+        ("vision", "analyze_image", CapabilityClass::Read),
+        // sequential-thinking
+        (
+            "sequential-thinking",
+            "sequentialthinking",
+            CapabilityClass::Read,
+        ),
+        // memory (Ghostlink crate, phase 1)
+        ("memory", "memory_catalog", CapabilityClass::Read),
+        ("memory", "memory_search", CapabilityClass::Read),
+        ("memory", "memory_remember", CapabilityClass::Write),
+        ("memory", "memory_forget", CapabilityClass::Write),
+    ];
+
+    #[test]
+    fn every_real_tool_is_classified_as_expected() {
+        let mut wrong = Vec::new();
+        for (server, tool, expected) in REAL_TOOLS {
+            let actual = classify(server, tool);
+            if actual != *expected {
+                wrong.push(format!(
+                    "{server}.{tool}: expected {expected:?}, got {actual:?}"
+                ));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "capability table disagrees with the real tool set:\n  {}",
+            wrong.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn no_ordinary_read_is_left_to_the_exec_default() {
+        // The specific regression: these all silently became Exec.
+        for (server, tool) in [
+            ("git", "git_diff_unstaged"),
+            ("git", "git_diff_staged"),
+            ("sqlite", "list_tables"),
+            ("sqlite", "describe_table"),
+            ("fetch", "fetch"),
+            ("brave-search", "brave_web_search"),
+        ] {
+            assert_ne!(
+                classify(server, tool),
+                CapabilityClass::Exec,
+                "{server}.{tool} fell through to Exec and would demand approval for a read"
+            );
+        }
     }
 }

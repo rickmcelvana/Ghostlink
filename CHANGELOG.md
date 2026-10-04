@@ -6,6 +6,13 @@ All notable changes to Ghostlink Studio are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- **Six ordinary read tools were falling through to the `Exec` default** (`crates/ghost-link/src/capability.rs`):
+  auditing the classification table against the *actual* tool set of every server in `mcp_servers.example.toml` found `git_diff_unstaged`, `git_diff_staged`, `sqlite.list_tables`, `sqlite.describe_table`, `fetch.fetch`, and both `brave-search` tools were unclassified and so defaulted to `Exec`.
+  Failing closed is safe -- no read was wrongly permitted -- but it is not correct: each of these demanded a human approval just to look at a diff, list tables, or fetch a URL. That is exactly the routine false gate that trains people to click Approve without reading, which is the habit the approval tray depends on.
+  `fetch.fetch` was missed for a structural reason worth recording: the table keys on `(server, tool)`, and the old loop filed `brave_web_search` under both `fetch` and `brave-search` while never filing the `fetch` tool that actually exists on the `fetch` server. A `REAL_TOOLS` table in the test module now pins every real tool name to its expected class, so adding a tool upstream without classifying it fails the build instead of silently demanding an approval.
+  Also adds the `memory` server to the active `mcp_servers.toml`, which had only been added to `mcp_servers.example.toml` -- so the phase-1 memory tools were unreachable in a real deployment despite being implemented and classified.
+
 ### Added
 - **Local schedule driver** (`crates/ghost-link/src/scheduler.rs`, `crates/ghost-link/src/main.rs`, `.gitignore`):
   schedules are JSON rows plus a tokio task that sleeps until the next firing. Each run is an ordinary agent turn through the native path, so the capability gate, approval queue, and workspace scoping apply exactly as they do to interactive chat -- **a schedule is not a privileged route**. A schedule that produces a write or exec call lands in the approval queue rather than executing; the run is recorded as `needs_approval`, and `last_run_was_read_only` is what distinguishes a schedule safe to repeat unattended from one that isn't.
