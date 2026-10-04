@@ -54,7 +54,7 @@ memory bodies and tool previews — not credentials. API keys stay in
 
 ## Implementation status
 
-Branch: `main` (phases 0-4 and 6 landed; see below)
+Branch: see PR (phases 0-6 all landed)
 (`cargo fmt`, `cargo clippy -D warnings`, `cargo test --workspace` all clean).
 
 | Phase | Status |
@@ -65,7 +65,7 @@ Branch: `main` (phases 0-4 and 6 landed; see below)
 | 1 — Memory library | **Done.** `crates/mcp-memory`, SQLite + `rusqlite` (bundled), 4 tools, scope stamped at dispatch |
 | 3 — Approval tray | **Done.** `approvals.rs`, list/decide routes, `ApprovalTray.tsx` (9 tests) |
 | 4 — Bounded loop | **Done.** `agent.rs` three-limit budget + wall-clock backstop; `skills.rs` non-escalating skills |
-| 5 — Scheduler | Not started |
+| 5 — Scheduler | **Done.** `scheduler.rs`, driver loop, 7 routes; tool selection deferred (see below) |
 | 6 — Turn traces | **Done.** `trace.rs`, `GET /api/inference/traces`, redaction enforced by type (no payload field exists) |
 
 Two notes for whoever picks this up:

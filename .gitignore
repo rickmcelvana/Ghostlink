@@ -146,4 +146,5 @@ ghostlink_gui_modern/public/env-config.js
 # arguments of pending actions, which is exactly the kind of thing that must
 # never be committed into a user's repository.
 approvals.json
+schedules.json
 ghostlink_memory.db

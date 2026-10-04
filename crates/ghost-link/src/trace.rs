@@ -181,6 +181,13 @@ impl TraceEvent {
         parts.join(" ")
     }
 
+    /// Records an agent turn. Phase 5's scheduler uses this for scheduled runs,
+    /// so a background firing is distinguishable in the trace from a human's
+    /// chat turn.
+    pub fn invoke_agent(turn_id: &str, workspace_id: &str) -> Self {
+        Self::new(TraceEventKind::InvokeAgent, turn_id, workspace_id)
+    }
+
     /// Records a tool dispatch or refusal.
     pub fn execute_tool(
         tool_name: &str,

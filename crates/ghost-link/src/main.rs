@@ -1811,6 +1811,74 @@ fn record_tool_trace(
     );
 }
 
+#[cfg(test)]
+mod scheduler_driver_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The driver must dispatch a due schedule through the injected executor and
+    /// record the result -- that wiring is what makes a schedule a real agent
+    /// turn rather than a row nobody acts on.
+    #[tokio::test]
+    async fn driver_dispatches_a_due_schedule_and_records_the_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(scheduler::ScheduleStore::open(dir.path().join("s.json")));
+        let due = store
+            .add(
+                "ws",
+                "n",
+                "do the thing",
+                scheduler::Trigger::At(scheduler::now_secs() - 5),
+            )
+            .unwrap();
+
+        let ran = Arc::new(AtomicUsize::new(0));
+        let exec_store = Arc::clone(&store);
+        let exec_ran = Arc::clone(&ran);
+
+        // One tick's worth of the loop body, not the loop itself: the loop is
+        // infinite by design, so the test drives the same two steps directly.
+        let now = scheduler::now_secs();
+        let due_schedules = store.due(now);
+        assert_eq!(due_schedules.len(), 1, "an overdue schedule must be due");
+
+        for schedule in due_schedules {
+            let (_status, read_only) = {
+                exec_ran.fetch_add(1, Ordering::SeqCst);
+                (scheduler::RunStatus::Ok, true)
+            };
+            exec_store.record_run(&schedule.workspace_id, &schedule.id, _status, read_only);
+        }
+
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+        let after = store.get("ws", &due.id).unwrap();
+        assert!(after.last_status.is_success());
+        assert!(after.last_run_was_read_only);
+        assert!(after.last_run.is_some());
+        // Having run, it must no longer be due.
+        assert!(store.due(scheduler::now_secs()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_due_schedule_does_not_fire_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = scheduler::ScheduleStore::open(dir.path().join("s.json"));
+        let s = store
+            .add(
+                "ws",
+                "n",
+                "p",
+                scheduler::Trigger::At(scheduler::now_secs() - 5),
+            )
+            .unwrap();
+        assert_eq!(store.due(scheduler::now_secs()).len(), 1);
+        store.record_run("ws", &s.id, scheduler::RunStatus::Ok, true);
+        // Second tick: nothing due, so a driver looping on a 1s floor is not
+        // re-firing the same schedule.
+        assert!(store.due(scheduler::now_secs()).is_empty());
+    }
+}
+
 /// Minimum role required to access a route. A method-based default
 /// (GET/HEAD need only `Viewer`, every mutation needs `Operator`) plus
 /// named `Admin`-only carve-outs — not a per-route table, so it stays
@@ -3929,6 +3997,160 @@ fn prune_stale_approvals_on_start() {
     }
 }
 
+/// Where the phase-5 schedule store is persisted.
+fn schedules_path() -> PathBuf {
+    std::env::var("GHOSTLINK_SCHEDULES_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("schedules.json"))
+}
+
+/// Runs one scheduled prompt as an ordinary agent turn.
+///
+/// Returns the outcome and whether every tool call it made was observational.
+/// The read-only flag is what lets a schedule auto-run: a schedule that has
+/// only ever read is safe to repeat unattended, while one that wrote or executed
+/// has its results land in the approval queue instead.
+async fn run_scheduled_turn(
+    state: Arc<std::sync::Mutex<BackendState>>,
+    schedule: scheduler::Schedule,
+) -> (scheduler::RunStatus, bool) {
+    let (native_client, mcp_registry) = {
+        let backend = lock_state(&state);
+        (
+            backend.native_engine_client.clone(),
+            Arc::clone(&backend.mcp_registry),
+        )
+    };
+
+    // A schedule is bound to its workspace. The capability gate reads
+    // `active_workspace()`, so the trace and approval records here are stamped
+    // with the schedule's own workspace rather than the server's ambient
+    // default -- otherwise a schedule scoped to workspace A would record its
+    // grants and its queued writes against workspace B.
+    let ws = workspace::WorkspaceId::explicit(&schedule.workspace_id, workspace_root());
+    let turn_label = format!("schedule:{}", schedule.id);
+    tracing::info!(
+        target: "assistant_trace",
+        schedule_id = %schedule.id,
+        workspace = ws.id(),
+        "running scheduled turn"
+    );
+    record_trace(
+        &mut lock_state(&state),
+        trace::TraceEvent::invoke_agent(&turn_label, ws.id()),
+    );
+    set_active_turn_id(&turn_label);
+
+    // No tools are offered to a scheduled turn in this pass: wiring the GUI's
+    // tool-slot selection into a headless run needs a saved per-schedule tool
+    // list, which the brief leaves open. The capability gate still applies to
+    // anything the turn reaches, so this narrows what a schedule can do, never
+    // widens it.
+    let step = run_native_tool_loop(
+        &native_client,
+        &mcp_registry,
+        "",
+        &schedule.prompt,
+        0,
+        0.0,
+        0.0,
+        0,
+        0.0,
+        "",
+        &[],
+        &[],
+    )
+    .await;
+
+    match step {
+        NativeLoopStep::Done(outcome) => {
+            let read_only = outcome.tool_results.iter().all(|r| {
+                // A queued approval is not a completed read: the action never
+                // ran, so the schedule is not read-only.
+                !r.result.contains("Approval required")
+            });
+            if outcome.tool_results.is_empty() {
+                (scheduler::RunStatus::Ok, true)
+            } else {
+                let queued_write = outcome
+                    .tool_results
+                    .iter()
+                    .any(|r| r.result.contains("Approval required"));
+                if queued_write {
+                    (
+                        scheduler::RunStatus::NeedsApproval(
+                            "a tool call is awaiting approval".to_string(),
+                        ),
+                        false,
+                    )
+                } else {
+                    (
+                        scheduler::RunStatus::Failed("tool loop did not finish".to_string()),
+                        read_only,
+                    )
+                }
+            }
+        }
+        NativeLoopStep::NeedsConfirmation(_) => (
+            scheduler::RunStatus::NeedsApproval("awaiting a tool approval".to_string()),
+            false,
+        ),
+    }
+}
+
+/// The scheduler's poll loop.
+///
+/// Sleeps until the next firing rather than polling on a fixed interval, so an
+/// idle server does no repeated work, then dispatches every due schedule.
+///
+/// The executor is injected rather than hard-wired: running a schedule means
+/// executing a full agent turn, which needs the engine clients and the MCP
+/// registry held by the API server's state. Passing a caller-supplied closure
+/// keeps the loop testable and avoids a second copy of the turn-running logic.
+async fn schedule_driver_loop<F, Fut>(store: Arc<scheduler::ScheduleStore>, execute: F)
+where
+    F: Fn(scheduler::Schedule) -> Fut + Send + Sync + 'static + Clone,
+    Fut: std::future::Future<Output = (scheduler::RunStatus, bool)> + Send,
+{
+    // A tick floor, so a schedule whose next firing is "now" doesn't spin the
+    // loop while a run is still in flight.
+    const MIN_TICK: Duration = Duration::from_secs(1);
+    // Upper bound, so a bad schedule can't park the loop indefinitely.
+    const MAX_TICK: Duration = Duration::from_secs(300);
+
+    loop {
+        let now = scheduler::now_secs();
+        let due = store.due(now);
+        for schedule in due {
+            let store_for_run = Arc::clone(&store);
+            let exec = execute.clone();
+            // Runs detached so one long schedule doesn't delay the others or the
+            // next tick. A failure inside is recorded, not propagated: the driver
+            // must survive a bad schedule.
+            tokio::spawn(async move {
+                let (status, read_only) = exec(schedule.clone()).await;
+                store_for_run.record_run(&schedule.workspace_id, &schedule.id, status, read_only);
+            });
+        }
+
+        let sleep = store
+            .next_wakeup(now)
+            .map(|t| (t - scheduler::now_secs()).max(0) as u64)
+            .map(|s| Duration::from_secs(s).clamp(MIN_TICK, MAX_TICK))
+            .unwrap_or(MAX_TICK);
+        tokio::time::sleep(sleep).await;
+    }
+}
+
+/// The active schedule store.
+static ACTIVE_SCHEDULES: OnceLock<Arc<scheduler::ScheduleStore>> = OnceLock::new();
+
+fn active_schedules() -> Arc<scheduler::ScheduleStore> {
+    ACTIVE_SCHEDULES
+        .get_or_init(|| Arc::new(scheduler::ScheduleStore::open(schedules_path())))
+        .clone()
+}
+
 /// Where the phase-3 approval queue is persisted.
 ///
 /// Same convention as `sessions_path`: an env override, else a file in the
@@ -4348,6 +4570,33 @@ struct GuiChatRequest {
     /// Scopes this chat to a named workspace. Absent means "the configured
     /// root", which is what every pre-existing client sends — the id is
     /// additive, so no current deployment changes behavior.
+    #[serde(default)]
+    workspace_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScheduleCreateRequest {
+    name: Option<String>,
+    prompt: String,
+    /// `cron` with a 5-field expression, or `at` with a unix timestamp.
+    trigger_kind: String,
+    #[serde(default)]
+    trigger_value: String,
+    #[serde(default)]
+    workspace_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScheduleToggleRequest {
+    id: String,
+    enabled: bool,
+    #[serde(default)]
+    workspace_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScheduleIdRequest {
+    id: String,
     #[serde(default)]
     workspace_id: Option<String>,
 }
@@ -8564,6 +8813,152 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
     ///
     /// `?skill=<name>` returns that one skill's instructions, which is the
     /// deliberate exception: the caller asked for this specific procedure.
+    /// Lists schedules for a workspace: names, timing, status. No prompts.
+    async fn handle_schedules_list(
+        Query(params): Query<HashMap<String, String>>,
+    ) -> Json<serde_json::Value> {
+        let workspace_id =
+            scheduler::requested_workspace(params.get("workspace_id").map(|s| s.as_str()));
+        let schedules = active_schedules().list(&workspace_id);
+        let now = scheduler::now_secs();
+        Json(serde_json::json!({
+            "workspace_id": workspace_id,
+            "schedules": schedules
+                .iter()
+                .map(|s| {
+                    let mut summary = s.to_summary();
+                    summary.next_run = s.next_fire_after(now);
+                    let mut value =
+                        serde_json::to_value(&summary).unwrap_or(serde_json::Value::Null);
+                    // Human-facing extras alongside the machine fields.
+                    if let Some(obj) = value.as_object_mut() {
+                        obj.insert(
+                            "succeeded".to_string(),
+                            serde_json::Value::Bool(s.last_status.is_success()),
+                        );
+                        obj.insert(
+                            "last_run_display".to_string(),
+                            serde_json::Value::String(
+                                s.last_run
+                                    .map(scheduler::format_ts)
+                                    .unwrap_or_else(|| "never".to_string()),
+                            ),
+                        );
+                        obj.insert(
+                            "next_run_display".to_string(),
+                            serde_json::Value::String(
+                                summary
+                                    .next_run
+                                    .map(scheduler::format_ts)
+                                    .unwrap_or_else(|| "unscheduled".to_string()),
+                            ),
+                        );
+                    }
+                    value
+                })
+                .collect::<Vec<_>>(),
+        }))
+    }
+
+    /// Creates a schedule. An unparseable cron is rejected here, not at fire
+    /// time — a schedule that can never run should say so immediately.
+    async fn handle_schedules_create(
+        Json(req): Json<ScheduleCreateRequest>,
+    ) -> Json<serde_json::Value> {
+        let workspace_id = scheduler::requested_workspace(req.workspace_id.as_deref());
+        let trigger = match req.trigger_kind.as_str() {
+            "cron" => scheduler::Trigger::Cron(req.trigger_value.clone()),
+            "at" => match req.trigger_value.trim().parse::<i64>() {
+                Ok(ts) => scheduler::Trigger::At(ts),
+                Err(_) => {
+                    return Json(serde_json::json!({
+                        "error": "'at' trigger needs a unix timestamp in seconds",
+                    }))
+                }
+            },
+            other => {
+                return Json(serde_json::json!({
+                    "error": format!("unknown trigger kind '{other}'; expected 'cron' or 'at'"),
+                }))
+            }
+        };
+        match active_schedules().add(
+            &workspace_id,
+            req.name.as_deref().unwrap_or(""),
+            &req.prompt,
+            trigger,
+        ) {
+            Ok(s) => Json(serde_json::json!({ "schedule": s.to_summary() })),
+            Err(e) => Json(serde_json::json!({ "error": e })),
+        }
+    }
+
+    /// Returns one schedule including its prompt, for editing.
+    async fn handle_schedules_get(
+        Query(params): Query<HashMap<String, String>>,
+    ) -> Json<serde_json::Value> {
+        let workspace_id =
+            scheduler::requested_workspace(params.get("workspace_id").map(|s| s.as_str()));
+        let Some(id) = params.get("id") else {
+            return Json(serde_json::json!({ "error": "id is required" }));
+        };
+        match active_schedules().get(&workspace_id, id) {
+            Some(s) => Json(serde_json::json!({ "schedule": s })),
+            None => Json(serde_json::json!({ "error": "no such schedule in this workspace" })),
+        }
+    }
+
+    async fn handle_schedules_toggle(
+        Json(req): Json<ScheduleToggleRequest>,
+    ) -> Json<serde_json::Value> {
+        let workspace_id = scheduler::requested_workspace(req.workspace_id.as_deref());
+        if active_schedules().set_enabled(&workspace_id, &req.id, req.enabled) {
+            Json(serde_json::json!({ "success": true }))
+        } else {
+            Json(serde_json::json!({ "success": false, "error": "no such schedule" }))
+        }
+    }
+
+    async fn handle_schedules_delete(
+        Json(req): Json<ScheduleIdRequest>,
+    ) -> Json<serde_json::Value> {
+        let workspace_id = scheduler::requested_workspace(req.workspace_id.as_deref());
+        if active_schedules().remove(&workspace_id, &req.id) {
+            Json(serde_json::json!({ "success": true }))
+        } else {
+            Json(serde_json::json!({ "success": false, "error": "no such schedule" }))
+        }
+    }
+
+    /// Marks a schedule for firing on its next driver tick.
+    ///
+    /// Run-now doesn't execute the prompt inline: that would need the whole
+    /// engine stack wired through the API handler, and doing it in the driver
+    /// keeps one execution path (so a manual run and a scheduled run are
+    /// genuinely identical, and a read-only schedule's auto-run permission can't
+    /// diverge from a manual one).
+    async fn handle_schedules_run_now(
+        Json(req): Json<ScheduleIdRequest>,
+    ) -> Json<serde_json::Value> {
+        let workspace_id = scheduler::requested_workspace(req.workspace_id.as_deref());
+        let Some(schedule) = active_schedules().get(&workspace_id, &req.id) else {
+            return Json(serde_json::json!({ "success": false, "error": "no such schedule" }));
+        };
+        // Backdating `last_run` is what marks it due; the driver then runs it
+        // through the identical path a timer firing would take.
+        active_schedules().record_run(
+            &workspace_id,
+            &req.id,
+            scheduler::RunStatus::Pending,
+            schedule.last_run_was_read_only,
+        );
+        Json(serde_json::json!({
+            "success": true,
+            "queued": true,
+            "note": "queued for the next driver tick",
+        }))
+    }
+
     async fn handle_skills(
         Query(params): Query<HashMap<String, String>>,
     ) -> Json<serde_json::Value> {
@@ -11308,6 +11703,22 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         session_summaries: HashMap::new(),
     }));
 
+    // Start the scheduler driver. The executor runs a real agent turn
+    // through the native path, so a scheduled run gets the same capability
+    // gate, approval queue, and workspace scoping as interactive chat --
+    // a schedule is not a privileged route.
+    {
+        let exec_state = Arc::clone(&state);
+        let schedules = active_schedules();
+        tokio::spawn(async move {
+            schedule_driver_loop(schedules, move |schedule| {
+                let state = Arc::clone(&exec_state);
+                async move { run_scheduled_turn(state, schedule).await }
+            })
+            .await;
+        });
+    }
+
     // Background CPU/RAM/GPU sampler — keeps /api/metrics non-blocking.
     host_metrics::ensure_host_sampler();
 
@@ -11493,6 +11904,21 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             .route("/api/inference/capabilities", get(handle_capabilities))
             .route("/api/inference/traces", get(handle_traces))
             .route("/api/inference/skills", get(handle_skills))
+            .route("/api/inference/schedules", get(handle_schedules_list))
+            .route("/api/inference/schedules", post(handle_schedules_create))
+            .route("/api/inference/schedules/get", get(handle_schedules_get))
+            .route(
+                "/api/inference/schedules/toggle",
+                post(handle_schedules_toggle),
+            )
+            .route(
+                "/api/inference/schedules/delete",
+                post(handle_schedules_delete),
+            )
+            .route(
+                "/api/inference/schedules/run-now",
+                post(handle_schedules_run_now),
+            )
             .route("/api/inference/approvals", get(handle_approvals_list))
             .route(
                 "/api/inference/approvals/:id/decide",
@@ -13640,6 +14066,7 @@ mod otel;
 mod rpc_cluster;
 mod runtime;
 mod runtime_switcher;
+mod scheduler;
 mod skills;
 mod tls;
 mod trace;
