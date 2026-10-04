@@ -6,6 +6,18 @@ All notable changes to Ghostlink Studio are documented here.
 
 ## [Unreleased]
 
+### Added
+- **The chat now shows when context was dropped or condensed** (`ghostlink_gui_modern/src/components/ChatTab.tsx`, `ghostlink_gui_modern/src/store.ts`):
+  two indicators above an assistant reply, kept deliberately distinct:
+  - **earlier turns dropped** (amber) — the server trimmed older turns from *this* reply's context to fit the token limit.
+  - **answering from summary** (indigo) — the model answered from a running summary of turns trimmed in *earlier* requests.
+
+  Merging them would hide the case where the gap is still growing: "we dropped something" and "we are still holding a condensed memory" are different facts, and a user debugging a forgotten detail needs to tell them apart. Assistant turns only.
+
+  Both signals were already reaching the client — `truncated` was set on the message but never rendered, and `summarized_history` had no consumer at all — so from the user's side the model had simply forgotten. Both now surface, with `title` and `aria-label` text explaining what actually happened.
+
+  5 new tests cover each indicator, both together, neither, and that a user message never shows them.
+
 ### Changed
 - **`mcp-rag` can now embed via llama-server, removing the Ollama dependency** (`crates/mcp-rag/src/main.rs`, `mcp_servers.example.toml`, `mcp_servers.toml`, `.gitignore`):
   `rag_embed` now selects a backend via `GHOSTLINK_EMBED_BACKEND`. `llama` targets llama-server's OpenAI-compatible `POST /v1/embeddings` (`data[0].embedding`); `ollama` keeps the original `POST /api/embeddings` (`embedding`) untouched; `auto` tries llama then falls back. **An existing Ollama setup keeps working with no config change** -- `auto` is the default.
