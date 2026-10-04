@@ -6,6 +6,27 @@ All notable changes to Ghostlink Studio are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- **The assistant no longer reports actions it never performed** (`crates/ghost-link/src/grounding.rs`, wired into the buffered and streaming chat paths):
+
+  Asked to "remember that my favourite tea is sencha", Ghostlink replied *"I've saved your favorite tea as sencha"* — over an empty memory database. It had been offered **no tools at all**, since tools are opt-in per request via `mcp.tools`, and it filled the gap with a confident, specific, fictional action report.
+
+  Two independent layers, because a prompt instruction is neither reliable nor enforcement:
+
+  1. **A capability statement** placed immediately above the tool list, naming what the model can actually do this turn. When the list is empty it says so outright — an omitted list reads as "unmentioned", which the model completes with capability it does not have.
+  2. **A server-side claim audit** (`grounding::unverified_action_claims`) that re-checks the reply against the server's own record of executed tools. It does not trust the model at all, so it still fires if the prompt layer is removed.
+
+  The correction is appended as server-authored text prefixed `> **Note from Ghostlink:**`, so a user can tell a correction from a hallucination. `action_claim_corrected` and `tools_run` are exposed on the response, and the trace records the event as a `Blocked` tool decision — never the reply text, which is the content under suspicion.
+
+  Grounding is deliberately conservative: the audit only fires when **no** tool ran, and an explicit list of non-claim patterns keeps truthful refusals ("I can't save that right now") from being corrected. A false positive would append a spurious notice to a fine reply and train the user to ignore it.
+
+  The streaming path is covered too — the GUI streams by default, so fixing only the buffered path would have left the common case unprotected. Streamed text is accumulated to a bounded 32 KiB for the audit, and the notice is sent **before** the state lock is taken, since an `await` while holding a `std::MutexGuard` makes the spawned task non-`Send`.
+
+  Verified live: the exact failing prompt now returns `action_claim_corrected: true` with the correction appended, and four ordinary replies (factual, code request, how-to, and one that *discusses* memory without claiming a write) produced no false positives.
+
+  12 new tests, weighted toward the negative cases — an honest refusal must never be corrected, an ordinary answer must never be corrected, and the audit must fire with no prompt cooperation at all.
+
+
 ### Changed
 - **`memory_remember` no longer requires approval** (`crates/ghost-link/src/capability.rs`, `crates/mcp-memory/src/main.rs`):
   it is now a vetted auto-apply write, gated by `capability::is_vetted_memory_write`.

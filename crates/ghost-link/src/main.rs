@@ -2782,6 +2782,13 @@ fn merge_recall_into_summary(summary: Option<&str>, recall_block: Option<&str>) 
     }
 }
 
+/// Upper bound on reply text retained for the grounding audit.
+///
+/// The audit is a keyword scan, so it does not need the whole reply — but it does
+/// need enough that a claim placed after a long preamble is still caught. 32 KiB
+/// is far past any claim position that matters and bounds the per-stream buffer.
+const GROUNDING_AUDIT_MAX_CHARS: usize = 32 * 1024;
+
 /// Wall-clock budget for proactive recall on the chat hot path.
 const RECALL_TIMEOUT_SECS: u64 = 4;
 
@@ -3247,7 +3254,13 @@ async fn run_native_tool_loop(
     tools: &[mcp::McpToolSchema],
     history: &[(String, String)],
 ) -> NativeLoopStep {
-    let tool_instructions = mcp::toolcall::build_tool_instructions(tools);
+    // The capability statement goes first, immediately above the tool list, so the
+    // model cannot read the tools without also reading what it may claim. When the
+    // list is empty the statement says so outright — an omitted list reads as
+    // "unmentioned", which the model fills in with capability it does not have.
+    let tool_names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+    let mut tool_instructions = grounding::capability_statement(&tool_names, 0);
+    tool_instructions.push_str(&mcp::toolcall::build_tool_instructions(tools));
     native_tool_loop_core(
         native_engine_client,
         mcp_registry,
@@ -10425,6 +10438,10 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                                             let stream_started = Instant::now();
                                             let mut first_token_ms: Option<f32> = None;
                                             let mut accumulated_tokens: u32 = 0;
+                                            // Held so the finalizer can audit the reply
+                                            // (see `grounding`). Bounded so a runaway
+                                            // stream cannot grow this without limit.
+                                            let mut accumulated_text = String::new();
                                             loop {
                                                 let next = if first_token_ms.is_none()
                                                     && first_token_timeout_secs > 0
@@ -10480,6 +10497,10 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                                                         }
                                                         accumulated_tokens =
                                                             accumulated_tokens.saturating_add(1);
+                                                        if accumulated_text.len() < GROUNDING_AUDIT_MAX_CHARS
+                                                        {
+                                                            accumulated_text.push_str(&text);
+                                                        }
                                                         let escaped = serde_json::to_string(&text)
                                                             .unwrap_or_else(|_| {
                                                                 String::from("\"\"")
@@ -10529,6 +10550,39 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                                                 .as_secs_f32()
                                                 * 1000.0)
                                                 .max(0.1);
+                                            // Streamed turns get the same grounding
+                                            // audit as buffered ones -- the GUI streams
+                                            // by default, so skipping this would leave
+                                            // the common path unprotected.
+                                            //
+                                            // Deliberately before the state lock: the
+                                            // `tx.send().await` below would otherwise
+                                            // hold a std MutexGuard across an await and
+                                            // make the whole task non-Send.
+                                            let (_corrected, audit) = grounding::apply_grounding(
+                                                &accumulated_text,
+                                                0,
+                                            );
+                                            if audit.unsupported {
+                                                let escaped = serde_json::to_string(
+                                                    &grounding::correction_notice(0),
+                                                )
+                                                .unwrap_or_else(|_| String::from("\"\""));
+                                                let _ = tx
+                                                    .send(Ok(Event::default().data(
+                                                        format!(
+                                                            r#"{{"token":{escaped},"request_id":"{}","correction":true}}"#,
+                                                            request_id_str
+                                                        ),
+                                                    )))
+                                                    .await;
+                                                tracing::warn!(
+                                                    target: "assistant_trace",
+                                                    session_id = %chat_session_id,
+                                                    "streamed reply claimed an action that never ran; correction appended"
+                                                );
+                                            }
+
                                             let mut backend = lock_state(&state_clone);
                                             if let Some(ttft_ms) = first_token_ms {
                                                 backend.inference_metrics.record_ttft(ttft_ms);
@@ -11040,6 +11094,38 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             (request_seq, session_id, metrics_json)
         };
 
+        // Ground the reply against what actually ran.
+        //
+        // A model with no tools will confidently describe having saved, written or
+        // sent something it never touched — observed live, where it reported a
+        // stored memory over an empty database. The audit is server-side and uses
+        // the server's own record of executed tools, so it holds regardless of what
+        // the prompt said. See `grounding` for why this is not a prompt fix.
+        let tools_run = tool_results.len();
+        let (response_text, claim_audit) = grounding::apply_grounding(&response_text, tools_run);
+        if claim_audit.unsupported {
+            // Field-level, like every other trace event: tool and class names,
+            // counts, latency. Never the reply text, which is the very content
+            // under suspicion.
+            // `execute_tool` is the closest existing shape: a named operation with
+            // a decision. Reusing it keeps the trace vocabulary closed rather than
+            // inventing an event kind for a condition that is, from the audit
+            // trail's perspective, exactly this -- an action that did not execute.
+            let flagged = trace::TraceEvent::execute_tool(
+                "action_claim",
+                chat_workspace.id(),
+                Some("claim"),
+                trace::TraceDecision::Blocked,
+            );
+            tracing::warn!(
+                target: "assistant_trace",
+                workspace = %chat_workspace.id(),
+                tools_run = claim_audit.tools_run,
+                trace = %flagged,
+                "reply claimed an action that never ran; correction appended"
+            );
+        }
+
         // No "Tools used:" text footer here: every engine's tool results are
         // now real (see run_native_tool_loop/run_ollama_chat/run_vllm_chat)
         // and already woven into the model's own final answer, so appending
@@ -11069,6 +11155,10 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             "summarized_history": session_summary.is_some(),
             // Counts only. Lets the GUI and an operator tell "remembered nothing"
             // from "retrieval never ran" without any recalled text leaving here.
+            // True when the model asserted a completed action with no tool
+            // behind it and `response` now carries a server-authored correction.
+            "action_claim_corrected": claim_audit.unsupported,
+            "tools_run": tools_run,
             "recalled_memories": recall_outcome.memory_hits,
             "recalled_documents": recall_outcome.rag_hits,
             "metrics": metrics_json
@@ -14523,6 +14613,7 @@ mod backend_plugin;
 mod backend_registry;
 mod bootstrap;
 mod capability;
+mod grounding;
 mod host_metrics;
 mod inference_engine;
 mod mcp;
