@@ -16,6 +16,7 @@ All notable changes to Ghostlink Studio are documented here.
   | **N memories recalled** | stored memories were injected as context for this turn |
   | **N documents found** | indexed documents `rag.search` contributed |
   | **corrected: claimed an action that didn't run** | the model asserted something no tool backed, and the server appended a correction |
+
   The recall badges show **counts only**. The server never sends the recalled text, so the client cannot display it, store it, or leak it into browser storage — the badge confirms recall happened without duplicating the user's own memories into a second place.
   The correction badge is styled distinctly (rose, not a metadata colour) because it means something different in kind: not "context was trimmed" but "this reply was wrong and the server caught it". Reading a transcript, that is the one you want to notice.
   6 new tests, including singular/plural forms, the zero case rendering nothing, and that none of the three ever appears on a user message.
@@ -148,6 +149,7 @@ All notable changes to Ghostlink Studio are documented here.
   | 12 | 2.21 tok/s | 1.64s | 12.27 GB | 1/1 |
   | 24 | 2.28 tok/s | 1.70s | 12.29 GB | 1/1 |
   | **-1** | **3.88 / 3.91 tok/s** | 2.25s | 12.64 GB | **2/2** |
+
   Two findings from that, both contrary to what the repo previously documented:
   - **Partial offload is not a middle ground here.** `ngl` 12 and 24 land within noise of CPU-only (2.21-2.28 vs 2.28-2.37). Only full offload helps, at **1.65x**.
   - **The OOM was a memory precondition, not a bad setting.** The same `-ngl -1` load succeeded twice at ~22GB free and failed three times at ~11GB free with `vk::Device::allocateMemory: ErrorOutOfDeviceMemory`. So `-ngl -1` is kept as the default and a precondition check warns when free memory is short, naming the requirement, what is available, and `GHOSTLINK_LLAMA_NGL=0` as the escape hatch.
@@ -190,6 +192,7 @@ All notable changes to Ghostlink Studio are documented here.
   | `mcp.tools` absent | server default: every connected slot with at least one `Read` tool |
   | `mcp.tools: []` | explicitly none — honored as sent |
   | `mcp.tools: [...]` | exactly those slots |
+
   The absent/empty distinction is deliberate. A client sending `[]` has decided it wants no tools, and overriding that would be the same class of bug in the opposite direction. A malformed `tools` value is treated as unspecified rather than as "none", so a client bug cannot silently disarm the assistant.
   **Visibility, not permission.** The default widens what the model can *see*, never what it can *do*: `capability::decide` still runs per call, so `memory_remember` routes through vetted auto-apply and `memory_forget` and the Docker gateway tools still require approval.
   A slot qualifies when it offers *any* read. The first implementation excluded slots containing a `Write` entirely, on the reasoning that partial availability is confusing — but that excluded `memory` and `rag`, whose servers each mix reads with writes, leaving the default offering exactly one slot while four servers were connected. "Use the default" then quietly meant "you get almost nothing", which is the silent-disablement this change exists to remove. An `Exec`-only slot still never qualifies.
