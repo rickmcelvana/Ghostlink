@@ -2882,6 +2882,23 @@ fn merge_recall_into_summary(summary: Option<&str>, recall_block: Option<&str>) 
 /// is far past any claim position that matters and bounds the per-stream buffer.
 const GROUNDING_AUDIT_MAX_CHARS: usize = 32 * 1024;
 
+/// A request to start an implementer subagent.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SpawnAgentRequest {
+    /// What the subagent should do. Required: a subagent with no goal would burn
+    /// a budget producing nothing.
+    pub goal: String,
+    /// Project root. Defaults to the server's workspace root.
+    #[serde(default)]
+    pub root_path: Option<String>,
+    /// Existing project to attach to, instead of creating one.
+    #[serde(default)]
+    pub project_id: Option<String>,
+    /// Override the model for this run.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
 /// Wall-clock budget for proactive recall on the chat hot path.
 const RECALL_TIMEOUT_SECS: u64 = 4;
 
@@ -4398,11 +4415,48 @@ async fn run_scheduled_turn(
     );
     set_active_turn_id(&turn_label);
 
-    // No tools are offered to a scheduled turn in this pass: wiring the GUI's
-    // tool-slot selection into a headless run needs a saved per-schedule tool
-    // list, which the brief leaves open. The capability gate still applies to
-    // anything the turn reaches, so this narrows what a schedule can do, never
-    // widens it.
+    // A scheduled turn gets the same read-only tool default as an interactive chat
+    // turn. It previously got none, which meant a schedule could talk but never
+    // check anything -- "check the build every morning" was unrunnable, because
+    // the tools that would read the build output were not offered.
+    //
+    // Read-only by construction, not by policy: `toolselect::default_read_slots`
+    // selects slots with at least one `Read` tool, and `capability::decide` still
+    // runs per call, so anything a schedule reaches is gated exactly as an
+    // interactive turn's would be. A write queues for approval like any other, and
+    // a schedule that only ever reads is what `RunStatus` auto-repeat keys on.
+    let schedule_slots: Vec<(String, Vec<(String, capability::CapabilityClass)>)> = {
+        let mut out: Vec<(String, Vec<(String, capability::CapabilityClass)>)> = Vec::new();
+        for server in mcp_registry.list_all_servers().await.unwrap_or_default() {
+            if !server.connected || server.slot.is_empty() {
+                continue;
+            }
+            let classified = mcp_registry
+                .tool_schemas_for_server(&server.name)
+                .await
+                .into_iter()
+                .map(|t| (t.name.clone(), capability::classify(&server.name, &t.name)))
+                .collect();
+            out.push((server.slot.clone(), classified));
+        }
+        out
+    };
+    let schedule_slot_names = toolselect::default_read_slots(&schedule_slots);
+    let mut schedule_tools: Vec<mcp::McpToolSchema> = Vec::new();
+    for slot in &schedule_slot_names {
+        if let Some(server_name) = mcp_registry.server_for_slot(slot).await {
+            schedule_tools.extend(mcp_registry.tool_schemas_for_server(&server_name).await);
+        }
+    }
+    if !schedule_tools.is_empty() {
+        tracing::debug!(
+            target: "assistant_trace",
+            schedule_id = %schedule.id,
+            slots = %schedule_slot_names.join(","),
+            tools = schedule_tools.len(),
+            "scheduled turn using the read-only tool default"
+        );
+    }
     let step = run_native_tool_loop(
         &native_client,
         &mcp_registry,
@@ -4414,7 +4468,7 @@ async fn run_scheduled_turn(
         0,
         0.0,
         "",
-        &[],
+        &schedule_tools,
         &[],
     )
     .await;
@@ -4973,6 +5027,17 @@ struct GuiChatRequest {
     /// additive, so no current deployment changes behavior.
     #[serde(default)]
     workspace_id: Option<String>,
+    /// Start a detached implementer subagent on this turn instead of answering
+    /// inline, and return its ids.
+    ///
+    /// Opt-in per request rather than a tool the model can call. A subagent writes
+    /// proposed files and runs builds, so making it model-selectable would mean the
+    /// model deciding to spawn work that costs minutes of compute — the approval
+    /// queue would then have to gate every spawn, which is the friction this is
+    /// meant to avoid. The user asks for it; the server starts it; the review gate
+    /// still applies before anything reaches the working tree.
+    #[serde(default)]
+    spawn_agent: Option<SpawnAgentRequest>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -10327,6 +10392,58 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         // Correlates any approval this turn queues. Set before any tool dispatch
         // can happen.
         set_active_turn_id(req.session_id.as_deref().unwrap_or("sess_local_001"));
+
+        // A subagent request replaces the inline answer. Handled first and returned
+        // immediately: there is no point resolving tools, running recall, or
+        // generating a reply for a turn whose real work happens in a detached run.
+        if let Some(spawn) = req.spawn_agent.clone() {
+            if spawn.goal.trim().is_empty() {
+                return Json(serde_json::json!({
+                    "error": "spawn_agent.goal is required",
+                }))
+                .into_response();
+            }
+            let root = spawn
+                .root_path
+                .clone()
+                .unwrap_or_else(|| workspace_root().display().to_string());
+            match crate::task_api::start_implementer(
+                Arc::clone(&state),
+                Some(root.clone()),
+                spawn.project_id.clone(),
+                spawn.goal.clone(),
+                spawn.model.clone(),
+            )
+            .await
+            {
+                Ok((project, task, run)) => {
+                    return Json(serde_json::json!({
+                        "response": format!(
+                            "Started a subagent on: {}\n\nTask {} under project {}. It runs in the background; poll `/api/tasks/{}/events` for progress and `/api/tasks/{}/review` for the proposed diff.",
+                            spawn.goal, task.id, project.id, task.id, task.id
+                        ),
+                        "request_id": format!("req-{}", uuid::Uuid::new_v4()),
+                        "session_id": req.session_id.clone().unwrap_or_else(|| "sess_local_001".to_string()),
+                        "model": lock_state(&state).current_model.clone(),
+                        "inference_backend": "agent",
+                        "spawned": {
+                            "project_id": project.id,
+                            "task_id": task.id,
+                            "run_id": run.id,
+                            "role": run.role,
+                            "status": run.status,
+                        },
+                    }))
+                    .into_response();
+                }
+                Err(e) => {
+                    return Json(serde_json::json!({
+                        "error": format!("could not start subagent: {e}"),
+                    }))
+                    .into_response();
+                }
+            }
+        }
 
         // Legacy chat "tool slot" names the GUI's tool checkboxes send (calculator,
         // file_operations, ...) - resolved against real MCP servers below, then

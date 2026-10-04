@@ -202,6 +202,18 @@ All notable changes to Ghostlink Studio are documented here.
 
 ### Fixed
 
+### Added
+- **A conversation can start a subagent, and a schedule can use tools**:
+  - `spawn_agent` on `POST /api/inference/chat` starts a detached implementer run and returns its project, task and run ids. The turn returns immediately with `inference_backend: "agent"` and no generation, since the real work happens in the background; progress is polled via `/api/tasks/:id/events` and the proposed diff via `/api/tasks/:id/review`.
+
+    Deliberately a request field rather than a model-callable tool. A subagent writes proposed files and runs builds, so letting the model choose to spawn one would mean it deciding to spend minutes of compute — and every spawn would then need approval, which defeats the point. The user asks, the server starts it, and the review gate still applies before anything reaches the working tree. An empty goal is refused rather than run.
+
+    `task_api::start_implementer` was extracted from the existing HTTP handler and both now call it, so a subagent started from a conversation and one started from the REST API cannot drift apart.
+
+  - Scheduled turns now get the same read-only tool default as an interactive chat turn. They previously got none, so a schedule could talk but never check anything — "check the build each morning" was unrunnable, because the tools that would read the output were not offered. Read-only by construction rather than policy: the default selects slots with a `Read` tool, and `capability::decide` still runs per call, so a write queues for approval exactly as it would in a chat.
+
+    Verified live: the log records `scheduled turn using the read-only tool default`, and the schedule fired in 5.0s.
+
 - **Agent self-verification can now actually run** (`crates/ghost-link/src/task_runtime.rs`):
   verification builds the proposed change in a scratch copy of the project, and that copy included everything except `.git`, `target` and `node_modules`. Against this repository the copy was **40 GB** — 38.8 GB of it `models/*.gguf`, plus a vendored `third_party/llama.cpp`.
 

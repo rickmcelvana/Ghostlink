@@ -844,6 +844,93 @@ pub struct StartChatAgentReq {
     pub project_id: Option<String>,
 }
 
+/// Creates (or reuses) a project and task, then starts an implementer run.
+///
+/// Extracted from `handle_start_chat_agent` so the chat path can start a subagent
+/// without going through HTTP. Both entry points must behave identically: a
+/// subagent started from a conversation is the same run as one started from the
+/// REST API, with the same budget, the same capability gate, and the same review
+/// before anything is applied.
+///
+/// Returns `(project, task, run)`. The run is detached -- it is `spawn`ed and
+/// completes in the background, so a caller gets an id immediately and polls
+/// `/api/tasks/:id/events`.
+#[allow(clippy::too_many_arguments)]
+pub async fn start_implementer(
+    state: Arc<std::sync::Mutex<BackendState>>,
+    root_path: Option<String>,
+    project_id: Option<String>,
+    prompt: String,
+    model: Option<String>,
+) -> Result<
+    (
+        crate::task_runtime::Project,
+        crate::task_runtime::Task,
+        crate::task_runtime::AgentRun,
+    ),
+    String,
+> {
+    use crate::task_runtime::{ProjectKind, TaskBudget};
+
+    let (store, current_model) = {
+        let guard = state.lock().unwrap();
+        (Arc::clone(&guard.task_store), guard.current_model.clone())
+    };
+
+    let project = if let Some(proj_id) = project_id {
+        store.get_project(&proj_id).map_err(|e| e.to_string())?
+    } else {
+        let root = root_path.unwrap_or_else(|| ".".to_string());
+        let projects = store.list_projects().unwrap_or_default();
+        match projects.into_iter().find(|p| p.root_path == root) {
+            Some(existing) => existing,
+            None => store
+                .create_project(
+                    "Studio Chat Project".to_string(),
+                    ProjectKind::Code,
+                    root,
+                    None,
+                    model.clone(),
+                )
+                .map_err(|e| e.to_string())?,
+        }
+    };
+
+    let task = store
+        .create_task(
+            &project.id,
+            prompt.clone(),
+            None,
+            Some(TaskBudget::default()),
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+
+    let model = model
+        .or(project.default_model.clone())
+        .unwrap_or(current_model);
+
+    let cancel_token = CancellationToken::new();
+    store.register_cancel_token(task.id.clone(), cancel_token.clone());
+
+    let backend = Arc::new(RealAgentBackend {
+        state: Arc::clone(&state),
+    });
+    let run = crate::task_runtime::TaskRunner::spawn_implementer(
+        store,
+        backend,
+        task.clone(),
+        "implementer".to_string(),
+        model,
+        Some(prompt),
+        cancel_token,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok((project, task, run))
+}
+
 async fn handle_start_chat_agent(
     State(state): State<Arc<std::sync::Mutex<BackendState>>>,
     Json(payload): Json<StartChatAgentReq>,
@@ -855,85 +942,18 @@ async fn handle_start_chat_agent(
         ));
     }
 
-    let (store, current_model) = {
-        let guard = state.lock().unwrap();
-        (Arc::clone(&guard.task_store), guard.current_model.clone())
-    };
-
-    let project = if let Some(proj_id) = payload.project_id {
-        match store.get_project(&proj_id) {
-            Ok(p) => p,
-            Err(e) => {
-                return Err((
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({ "error": e.to_string() })),
-                ))
-            }
-        }
-    } else {
-        let root = payload.root_path.clone().unwrap_or_else(|| ".".to_string());
-        let projects = store.list_projects().unwrap_or_default();
-        if let Some(existing) = projects.into_iter().find(|p| p.root_path == root) {
-            existing
-        } else {
-            match store.create_project(
-                "Studio Chat Project".to_string(),
-                ProjectKind::Code,
-                root,
-                None,
-                payload.model.clone(),
-            ) {
-                Ok(p) => p,
-                Err(e) => {
-                    return Err((
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({ "error": e.to_string() })),
-                    ))
-                }
-            }
-        }
-    };
-
-    let task = match store.create_task(
-        &project.id,
+    // Delegates rather than duplicating, so a subagent started from the REST API
+    // and one started from a conversation cannot drift apart.
+    match start_implementer(
+        state,
+        payload.root_path.clone(),
+        payload.project_id.clone(),
         payload.prompt.clone(),
-        None,
-        Some(TaskBudget::default()),
-        None,
-    ) {
-        Ok(t) => t,
-        Err(e) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            ))
-        }
-    };
-
-    let model = payload
-        .model
-        .or(project.default_model.clone())
-        .unwrap_or(current_model);
-
-    let cancel_token = CancellationToken::new();
-    store.register_cancel_token(task.id.clone(), cancel_token.clone());
-
-    let backend = Arc::new(RealAgentBackend {
-        state: Arc::clone(&state),
-    });
-
-    match crate::task_runtime::TaskRunner::spawn_implementer(
-        store,
-        backend,
-        task.clone(),
-        "implementer".to_string(),
-        model,
-        Some(payload.prompt),
-        cancel_token,
+        payload.model.clone(),
     )
     .await
     {
-        Ok(run) => Ok((
+        Ok((project, task, run)) => Ok((
             StatusCode::OK,
             Json(serde_json::json!({
                 "project": project,
@@ -943,7 +963,7 @@ async fn handle_start_chat_agent(
         )),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() })),
+            Json(serde_json::json!({ "error": e })),
         )),
     }
 }
