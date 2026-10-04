@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"bytes"
-	"crypto/tls"
 	"io"
 	"net"
 	"net/http"
@@ -31,23 +30,7 @@ func NewChatProxy(backendURL string) *ChatProxy {
 	if parseErr == nil && strings.EqualFold(parsedURL.Scheme, "https") {
 		host := parsedURL.Hostname()
 		ip := net.ParseIP(host)
-		isLoopback := strings.EqualFold(host, "localhost") || (ip != nil && ip.IsLoopback())
-		// ghost-link serves TLS whenever settings.enable_tls is set, which
-		// includes loopback: its listener choice is
-		// `enable_tls || !is_loopback_host(host)`, so a loopback backend is HTTPS
-		// too and presents a self-signed cert. Without this the proxy's TLS
-		// handshake fails cert verification and every forwarded request comes
-		// back as "Backend unreachable" (503) -- while /health still reports ok,
-		// because that path does not go through this client.
-		//
-		// Scoped to loopback on purpose. A non-loopback https backend keeps full
-		// verification, so this cannot be used to weaken verification against a
-		// real remote host.
-		if isLoopback {
-			client.Transport = &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // loopback-only self-signed cert
-			}
-		}
+		_ = strings.EqualFold(host, "localhost") || (ip != nil && ip.IsLoopback())
 	}
 	return &ChatProxy{
 		BackendURL: strings.TrimRight(backendURL, "/"),
