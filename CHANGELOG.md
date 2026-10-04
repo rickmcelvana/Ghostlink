@@ -6,6 +6,19 @@ All notable changes to Ghostlink Studio are documented here.
 
 ## [Unreleased]
 
+### Changed
+- **`memory_remember` no longer requires approval** (`crates/ghost-link/src/capability.rs`, `crates/mcp-memory/src/main.rs`):
+  it is now a vetted auto-apply write, gated by `capability::is_vetted_memory_write`.
+
+  It was `CapabilityClass::Write` with no filesystem target, so the path-based auto-apply rule could never match it and every memory write queued for a human decision. Verified live: asked to remember something, the DB stayed at 0 rows. Nothing was ever remembered unless the user answered a prompt per fact, which left both the store and the recall that reads it close to dead weight.
+
+  `memory_forget` is deliberately **not** included. Forgetting is irreversible — there is no un-forget — so a misfired delete should still cost a human decision. The scope, not the prompt, is what makes this safe: `is_scope_stamped` forces the workspace id at dispatch, so an auto-applied write lands in the chat's own workspace and cannot be redirected by the model.
+
+  The tool description also said *"Requires user approval"*, which was actively harmful — the model read that and declined to call the tool at all, even when asked directly. Now describes the tool and states it takes effect immediately.
+
+  7 new tests: remember auto-applies, forget never does, another server's same-named tool is not covered, sibling read tools are not covered, `rag.index_document` stays gated, an Exec tool on the memory server cannot pick up the path, and the exemption is workspace-scoped rather than path-scoped.
+
+
 ### Added
 - **Proactive memory recall** (`crates/ghost-link/src/recall.rs`, wired in `main.rs`):
   on the first turn of a session the server now calls `memory_search` and `rag.search` itself and injects the hits as system context, instead of waiting for the model to decide it should go looking.
