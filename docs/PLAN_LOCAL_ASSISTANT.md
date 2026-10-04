@@ -54,7 +54,7 @@ memory bodies and tool previews — not credentials. API keys stay in
 
 ## Implementation status
 
-Branch: `main` (phases 0-3 and 6 landed; see below)
+Branch: `main` (phases 0-4 and 6 landed; see below)
 (`cargo fmt`, `cargo clippy -D warnings`, `cargo test --workspace` all clean).
 
 | Phase | Status |
@@ -64,7 +64,7 @@ Branch: `main` (phases 0-3 and 6 landed; see below)
 | 2 — Capability boundary | **Done.** `capability.rs`, enforced in `invoke_mcp_tool`, `GET /api/inference/capabilities` |
 | 1 — Memory library | **Done.** `crates/mcp-memory`, SQLite + `rusqlite` (bundled), 4 tools, scope stamped at dispatch |
 | 3 — Approval tray | **Done.** `approvals.rs`, list/decide routes, `ApprovalTray.tsx` (9 tests) |
-| 4 — Bounded loop | Not started |
+| 4 — Bounded loop | **Done.** `agent.rs` three-limit budget + wall-clock backstop; `skills.rs` non-escalating skills |
 | 5 — Scheduler | Not started |
 | 6 — Turn traces | **Done.** `trace.rs`, `GET /api/inference/traces`, redaction enforced by type (no payload field exists) |
 

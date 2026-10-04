@@ -2850,33 +2850,92 @@ async fn native_tool_loop_core(
     history: &[(String, String)],
     mut scratchpad: String,
     mut tool_results: Vec<ToolResult>,
-    mut iterations_left: usize,
+    iterations_left: usize,
 ) -> NativeLoopStep {
     let tool_map: std::collections::HashMap<&str, &mcp::McpToolSchema> =
         tools.iter().map(|t| (t.name.as_str(), t)).collect();
 
-    while iterations_left > 0 {
-        iterations_left -= 1;
+    // Phase 4: the bare `iterations_left` becomes a three-limit budget tracker.
+    // `iterations_left` (resumed turns pass a remainder) still seeds max_steps,
+    // so a paused-and-resumed turn keeps its original step ceiling instead of
+    // silently getting a fresh full budget.
+    let mut budget = agent::BudgetTracker::new(agent::Budget::new(
+        iterations_left.max(1),
+        agent::Budget::default().max_tool_calls,
+        agent::Budget::from_env().max_tokens,
+    ));
+
+    while budget.begin_step() {
         let prompt = format!("{tool_instructions}Question: {user_message}\n{scratchpad}");
 
-        let gen = match native_engine_client
-            .generate(
-                model,
-                &prompt,
-                exec_tokens,
-                temp,
-                top_p,
-                top_k,
-                penalty,
-                native_engine,
-                history,
-                None,
-                None,
-                false,
-                None,
-            )
-            .await
-        {
+        // Wall-clock backstop for the whole turn. The engine layers already have
+        // their own connect and first-token timeouts; this bounds the *composite*
+        // of several steps, which those cannot see.
+        let gen_result = match agent::turn_timeout() {
+            Some(limit) => {
+                match tokio::time::timeout(
+                    limit,
+                    native_engine_client.generate(
+                        model,
+                        &prompt,
+                        exec_tokens,
+                        temp,
+                        top_p,
+                        top_k,
+                        penalty,
+                        native_engine,
+                        history,
+                        None,
+                        None,
+                        false,
+                        None,
+                    ),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        // Names the wall clock rather than reusing a budget
+                        // exhaustion message: the budget may well have room
+                        // left, and saying otherwise would misdirect whoever
+                        // raises the limit.
+                        return NativeLoopStep::Done(NativeToolLoopOutcome {
+                            text: format!(
+                                "\n\n(stopped: turn exceeded GHOSTLINK_AGENT_TURN_TIMEOUT_SECS after {} step(s) and {} tool call(s))",
+                                budget.steps_used(),
+                                budget.tool_calls_used()
+                            ),
+                            real_inference: false,
+                            tokens: None,
+                            tokens_per_sec: None,
+                            latency_ms: None,
+                            tool_results,
+                        });
+                    }
+                }
+            }
+            None => {
+                native_engine_client
+                    .generate(
+                        model,
+                        &prompt,
+                        exec_tokens,
+                        temp,
+                        top_p,
+                        top_k,
+                        penalty,
+                        native_engine,
+                        history,
+                        None,
+                        None,
+                        false,
+                        None,
+                    )
+                    .await
+            }
+        };
+
+        let gen = match gen_result {
             Ok(gen) => gen,
             Err(err) => {
                 return NativeLoopStep::Done(NativeToolLoopOutcome {
@@ -2895,6 +2954,7 @@ async fn native_tool_loop_core(
         let tokens = gen
             .tokens_generated
             .or_else(|| Some((gen.text.split_whitespace().count() as u32).max(1)));
+        budget.charge_tokens(tokens.unwrap_or(0));
 
         let Some(call) = mcp::toolcall::extract_tool_call(&gen.text) else {
             // Plain-text answer with no tool call - the model is done.
@@ -2923,7 +2983,11 @@ async fn native_tool_loop_core(
                     top_p,
                     top_k,
                     penalty,
-                    iterations_left,
+                    iterations_left: budget
+                        .budget()
+                        .max_steps
+                        .saturating_sub(budget.steps_used())
+                        .max(1),
                     tool: call.tool.clone(),
                     server: schema.server.clone(),
                     args: call.args.clone(),
@@ -2950,13 +3014,19 @@ async fn native_tool_loop_core(
         ));
     }
 
-    // MAX_TOOL_ITERATIONS exhausted without a plain-text final answer - surface
-    // whatever the model last said rather than looping forever.
+    // A budget ran out without a plain-text final answer - surface whatever the
+    // model last said rather than looping forever, and name the limit that
+    // actually stopped it (steps vs tool calls vs tokens).
+    let reason = agent::StopReason::classify_end(budget.stop_reason());
+    debug_assert!(
+        reason.is_exhausted(),
+        "reached the loop tail with no stop reason; the budget said it had room"
+    );
     NativeLoopStep::Done(NativeToolLoopOutcome {
         text: format!(
-            "{}\n\n(stopped after {} tool round-trips without a final answer)",
+            "{}\n\n{}",
             scratchpad.trim(),
-            mcp::toolcall::MAX_TOOL_ITERATIONS
+            agent::exhaustion_message(reason, &budget)
         ),
         real_inference: true,
         tokens: None,
@@ -3167,6 +3237,7 @@ fn parse_ollama_tool_call(call: &serde_json::Value) -> (String, serde_json::Valu
 /// silently skipping the gate for later calls in the same batch.
 async fn ollama_process_call_batch(
     mcp_registry: &mcp::McpRegistry,
+    budget: &mut agent::BudgetTracker,
     tools: &[mcp::McpToolSchema],
     calls: Vec<serde_json::Value>,
     messages: &mut Vec<ollama::ChatMessage>,
@@ -3174,6 +3245,19 @@ async fn ollama_process_call_batch(
 ) -> Option<(String, String, serde_json::Value, Vec<serde_json::Value>)> {
     let tool_map: std::collections::HashMap<&str, &mcp::McpToolSchema> =
         tools.iter().map(|t| (t.name.as_str(), t)).collect();
+
+    // Charge the whole batch up front: `charge_tool_calls` is all-or-nothing, so
+    // a batch that would overrun the budget is refused whole rather than having
+    // its tail silently dropped.
+    let batch_len = calls.len();
+    if !budget.charge_tool_calls(batch_len) {
+        return Some((
+            "(tool-call budget exhausted)".to_string(),
+            String::new(),
+            serde_json::Value::Null,
+            Vec::new(),
+        ));
+    }
 
     let mut iter = calls.into_iter();
     while let Some(call) = iter.next() {
@@ -3209,10 +3293,17 @@ async fn ollama_chat_loop_core(
     max_tokens: usize,
     mut messages: Vec<ollama::ChatMessage>,
     mut tool_results: Vec<ToolResult>,
-    mut iterations_left: usize,
+    iterations_left: usize,
 ) -> Result<OllamaLoopStep, String> {
-    while iterations_left > 0 {
-        iterations_left -= 1;
+    // Phase 4: same three-limit budget as the native loop. A resumed turn seeds
+    // max_steps from its remaining iterations so it can't reset its ceiling.
+    let mut budget = agent::BudgetTracker::new(agent::Budget::new(
+        iterations_left.max(1),
+        agent::Budget::default().max_tool_calls,
+        agent::Budget::from_env().max_tokens,
+    ));
+
+    while budget.begin_step() {
         let response = ollama_client
             .chat(
                 model,
@@ -3242,6 +3333,7 @@ async fn ollama_chat_loop_core(
 
         if let Some((tool, server, args, remaining_calls)) = ollama_process_call_batch(
             mcp_registry,
+            &mut budget,
             tools,
             requested_calls,
             &mut messages,
@@ -3365,6 +3457,14 @@ async fn resume_ollama_chat(
         unreachable!("resume_ollama_chat called with a non-Ollama PendingToolCall");
     };
 
+    // A resumed turn gets a fresh tracker seeded from the iteration budget it
+    // was paused with, so it can't exceed the original ceiling.
+    let mut budget = agent::BudgetTracker::new(agent::Budget::new(
+        iterations_left.max(1),
+        agent::Budget::default().max_tool_calls,
+        agent::Budget::from_env().max_tokens,
+    ));
+
     let outcome = if approve {
         invoke_mcp_tool(mcp_registry, &tools, &tool, args).await
     } else {
@@ -3383,6 +3483,7 @@ async fn resume_ollama_chat(
 
     if let Some((next_tool, next_server, next_args, next_remaining)) = ollama_process_call_batch(
         mcp_registry,
+        &mut budget,
         &tools,
         remaining_calls,
         &mut messages,
@@ -3452,6 +3553,7 @@ enum VllmLoopStep {
 /// batch hadn't been reached yet) the moment one needs approval.
 async fn vllm_process_call_batch(
     mcp_registry: &mcp::McpRegistry,
+    budget: &mut agent::BudgetTracker,
     tools: &[mcp::McpToolSchema],
     calls: Vec<vllm::VllmToolCall>,
     messages: &mut Vec<serde_json::Value>,
@@ -3465,6 +3567,17 @@ async fn vllm_process_call_batch(
 )> {
     let tool_map: std::collections::HashMap<&str, &mcp::McpToolSchema> =
         tools.iter().map(|t| (t.name.as_str(), t)).collect();
+
+    // Charged as a whole batch; see `ollama_process_call_batch`.
+    if !budget.charge_tool_calls(calls.len()) {
+        return Some((
+            "(tool-call budget exhausted)".to_string(),
+            String::new(),
+            serde_json::Value::Null,
+            None,
+            Vec::new(),
+        ));
+    }
 
     let mut iter = calls.into_iter();
     while let Some(call) = iter.next() {
@@ -3507,10 +3620,15 @@ async fn vllm_chat_loop_core(
     max_tokens: usize,
     mut messages: Vec<serde_json::Value>,
     mut tool_results: Vec<ToolResult>,
-    mut iterations_left: usize,
+    iterations_left: usize,
 ) -> Result<VllmLoopStep, String> {
-    while iterations_left > 0 {
-        iterations_left -= 1;
+    let mut budget = agent::BudgetTracker::new(agent::Budget::new(
+        iterations_left.max(1),
+        agent::Budget::default().max_tool_calls,
+        agent::Budget::from_env().max_tokens,
+    ));
+
+    while budget.begin_step() {
         let result = vllm_client
             .chat(
                 model,
@@ -3547,6 +3665,7 @@ async fn vllm_chat_loop_core(
 
         if let Some((tool, server, args, call_id, remaining_calls)) = vllm_process_call_batch(
             mcp_registry,
+            &mut budget,
             tools,
             result.tool_calls,
             &mut messages,
@@ -3665,6 +3784,14 @@ async fn resume_vllm_chat(
         unreachable!("resume_vllm_chat called with a non-Vllm PendingToolCall");
     };
 
+    // A resumed turn gets a fresh tracker seeded from the iteration budget it
+    // was paused with, so it can't exceed the original ceiling.
+    let mut budget = agent::BudgetTracker::new(agent::Budget::new(
+        iterations_left.max(1),
+        agent::Budget::default().max_tool_calls,
+        agent::Budget::from_env().max_tokens,
+    ));
+
     let outcome = if approve {
         invoke_mcp_tool(mcp_registry, &tools, &tool, args).await
     } else {
@@ -3684,6 +3811,7 @@ async fn resume_vllm_chat(
     if let Some((next_tool, next_server, next_args, next_call_id, next_remaining)) =
         vllm_process_call_batch(
             mcp_registry,
+            &mut budget,
             &tools,
             remaining_calls,
             &mut messages,
@@ -3833,6 +3961,33 @@ fn use_temp_approvals_path(tag: &str) {
             tag
         )),
     );
+}
+
+/// Skills loaded from `skills_dir()`, read once per process.
+///
+/// A `OnceLock` because a skill library is operator-authored configuration, not
+/// per-request state. Reload requires a restart; adding a hot-reload endpoint
+/// would mean deciding what happens to a turn already mid-skill, which is more
+/// machinery than this phase should take on.
+static ACTIVE_SKILLS: OnceLock<Arc<skills::SkillSet>> = OnceLock::new();
+
+fn active_skills() -> Arc<skills::SkillSet> {
+    ACTIVE_SKILLS
+        .get_or_init(|| {
+            let (set, skipped) = skills::SkillSet::load_from_dir(&skills::skills_dir());
+            if !set.is_empty() {
+                tracing::info!(
+                    "loaded {} skill(s) from {:?}",
+                    set.len(),
+                    skills::skills_dir()
+                );
+            }
+            if skipped > 0 {
+                tracing::warn!("skipped {skipped} malformed skill file(s)");
+            }
+            Arc::new(set)
+        })
+        .clone()
 }
 
 /// The chat turn currently being served, used to correlate queued approvals.
@@ -8400,6 +8555,36 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         }))
     }
 
+    /// Lists loadable skills: names, descriptions, and tool counts.
+    ///
+    /// Never returns the procedure body. A turn calls this to discover what
+    /// exists, then the active skill's instructions are injected only when the
+    /// model actually selects one — the same explicit-retrieval discipline the
+    /// memory catalog uses, so a large skill library doesn't sit in every prompt.
+    ///
+    /// `?skill=<name>` returns that one skill's instructions, which is the
+    /// deliberate exception: the caller asked for this specific procedure.
+    async fn handle_skills(
+        Query(params): Query<HashMap<String, String>>,
+    ) -> Json<serde_json::Value> {
+        let set = active_skills();
+        if let Some(name) = params.get("skill") {
+            return match set.get(name) {
+                Some(skill) => Json(serde_json::json!({
+                    "name": skill.name,
+                    "description": skill.description,
+                    // Instructions are operator-authored procedures, not secrets,
+                    // and the caller explicitly asked for this one.
+                    "instructions": skill.instructions,
+                    "tools": skill.tools,
+                    "workspace_subdir": skill.workspace_subdir,
+                })),
+                None => Json(serde_json::json!({ "error": "no such skill" })),
+            };
+        }
+        Json(serde_json::json!({ "skills": set.catalog() }))
+    }
+
     async fn handle_capabilities(
         State(state): State<Arc<Mutex<BackendState>>>,
     ) -> Json<serde_json::Value> {
@@ -8414,6 +8599,10 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
 
         let ws = active_workspace();
         let mut classified = Vec::new();
+        // `(server, tool)` pairs, kept alongside the JSON so the skill
+        // narrowing below intersects against real names rather than a
+        // re-derivation that could drift from this loop.
+        let mut tool_pairs: Vec<(String, String)> = Vec::new();
         for server in &servers {
             // A server that isn't connected reports no tools; skipping it keeps the
             // response to what is actually reachable right now.
@@ -8422,6 +8611,7 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             }
             for tool in registry.tool_schemas_for_server(&server.name).await {
                 let class = capability::classify_schema(&tool);
+                tool_pairs.push((tool.server.clone(), tool.name.clone()));
                 classified.push(serde_json::json!({
                     "server": tool.server,
                     "tool": tool.name,
@@ -8433,10 +8623,30 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             }
         }
 
+        let set = active_skills();
+        let skill_entries: Vec<serde_json::Value> = set
+            .catalog()
+            .into_iter()
+            .map(|c| {
+                serde_json::json!({
+                    "name": c.name,
+                    "description": c.description,
+                    "tool_count": c.tool_count,
+                    // The narrowing result, so an operator can see what a skill
+                    // actually grants without reading the classification logic.
+                    // A skill listing `write_file` grants nothing: writes stay
+                    // behind the approval gate.
+                    "granted_tools": set.permitted_tools(&c.name, &tool_pairs),
+                    "cannot_widen_boundary": true,
+                })
+            })
+            .collect();
+
         Json(serde_json::json!({
             "workspace_id": ws.id(),
             "workspace_source": ws.source().as_str(),
             "tools": classified,
+            "skills": skill_entries,
         }))
     }
 
@@ -11282,6 +11492,7 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             )
             .route("/api/inference/capabilities", get(handle_capabilities))
             .route("/api/inference/traces", get(handle_traces))
+            .route("/api/inference/skills", get(handle_skills))
             .route("/api/inference/approvals", get(handle_approvals_list))
             .route(
                 "/api/inference/approvals/:id/decide",
@@ -13411,6 +13622,7 @@ fn run_gui_preflight_checks() -> Result<()> {
     Ok(())
 }
 
+mod agent;
 mod approvals;
 mod audit_log;
 mod auth;
@@ -13428,6 +13640,7 @@ mod otel;
 mod rpc_cluster;
 mod runtime;
 mod runtime_switcher;
+mod skills;
 mod tls;
 mod trace;
 mod vllm;
@@ -14654,9 +14867,16 @@ mod tests {
         ];
         let mut messages = Vec::new();
         let mut tool_results = Vec::new();
-        let pending =
-            ollama_process_call_batch(&registry, &tools, calls, &mut messages, &mut tool_results)
-                .await;
+        let mut scratch = agent::BudgetTracker::new(agent::Budget::default());
+        let pending = ollama_process_call_batch(
+            &registry,
+            &mut scratch,
+            &tools,
+            calls,
+            &mut messages,
+            &mut tool_results,
+        )
+        .await;
 
         assert!(pending.is_none());
         assert_eq!(messages.len(), 2);
