@@ -80,6 +80,9 @@ fn build_table() -> ClassTable {
     // --- Read: inspection with no durable side effects ---
     for tool in [
         "read_text_file",
+        // The live server advertises BOTH `read_file` and `read_text_file`;
+        // only the latter was classified, so the alias fell through to Exec.
+        "read_file",
         "read_media_file",
         "read_multiple_files",
         "list_directory",
@@ -136,6 +139,10 @@ fn build_table() -> ClassTable {
         "git_checkout",
         "git_reset",
         "git_push",
+        // Branch creation is a ref write like checkout/push, not a command
+        // execution: it moves no worktree content and runs nothing.
+        "git_create_branch",
+        "git_branch",
     ] {
         t.insert(("git".into(), tool.into()), CapabilityClass::Write);
     }
@@ -179,6 +186,9 @@ fn build_table() -> ClassTable {
         "execute_query",
         "create_table",
         "modify_table",
+        // `append_insight` writes to the server's memory file, so it is a
+        // durable write like the rest.
+        "append_insight",
     ] {
         t.insert(("sqlite".into(), tool.into()), CapabilityClass::Write);
     }
@@ -655,9 +665,23 @@ mod tests {
     /// Falling back to `Exec` is safe, not correct: it blocked `git_diff_unstaged`,
     /// `list_tables`, `describe_table`, `fetch.fetch`, and both brave-search
     /// tools, every one of which is an ordinary observation.
+    /// Every tool a configured MCP server actually exposes must be classified.
+    ///
+    /// Verified against a LIVE server with all seven runnable MCP servers
+    /// connected (calculator, memory, fetch, git, sqlite, filesystem,
+    /// sequential-thinking) -- 39 tools total -- rather than against a table
+    /// transcribed from upstream docs. That pass found seven tools the docs
+    /// didn't mention: `git.git_create_branch`, `git.git_branch`,
+    /// `sqlite.append_insight`, `filesystem.read_file`, and the three git diff
+    /// variants. Each had been silently defaulting to `Exec`, so a branch
+    /// listing or a plain file read demanded an approval.
+    ///
+    /// Keep this in sync by re-running the connected-server check rather than by
+    /// reading upstream documentation: the docs and the served tool list disagree.
     const REAL_TOOLS: &[(&str, &str, CapabilityClass)] = &[
-        // filesystem
+        // filesystem (14 advertised)
         ("filesystem", "read_text_file", CapabilityClass::Read),
+        ("filesystem", "read_file", CapabilityClass::Read),
         ("filesystem", "read_media_file", CapabilityClass::Read),
         ("filesystem", "read_multiple_files", CapabilityClass::Read),
         ("filesystem", "list_directory", CapabilityClass::Read),
@@ -682,25 +706,12 @@ mod tests {
         ("calculator", "calculate", CapabilityClass::Read),
         // fetch -- the tool is named `fetch` on a server named `fetch`
         ("fetch", "fetch", CapabilityClass::Read),
-        // brave-search is a separate server from fetch
-        ("brave-search", "brave_web_search", CapabilityClass::Read),
-        (
-            "brave-search",
-            "brave_web_search_stats",
-            CapabilityClass::Read,
-        ),
-        // sqlite: reads, including schema inspection
-        ("sqlite", "read_query", CapabilityClass::Read),
-        ("sqlite", "list_tables", CapabilityClass::Read),
-        ("sqlite", "describe_table", CapabilityClass::Read),
-        ("sqlite", "write_query", CapabilityClass::Write),
-        ("sqlite", "create_table", CapabilityClass::Write),
-        // git
+        // git (12 advertised)
         ("git", "git_status", CapabilityClass::Read),
+        ("git", "git_log", CapabilityClass::Read),
         ("git", "git_diff", CapabilityClass::Read),
         ("git", "git_diff_unstaged", CapabilityClass::Read),
         ("git", "git_diff_staged", CapabilityClass::Read),
-        ("git", "git_log", CapabilityClass::Read),
         ("git", "git_show", CapabilityClass::Read),
         ("git", "git_blame", CapabilityClass::Read),
         ("git", "git_add", CapabilityClass::Write),
@@ -708,6 +719,15 @@ mod tests {
         ("git", "git_checkout", CapabilityClass::Write),
         ("git", "git_reset", CapabilityClass::Write),
         ("git", "git_push", CapabilityClass::Write),
+        ("git", "git_create_branch", CapabilityClass::Write),
+        ("git", "git_branch", CapabilityClass::Write),
+        // sqlite (6 advertised)
+        ("sqlite", "read_query", CapabilityClass::Read),
+        ("sqlite", "list_tables", CapabilityClass::Read),
+        ("sqlite", "describe_table", CapabilityClass::Read),
+        ("sqlite", "write_query", CapabilityClass::Write),
+        ("sqlite", "create_table", CapabilityClass::Write),
+        ("sqlite", "append_insight", CapabilityClass::Write),
         // rag (Ghostlink crate)
         ("rag", "search", CapabilityClass::Read),
         ("rag", "index_document", CapabilityClass::Write),
@@ -724,6 +744,13 @@ mod tests {
         ("memory", "memory_search", CapabilityClass::Read),
         ("memory", "memory_remember", CapabilityClass::Write),
         ("memory", "memory_forget", CapabilityClass::Write),
+        // brave-search is disabled by default but classified for completeness
+        ("brave-search", "brave_web_search", CapabilityClass::Read),
+        (
+            "brave-search",
+            "brave_web_search_stats",
+            CapabilityClass::Read,
+        ),
     ];
 
     #[test]
@@ -745,7 +772,7 @@ mod tests {
     }
 
     #[test]
-    fn no_ordinary_read_is_left_to_the_exec_default() {
+    fn no_ordinary_operation_is_left_to_the_exec_default() {
         // The specific regression: these all silently became Exec.
         for (server, tool) in [
             ("git", "git_diff_unstaged"),
@@ -754,12 +781,20 @@ mod tests {
             ("sqlite", "describe_table"),
             ("fetch", "fetch"),
             ("brave-search", "brave_web_search"),
+            // Found only by connecting the servers, not from docs:
+            ("filesystem", "read_file"),
         ] {
             assert_ne!(
                 classify(server, tool),
                 CapabilityClass::Exec,
-                "{server}.{tool} fell through to Exec and would demand approval for a read"
+                "{server}.{tool} fell through to Exec and would demand approval"
             );
         }
+        // Branch ops are writes, not reads -- but they must not be Exec either:
+        // creating a branch runs no command and moves no worktree content.
+        for tool in ["git_create_branch", "git_branch"] {
+            assert_eq!(classify("git", tool), CapabilityClass::Write);
+        }
+        assert_eq!(classify("sqlite", "append_insight"), CapabilityClass::Write);
     }
 }

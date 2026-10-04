@@ -7,6 +7,15 @@ All notable changes to Ghostlink Studio are documented here.
 ## [Unreleased]
 
 ### Fixed
+- **Windows: the three `uvx`-backed MCP servers could not start at all** (`mcp_servers.example.toml`, `mcp_servers.toml`):
+  `mcp.os.win32.utilities` imports `pywintypes`, which `uvx`'s ephemeral environment does not include, so `fetch`, `git`, and `sqlite` died at import with `ModuleNotFoundError: No module named 'pywintypes'`. Adding `--with pywin32` to each fixes it; verified by MCP handshake, not by assuming.
+  `mcp-server-sqlite` additionally needs an explicit `mcp` pin. Unpinned it resolves against a newer `mcp` whose decorator API dropped `Server.list_resources` and it dies at import; `mcp==1.9.4` works, as do 1.10.1/1.12.0/1.13.0. The existing `mcp==1.9.4` pins on `fetch` and `git` were already correct for a different reason and are kept.
+
+- **Four more tools were defaulting to `Exec`, found by connecting the servers** (`crates/ghost-link/src/capability.rs`):
+  auditing upstream documentation was not enough. Connecting all seven runnable MCP servers exposed **39 tools**, and four were unclassified: `git.git_create_branch`, `git.git_branch`, `sqlite.append_insight`, and `filesystem.read_file` (an alias of `read_text_file` the docs don't mention). Listing branches or reading a file demanded an approval.
+  Branch creation and `append_insight` are classified `Write`, not `Read`: they move refs and append to a durable file respectively. `REAL_TOOLS` is now the live-observed tool set rather than a transcription, and the module comment says to re-derive it by connecting servers rather than by reading docs -- because the docs and the served tool list disagree.
+  Verified live after the fix: 7/7 servers connected, 39/39 tools classified, **24 read / 15 write / 0 spurious exec**.
+
 - **Six ordinary read tools were falling through to the `Exec` default** (`crates/ghost-link/src/capability.rs`):
   auditing the classification table against the *actual* tool set of every server in `mcp_servers.example.toml` found `git_diff_unstaged`, `git_diff_staged`, `sqlite.list_tables`, `sqlite.describe_table`, `fetch.fetch`, and both `brave-search` tools were unclassified and so defaulted to `Exec`.
   Failing closed is safe -- no read was wrongly permitted -- but it is not correct: each of these demanded a human approval just to look at a diff, list tables, or fetch a URL. That is exactly the routine false gate that trains people to click Approve without reading, which is the habit the approval tray depends on.

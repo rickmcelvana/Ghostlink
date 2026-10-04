@@ -51,7 +51,7 @@ command = "uvx"
 # built against and fail to import. Pin a known-compatible version with `==`,
 # not `<`/`>` — this command runs via `cmd /C` on Windows (see client.rs
 # build_command) and cmd.exe reads a bare `<` as stdin redirection.
-args = ["--with", "mcp==1.9.4", "mcp-server-fetch"]
+args = ["--with", "mcp==1.9.4", "--with", "pywin32", "mcp-server-fetch"]
 requires_confirmation = false
 timeout_secs = 30
 
@@ -74,8 +74,16 @@ name = "sqlite"
 slot = "database_query"
 enabled = true
 transport = "stdio"
+# mcp==1.9.4 is required: unpinned, mcp-server-sqlite resolves against a newer
+# `mcp` whose decorator API dropped `Server.list_resources`, and it dies at import.
+# pywin32 is required on Windows: `mcp.os.win32.utilities` imports `pywintypes`,
+# which is not present in uvx's ephemeral environment by default.
 command = "uvx"
 args = [
+    "--with",
+    "mcp==1.9.4",
+    "--with",
+    "pywin32",
     "mcp-server-sqlite",
     "--db-path",
     "./mcp_workspace/ghostlink.db",
@@ -221,7 +229,15 @@ slot = "git_tools"
 enabled = true
 transport = "stdio"
 command = "uvx"
-args = ["--with", "mcp==1.9.4", "mcp-server-git", "--repository", "."]
+args = [
+    "--with",
+    "mcp==1.9.4",
+    "--with",
+    "pywin32",
+    "mcp-server-git",
+    "--repository",
+    ".",
+]
 requires_confirmation = false
 timeout_secs = 30
 
