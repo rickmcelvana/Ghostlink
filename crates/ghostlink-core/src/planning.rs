@@ -112,9 +112,7 @@ impl PlacementPlan {
             // OPTIMIZATION: Fast O(1) check against the last added node ID before fallback
             // O(N) search. In sequential/chunked placement, contiguous assignments share the
             // same node ID, bypassing linear searches and string comparisons for 90%+ of assignments.
-            if participating_nodes
-                .last()
-                .map_or(true, |last| last != &a.node_id)
+            if participating_nodes.last() != Some(&a.node_id)
                 && !participating_nodes.contains(&a.node_id)
             {
                 participating_nodes.push(a.node_id.clone());
