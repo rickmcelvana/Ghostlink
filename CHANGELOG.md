@@ -22,6 +22,20 @@ All notable changes to Ghostlink Studio are documented here.
 
   Also checked before bumping: `setup-node` v5+ auto-enables npm caching when `packageManager` or `devEngines.packageManager` is set, which would change caching behavior. No `package.json` in this repo sets either field, so the bump is inert beyond the runtime version.
 
+### Added
+- **One-time bootstrap code so the GUI can authenticate without the raw API key** (`crates/ghost-link/src/bootstrap.rs`, `crates/ghost-link/src/main.rs`):
+  the GUI holds credentials in memory only (`api.ts` keeps `apiKey` out of `localStorage` deliberately), so a freshly loaded page has none and every request 401s until an operator pastes the Admin key into SecurityTab. The symptom was a bare `Failed to load agent task execution (401)`.
+
+  The obvious fix -- an endpoint returning `api_key.txt` -- is the wrong shape: it makes a permanent, full-privilege credential retrievable over HTTP, and ghost-link's TLS is self-signed, so a client that cannot pin the cert cannot verify the channel either.
+
+  Instead the server prints a single-use bootstrap code at startup, and `POST /api/security/bootstrap` trades it for a **short-lived JWT** through the existing `auth::issue_jwt` path. `auth::authenticate` already accepts a JWT as a bearer token, honours it only while its subject key still exists, and reads role fresh from the live record.
+
+  The code is single-use (consumed on redemption, whatever the outcome), expires after `GHOSTLINK_BOOTSTRAP_TTL_SECS` (default 300), is 128 bits from the OS CSPRNG via `rand::rngs::OsRng`, and is **refused from anything but loopback**. `X-Forwarded-For` is honoured only when the immediate peer is itself loopback, so a remote caller cannot spoof loopback to get past that check.
+
+  `/api/security/bootstrap` is unauthenticated by necessity, not oversight -- the caller has no credential yet, which is why it is calling. It is constrained by the properties above and returns a JWT, never key material. Audited on both success and failure like any other auth event.
+
+  9 tests cover single-use, expiry, loopback refusal, `X-Forwarded-For` spoofing from a remote peer, IPv6 loopback, and rejection of empty/garbage/oversized input.
+
 ### Fixed
 - **Review pane no longer drops the verification verdict, and its note field works** (`ghostlink_gui_modern/src/components/ReviewPane.tsx`, `ghostlink_gui_modern/src/api.ts`):
   the backend's `ReviewPacket` carries `verification: Vec<VerificationResult>` and `checks`, but `api.ts` never declared either and `ReviewPane` rendered neither. A reviewer saw only `risks: ["Verification produced no results — change is UNVERIFIED"]` next to an empty diff pane -- so the one piece of information that determines whether a change was tested was invisible, and an untested change looked the same as a verified one.
