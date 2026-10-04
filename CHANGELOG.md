@@ -6,64 +6,8 @@ All notable changes to Ghostlink Studio are documented here.
 
 ## [Unreleased]
 
-### Changed
-- **A chat request that names no tools now gets the server's read-only default** (`crates/ghost-link/src/toolselect.rs`):
-  `req.mcp.tools` was the only source of enabled tool slots and defaulted to empty, so any client that omitted it received an assistant with **no tools at all** — silently, and with nothing in the response to indicate it. Scheduled turns and non-GUI clients hit this permanently; the GUI happens to send its checkbox list, which is why it went unnoticed.
-
-  Now:
-
-  | request | meaning |
-  |---|---|
-  | `mcp.tools` absent | server default: every connected slot with at least one `Read` tool |
-  | `mcp.tools: []` | explicitly none — honored as sent |
-  | `mcp.tools: [...]` | exactly those slots |
-
-  The absent/empty distinction is deliberate. A client sending `[]` has decided it wants no tools, and overriding that would be the same class of bug in the opposite direction. A malformed `tools` value is treated as unspecified rather than as "none", so a client bug cannot silently disarm the assistant.
-
-  **Visibility, not permission.** The default widens what the model can *see*, never what it can *do*: `capability::decide` still runs per call, so `memory_remember` routes through vetted auto-apply and `memory_forget` and the Docker gateway tools still require approval.
-
-  A slot qualifies when it offers *any* read. The first implementation excluded slots containing a `Write` entirely, on the reasoning that partial availability is confusing — but that excluded `memory` and `rag`, whose servers each mix reads with writes, leaving the default offering exactly one slot while four servers were connected. "Use the default" then quietly meant "you get almost nothing", which is the silent-disablement this change exists to remove. An `Exec`-only slot still never qualifies.
-
-  Measured live on this machine: default went from 1 slot / 1 tool to **4 slots / 21 tools**, and a request with no `mcp.tools` had the model call `rag.search` and `memory_search` on its own — impossible before.
-
-  11 new tests, including that `memory_forget` and `docker-mcp-gateway/mcp-exec` still require approval under the default, and that the default derives from the live `classify` rather than a hand-maintained list.
-
-
-### Fixed
-- **The assistant no longer reports actions it never performed** (`crates/ghost-link/src/grounding.rs`, wired into the buffered and streaming chat paths):
-
-  Asked to "remember that my favourite tea is sencha", Ghostlink replied *"I've saved your favorite tea as sencha"* — over an empty memory database. It had been offered **no tools at all**, since tools are opt-in per request via `mcp.tools`, and it filled the gap with a confident, specific, fictional action report.
-
-  Two independent layers, because a prompt instruction is neither reliable nor enforcement:
-
-  1. **A capability statement** placed immediately above the tool list, naming what the model can actually do this turn. When the list is empty it says so outright — an omitted list reads as "unmentioned", which the model completes with capability it does not have.
-  2. **A server-side claim audit** (`grounding::unverified_action_claims`) that re-checks the reply against the server's own record of executed tools. It does not trust the model at all, so it still fires if the prompt layer is removed.
-
-  The correction is appended as server-authored text prefixed `> **Note from Ghostlink:**`, so a user can tell a correction from a hallucination. `action_claim_corrected` and `tools_run` are exposed on the response, and the trace records the event as a `Blocked` tool decision — never the reply text, which is the content under suspicion.
-
-  Grounding is deliberately conservative: the audit only fires when **no** tool ran, and an explicit list of non-claim patterns keeps truthful refusals ("I can't save that right now") from being corrected. A false positive would append a spurious notice to a fine reply and train the user to ignore it.
-
-  The streaming path is covered too — the GUI streams by default, so fixing only the buffered path would have left the common case unprotected. Streamed text is accumulated to a bounded 32 KiB for the audit, and the notice is sent **before** the state lock is taken, since an `await` while holding a `std::MutexGuard` makes the spawned task non-`Send`.
-
-  Verified live: the exact failing prompt now returns `action_claim_corrected: true` with the correction appended, and four ordinary replies (factual, code request, how-to, and one that *discusses* memory without claiming a write) produced no false positives.
-
-  12 new tests, weighted toward the negative cases — an honest refusal must never be corrected, an ordinary answer must never be corrected, and the audit must fire with no prompt cooperation at all.
-
-
-### Changed
-- **`memory_remember` no longer requires approval** (`crates/ghost-link/src/capability.rs`, `crates/mcp-memory/src/main.rs`):
-  it is now a vetted auto-apply write, gated by `capability::is_vetted_memory_write`.
-
-  It was `CapabilityClass::Write` with no filesystem target, so the path-based auto-apply rule could never match it and every memory write queued for a human decision. Verified live: asked to remember something, the DB stayed at 0 rows. Nothing was ever remembered unless the user answered a prompt per fact, which left both the store and the recall that reads it close to dead weight.
-
-  `memory_forget` is deliberately **not** included. Forgetting is irreversible — there is no un-forget — so a misfired delete should still cost a human decision. The scope, not the prompt, is what makes this safe: `is_scope_stamped` forces the workspace id at dispatch, so an auto-applied write lands in the chat's own workspace and cannot be redirected by the model.
-
-  The tool description also said *"Requires user approval"*, which was actively harmful — the model read that and declined to call the tool at all, even when asked directly. Now describes the tool and states it takes effect immediately.
-
-  7 new tests: remember auto-applies, forget never does, another server's same-named tool is not covered, sibling read tools are not covered, `rag.index_document` stays gated, an Exec tool on the memory server cannot pick up the path, and the exemption is workspace-scoped rather than path-scoped.
-
-
 ### Added
+
 - **Proactive memory recall** (`crates/ghost-link/src/recall.rs`, wired in `main.rs`):
   on the first turn of a session the server now calls `memory_search` and `rag.search` itself and injects the hits as system context, instead of waiting for the model to decide it should go looking.
 
@@ -81,24 +25,6 @@ All notable changes to Ghostlink Studio are documented here.
 
   18 new tests cover both MCP envelope shapes, bare arrays, wrapped objects, unparseable payloads, the token cap, per-item truncation, top-k bounding, and that a blank summary no longer injects an empty system message (a real bug the merge tests caught).
 
-
-### Changed
-- **`mcp-rag` can now embed via llama-server, removing the Ollama dependency** (`crates/mcp-rag/src/main.rs`, `mcp_servers.example.toml`, `mcp_servers.toml`, `.gitignore`):
-  `rag_embed` now selects a backend via `GHOSTLINK_EMBED_BACKEND`. `llama` targets llama-server's OpenAI-compatible `POST /v1/embeddings` (`data[0].embedding`); `ollama` keeps the original `POST /api/embeddings` (`embedding`) untouched; `auto` tries llama then falls back. **An existing Ollama setup keeps working with no config change** -- `auto` is the default.
-  Verified live with Ollama pointed at a dead port: indexed and searched in 0.0s, 768-dim vectors from `nomic-embed-text-v1.5.Q4_K_M` (84MB), with real semantic separation (cosine 0.918 for a paraphrase vs 0.407 across unrelated topics).
-  Requires a **second** llama-server on its own port -- an embedding model and a chat model cannot share one instance:
-  `llama-server -m models/nomic-embed-text-v1.5.Q4_K_M.gguf --embedding --pooling mean --host 127.0.0.1 --port 8081`
-  Vectors are only comparable within a model, so switching backend requires re-indexing; the config comment says so.
-
-### Changed
-- **Bumped the last `actions/setup-node@v4` pin to `@v7`** (`.github/workflows/ci.yml`):
-  GitHub removed the Node 20 runtime from Actions runners on 23 September 2026; JavaScript actions now run on Node 24. The `v4` tag still declares `runs.using: node20` (`v5` onward declare `node24`), and runners have been rewriting `node20` to `node24` since 16 June -- so this was never broken, just the one inconsistent pin in the repo. Every other workflow already used `@v7`.
-
-  Note this is the **action runtime**, not the build Node: `node-version: 20` selects the Node that runs `npm ci` / `vitest` / `tsc` and is unaffected by the runner change. Verified no `ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION` opt-out is referenced anywhere, since that escape hatch stopped working on 23 September.
-
-  Also checked before bumping: `setup-node` v5+ auto-enables npm caching when `packageManager` or `devEngines.packageManager` is set, which would change caching behavior. No `package.json` in this repo sets either field, so the bump is inert beyond the runtime version.
-
-### Added
 - **One-time bootstrap code so the GUI can authenticate without the raw API key** (`crates/ghost-link/src/bootstrap.rs`, `crates/ghost-link/src/main.rs`):
   the GUI holds credentials in memory only (`api.ts` keeps `apiKey` out of `localStorage` deliberately), so a freshly loaded page has none and every request 401s until an operator pastes the Admin key into SecurityTab. The symptom was a bare `Failed to load agent task execution (401)`.
 
@@ -112,7 +38,6 @@ All notable changes to Ghostlink Studio are documented here.
 
   9 tests cover single-use, expiry, loopback refusal, `X-Forwarded-For` spoofing from a remote peer, IPv6 loopback, and rejection of empty/garbage/oversized input.
 
-### Added
 - **The chat now shows when context was dropped or condensed** (`ghostlink_gui_modern/src/components/ChatTab.tsx`, `ghostlink_gui_modern/src/store.ts`):
   two indicators above an assistant reply, kept deliberately distinct:
   - **earlier turns dropped** (amber) — the server trimmed older turns from *this* reply's context to fit the token limit.
@@ -124,108 +49,6 @@ All notable changes to Ghostlink Studio are documented here.
 
   5 new tests cover each indicator, both together, neither, and that a user message never shows them.
 
-### Fixed
-- **Conversation summaries now survive a restart** (`crates/ghost-link/src/main.rs`, `.gitignore`):
-  `BackendState::session_summaries` was in-memory only, so a long session that had been trimmed lost its condensed memory on restart and the next turn re-read from scratch — the summarization work was effectively undone by a crash or a redeploy.
-
-  Summaries are now written to `session_summaries.json` (`GHOSTLINK_SESSION_SUMMARIES_PATH`) after each successful trim and loaded at startup. The on-disk shape is a separate `PersistedSessionSummary`, because the in-memory struct carries an `Instant` for LRU eviction that cannot be serialized and means nothing across a restart; wall-clock time is tracked separately for durable ordering.
-
-  Failure paths degrade rather than break: an unreadable or corrupt store loads as "no summaries", which is exactly the pre-existing cold-start behavior, instead of failing boot. Text over `SUMMARY_MAX_CHARS` is trimmed on load too, so a store written by a build with a larger cap cannot reintroduce an oversized summary.
-
-  Verified: a live restart returns `summarized_history: true` for `sess_local_001` purely from the restored file, and 6 new tests cover the round-trip, accumulation across restarts, corrupt/missing stores, oversized rows, and the cap.
-
-  One bug caught by those tests and fixed here: the loader sorted ascending and truncated, which kept the **oldest** rows and silently discarded the most recent work — the opposite of what the cap is for. It now drops the excess oldest and keeps the newest.
-
-### Fixed
-- **Bootstrap-code tests no longer fail intermittently in parallel** (`crates/ghost-link/src/bootstrap.rs`):
-  the code store is process-global — one `OnceLock<Mutex<HashMap<..>>>`, which is correct for the server since exactly one code is live per process. Under `cargo test`, though, tests share that store on parallel threads and `issue_code()` *clears* it before inserting, so one test issuing a code could wipe another's mid-assertion.
-
-  Caught on CI, not locally: `redemption_is_single_use` and `refused_from_non_loopback` failed in `Production Gate` while passing on this machine, because the two machines have different core counts and therefore different thread scheduling. The tests now hold a serialising guard. Verified with 25 consecutive runs at `--test-threads 16`.
-
-### Fixed
-- **Model loads now warn before a GPU-offload OOM instead of dying inside Vulkan** (`crates/ghost-link/src/native_engine.rs`):
-  full offload allocates a *second* copy of the weights in device memory alongside the host copy, so a model that loads comfortably at `-ngl 0` can fail at `-ngl -1` purely because something else on the machine grew.
-
-  Measured on this machine with Qwen3.8-27B-UD-IQ3_S (12.04GB), 16 threads, 3 runs per configuration:
-
-  | ngl | decode | TTFT | resident | loaded |
-  |---|---|---|---|---|
-  | 0 | 2.28 / 2.37 tok/s | 1.46s | 12.24 GB | 2/2 |
-  | 12 | 2.21 tok/s | 1.64s | 12.27 GB | 1/1 |
-  | 24 | 2.28 tok/s | 1.70s | 12.29 GB | 1/1 |
-  | **-1** | **3.88 / 3.91 tok/s** | 2.25s | 12.64 GB | **2/2** |
-
-  Two findings from that, both contrary to what the repo previously documented:
-  - **Partial offload is not a middle ground here.** `ngl` 12 and 24 land within noise of CPU-only (2.21-2.28 vs 2.28-2.37). Only full offload helps, at **1.65x**.
-  - **The OOM was a memory precondition, not a bad setting.** The same `-ngl -1` load succeeded twice at ~22GB free and failed three times at ~11GB free with `vk::Device::allocateMemory: ErrorOutOfDeviceMemory`. So `-ngl -1` is kept as the default and a precondition check warns when free memory is short, naming the requirement, what is available, and `GHOSTLINK_LLAMA_NGL=0` as the escape hatch.
-
-  The check warns rather than refuses: the estimate is conservative and refusing to load a model that would in fact fit would be worse. CPU-only loads are exempt, since there is no duplicate allocation.
-
-  Also corrects a memory figure in `launch-native.ps1`: CPU-only `ngl 0` shows **12.24 GB resident**, not the ~0.5 GB previously claimed, because resident memory includes the mmap'd model file at every `ngl`. Offload saves the duplicate device copy, not the whole model.
-
-### Fixed
-- **Review pane no longer drops the verification verdict, and its note field works** (`ghostlink_gui_modern/src/components/ReviewPane.tsx`, `ghostlink_gui_modern/src/api.ts`):
-  the backend's `ReviewPacket` carries `verification: Vec<VerificationResult>` and `checks`, but `api.ts` never declared either and `ReviewPane` rendered neither. A reviewer saw only `risks: ["Verification produced no results — change is UNVERIFIED"]` next to an empty diff pane -- so the one piece of information that determines whether a change was tested was invisible, and an untested change looked the same as a verified one.
-
-  The pane now renders a tri-state verdict banner in the header, matching the backend's `verification_passed() -> Option<bool>`, which deliberately returns `None` when nothing ran: **passed**, **failed**, or **NOT run — UNVERIFIED**. Each verification command shows pass / exit code / timeout plus the captured excerpt on failure, since the backend truncates output specifically so a reviewer can see *why* something failed. `checks` is now rendered too.
-
-  Also fixed a typo that made the "Request Changes" note field unreachable: the setter was declared `setShowNoteNoteInput` (doubled `Note`) while the button called `setShowNoteInput`, so clicking it threw instead of opening the input.
-
-  `ReviewPacket` was also not exported from `api.ts` despite being imported by `ChatTab`, `ReviewPane` and `TaskView`; it now is.
-
-- Empty-diff state explains itself ("this run produced no diffs to review... check the verification panel") instead of showing a bare blank pane.
-
-### Fixed
-- **`launch-native.ps1` pins `GHOSTLINK_TLS_CERT_PATH`, without which the control-plane 503s every proxied request** (`launch-native.ps1`):
-  the control-plane starts with its working directory set to `control-plane/`, but ghost-link writes `tls_cert.pem` to the repo root. So the proxy's pinned cert pool looked in the wrong place, fell back to system roots, failed verification against the self-signed cert, and returned `Backend unreachable` for every proxied request while `/health` kept reporting ok.
-
-  This is the same cwd hazard the launcher already documents for `api_key.txt`, and it now gets the same explicit path. Verified both ways from `control-plane/` as cwd: without the variable `/api/metrics` returns 503, with it 200.
-
-  Worth noting how it slipped through: the proxy's own tests and the live check both passed, because both ran the control-plane from the repo root. Only reading the launcher's actual `-WorkingDirectory` argument exposed it.
-
-### Changed
-- **Control-plane no longer 503s every proxied request when ghost-link is on HTTPS** (`control-plane/pkg/proxy/proxy.go`):
-  `NewChatProxy` computed the loopback check and threw it away (`_ = ...`), so an `https` backend URL got a default `http.Client` with full certificate verification. ghost-link serves TLS whenever `settings.enable_tls` is set, which includes loopback (`use_tls = enable_tls || !is_loopback_host(host)`), and presents a self-signed cert -- so the handshake failed and `forward()` answered `Backend unreachable` (503) for everything it proxied.
-  `/health` kept reporting `status: ok` the whole time, because that handler echoes the configured backend URL without ever using the proxy client. The gateway looked healthy while every real API call failed.
-  Loopback `https` backends now get an `InsecureSkipVerify` transport. Scoped to loopback deliberately: a non-loopback `https` backend keeps full verification, and a plaintext `http` backend is untouched. Covered by `control-plane/pkg/proxy/proxy_tls_test.go` -- 4 tests, including a direct regression test asserting a reachable loopback TLS backend does not produce 503.
-- **Streaming chat turns now record a trace event** (`crates/ghost-link/src/main.rs`):
-  `handle_gui_chat`'s three SSE arms each `return Sse::new(...)` before reaching the shared `record_trace` call, so the GUI's default streaming path recorded **no** turn trace at all. Only the non-streaming fallback and the OpenAI-compat server were traced. Added the trace to the Ollama and native stream finalizers, where the TTFT/tokens-per-second metrics were already being recorded -- so the trace carries the same real token count and latency rather than a second, separately-derived number.
-  The third SSE path (replaying a completed `response_text`) already flows through the shared call and needed no change.
-  Found by end-to-end test, not inspection: a live streaming chat left `/api/inference/traces` empty. Verified after the fix -- `{"kind":"chat","latency_ms":1328,"output_tokens":23}`.
-- **RAG workspace indexing no longer requires Ollama** (`crates/ghost-link/src/main.rs`):
-  the `/api/workspace/index` pre-flight probe hard-coded an Ollama health check, so a llama-only machine was answered `Ollama isn't reachable ... status: skipped` while its actual embedding backend was running fine. The probe now mirrors `mcp-rag`'s backend selection: an explicit backend probes only that one, and `auto` requires only that *either* answers.
-  This was found by the live test above, not by inspection -- the first version of the change looked correct and still returned the Ollama error.
-- Prebuilt llama.cpp binaries (`tools/llama.cpp/`) and locally-fetched GGUF weights (`models/nomic-embed-text*.gguf`) are gitignored. Neither belongs in the repo.
-
-### Changed
-- **Replaced `brave-search` with a local, keyless web search** (`mcp_servers.example.toml`, `crates/ghost-link/src/capability.rs`):
-  `brave-search` required `BRAVE_API_KEY` and a paid account, which sat awkwardly against this project's all-local constraint. It is replaced by `duckduckgo-mcp-server` (`npx -y duckduckgo-mcp-server`), verified live: it handshakes, advertises a single tool `duckduckgo_web_search`, and returns real results with no API key.
-  **Stated plainly because it matters operationally:** DuckDuckGo's free HTML endpoint rate-limits aggressively and answers `DDG detected an anomaly in the request, you are likely making requests too quickly` under load. That was observed directly during verification. It suits occasional lookups and is not a high-throughput search backend. A self-hosted SearXNG instance is the sturdier option if that becomes a problem -- it needs a container but no account.
-  Two other candidates were evaluated and rejected on evidence rather than reputation: `free-search-mcp` fails at import (its `selectolax` Modest backend was deprecated at 1.0 and now raises), and `one-search-mcp` requires a `.env` file plus a Chromium install before it will start.
-  Classified `Read`: it queries the public web and writes nothing local.
-
-- **Docker MCP Toolkit gateway connected and classified from its live tool set** (`mcp_servers.toml`, `mcp_servers.example.toml`, `crates/ghost-link/src/capability.rs`):
-  `docker mcp gateway run` (Docker 29.8.1) serves 8 tools, all now classified `Exec`: `mcp-exec`, `code-mode`, `mcp-add`, `mcp-remove`, `mcp-config-set`, `mcp-create-profile`, `mcp-activate-profile`, `mcp-find`. `mcp-exec` and `code-mode` run commands outright; the config-mutating ones decide what the gateway is able to run; `mcp-find` is included as Exec rather than Read because it queries the catalog of servers the gateway can activate.
-  The gateway's *dynamically* activated tools (containers, images, compose) arrive at runtime with names this table has never seen, so they hit the unknown-tool default of `Exec`. That fail-closed behavior is the point -- a tool the gateway invents at runtime cannot be quietly treated as a read.
-  Also worth recording: `docker-code-execution`, `docker-terminal`, and `docker-mcp-gateway` were three entries running the **identical** command, `docker mcp gateway run` -- three duplicate connections to one gateway. The two redundant entries are disabled in the active config; `docker-mcp-gateway` is the one to enable.
-
-### Fixed
-- **Windows: the three `uvx`-backed MCP servers could not start at all** (`mcp_servers.example.toml`, `mcp_servers.toml`):
-  `mcp.os.win32.utilities` imports `pywintypes`, which `uvx`'s ephemeral environment does not include, so `fetch`, `git`, and `sqlite` died at import with `ModuleNotFoundError: No module named 'pywintypes'`. Adding `--with pywin32` to each fixes it; verified by MCP handshake, not by assuming.
-  `mcp-server-sqlite` additionally needs an explicit `mcp` pin. Unpinned it resolves against a newer `mcp` whose decorator API dropped `Server.list_resources` and it dies at import; `mcp==1.9.4` works, as do 1.10.1/1.12.0/1.13.0. The existing `mcp==1.9.4` pins on `fetch` and `git` were already correct for a different reason and are kept.
-
-- **Four more tools were defaulting to `Exec`, found by connecting the servers** (`crates/ghost-link/src/capability.rs`):
-  auditing upstream documentation was not enough. Connecting all seven runnable MCP servers exposed **39 tools**, and four were unclassified: `git.git_create_branch`, `git.git_branch`, `sqlite.append_insight`, and `filesystem.read_file` (an alias of `read_text_file` the docs don't mention). Listing branches or reading a file demanded an approval.
-  Branch creation and `append_insight` are classified `Write`, not `Read`: they move refs and append to a durable file respectively. `REAL_TOOLS` is now the live-observed tool set rather than a transcription, and the module comment says to re-derive it by connecting servers rather than by reading docs -- because the docs and the served tool list disagree.
-  Verified live after the fix: 7/7 servers connected, 39/39 tools classified, **24 read / 15 write / 0 spurious exec**.
-
-- **Six ordinary read tools were falling through to the `Exec` default** (`crates/ghost-link/src/capability.rs`):
-  auditing the classification table against the *actual* tool set of every server in `mcp_servers.example.toml` found `git_diff_unstaged`, `git_diff_staged`, `sqlite.list_tables`, `sqlite.describe_table`, `fetch.fetch`, and both `brave-search` tools were unclassified and so defaulted to `Exec`.
-  Failing closed is safe -- no read was wrongly permitted -- but it is not correct: each of these demanded a human approval just to look at a diff, list tables, or fetch a URL. That is exactly the routine false gate that trains people to click Approve without reading, which is the habit the approval tray depends on.
-  `fetch.fetch` was missed for a structural reason worth recording: the table keys on `(server, tool)`, and the old loop filed `brave_web_search` under both `fetch` and `brave-search` while never filing the `fetch` tool that actually exists on the `fetch` server. A `REAL_TOOLS` table in the test module now pins every real tool name to its expected class, so adding a tool upstream without classifying it fails the build instead of silently demanding an approval.
-  Also adds the `memory` server to the active `mcp_servers.toml`, which had only been added to `mcp_servers.example.toml` -- so the phase-1 memory tools were unreachable in a real deployment despite being implemented and classified.
-
-### Added
 - **Local schedule driver** (`crates/ghost-link/src/scheduler.rs`, `crates/ghost-link/src/main.rs`, `.gitignore`):
   schedules are JSON rows plus a tokio task that sleeps until the next firing. Each run is an ordinary agent turn through the native path, so the capability gate, approval queue, and workspace scoping apply exactly as they do to interactive chat -- **a schedule is not a privileged route**. A schedule that produces a write or exec call lands in the approval queue rather than executing; the run is recorded as `needs_approval`, and `last_run_was_read_only` is what distinguishes a schedule safe to repeat unattended from one that isn't.
   Routes: `GET/POST /api/inference/schedules`, plus `get`, `toggle`, `delete`, and `run-now`. Every operation is scoped to the owning `workspace_id`, and another workspace's schedule id is indistinguishable from a nonexistent one, so the endpoints can't be used to enumerate ids.
@@ -291,6 +114,191 @@ All notable changes to Ghostlink Studio are documented here.
   Each of the three workflows now begins with a **`Require a tag ref`** step that fails with an explicit `::error::` (including how to dispatch correctly) when `GITHUB_REF` is not `refs/tags/*`. A failing step was chosen over a job-level `if:` deliberately: a skipped job still reports success, which is the exact failure being fixed. Verified locally for `refs/heads/main` (fails), `refs/heads/release/v2.3.0` (fails), and `refs/tags/v2.3.0` (passes).
 
 ---
+
+### Changed
+
+- **A chat request that names no tools now gets the server's read-only default** (`crates/ghost-link/src/toolselect.rs`):
+  `req.mcp.tools` was the only source of enabled tool slots and defaulted to empty, so any client that omitted it received an assistant with **no tools at all** — silently, and with nothing in the response to indicate it. Scheduled turns and non-GUI clients hit this permanently; the GUI happens to send its checkbox list, which is why it went unnoticed.
+
+  Now:
+
+  | request | meaning |
+  |---|---|
+  | `mcp.tools` absent | server default: every connected slot with at least one `Read` tool |
+  | `mcp.tools: []` | explicitly none — honored as sent |
+  | `mcp.tools: [...]` | exactly those slots |
+
+  The absent/empty distinction is deliberate. A client sending `[]` has decided it wants no tools, and overriding that would be the same class of bug in the opposite direction. A malformed `tools` value is treated as unspecified rather than as "none", so a client bug cannot silently disarm the assistant.
+
+  **Visibility, not permission.** The default widens what the model can *see*, never what it can *do*: `capability::decide` still runs per call, so `memory_remember` routes through vetted auto-apply and `memory_forget` and the Docker gateway tools still require approval.
+
+  A slot qualifies when it offers *any* read. The first implementation excluded slots containing a `Write` entirely, on the reasoning that partial availability is confusing — but that excluded `memory` and `rag`, whose servers each mix reads with writes, leaving the default offering exactly one slot while four servers were connected. "Use the default" then quietly meant "you get almost nothing", which is the silent-disablement this change exists to remove. An `Exec`-only slot still never qualifies.
+
+  Measured live on this machine: default went from 1 slot / 1 tool to **4 slots / 21 tools**, and a request with no `mcp.tools` had the model call `rag.search` and `memory_search` on its own — impossible before.
+
+  11 new tests, including that `memory_forget` and `docker-mcp-gateway/mcp-exec` still require approval under the default, and that the default derives from the live `classify` rather than a hand-maintained list.
+
+- **`memory_remember` no longer requires approval** (`crates/ghost-link/src/capability.rs`, `crates/mcp-memory/src/main.rs`):
+  it is now a vetted auto-apply write, gated by `capability::is_vetted_memory_write`.
+
+  It was `CapabilityClass::Write` with no filesystem target, so the path-based auto-apply rule could never match it and every memory write queued for a human decision. Verified live: asked to remember something, the DB stayed at 0 rows. Nothing was ever remembered unless the user answered a prompt per fact, which left both the store and the recall that reads it close to dead weight.
+
+  `memory_forget` is deliberately **not** included. Forgetting is irreversible — there is no un-forget — so a misfired delete should still cost a human decision. The scope, not the prompt, is what makes this safe: `is_scope_stamped` forces the workspace id at dispatch, so an auto-applied write lands in the chat's own workspace and cannot be redirected by the model.
+
+  The tool description also said *"Requires user approval"*, which was actively harmful — the model read that and declined to call the tool at all, even when asked directly. Now describes the tool and states it takes effect immediately.
+
+  7 new tests: remember auto-applies, forget never does, another server's same-named tool is not covered, sibling read tools are not covered, `rag.index_document` stays gated, an Exec tool on the memory server cannot pick up the path, and the exemption is workspace-scoped rather than path-scoped.
+
+- **`mcp-rag` can now embed via llama-server, removing the Ollama dependency** (`crates/mcp-rag/src/main.rs`, `mcp_servers.example.toml`, `mcp_servers.toml`, `.gitignore`):
+  `rag_embed` now selects a backend via `GHOSTLINK_EMBED_BACKEND`. `llama` targets llama-server's OpenAI-compatible `POST /v1/embeddings` (`data[0].embedding`); `ollama` keeps the original `POST /api/embeddings` (`embedding`) untouched; `auto` tries llama then falls back. **An existing Ollama setup keeps working with no config change** -- `auto` is the default.
+  Verified live with Ollama pointed at a dead port: indexed and searched in 0.0s, 768-dim vectors from `nomic-embed-text-v1.5.Q4_K_M` (84MB), with real semantic separation (cosine 0.918 for a paraphrase vs 0.407 across unrelated topics).
+  Requires a **second** llama-server on its own port -- an embedding model and a chat model cannot share one instance:
+  `llama-server -m models/nomic-embed-text-v1.5.Q4_K_M.gguf --embedding --pooling mean --host 127.0.0.1 --port 8081`
+  Vectors are only comparable within a model, so switching backend requires re-indexing; the config comment says so.
+
+- **Bumped the last `actions/setup-node@v4` pin to `@v7`** (`.github/workflows/ci.yml`):
+  GitHub removed the Node 20 runtime from Actions runners on 23 September 2026; JavaScript actions now run on Node 24. The `v4` tag still declares `runs.using: node20` (`v5` onward declare `node24`), and runners have been rewriting `node20` to `node24` since 16 June -- so this was never broken, just the one inconsistent pin in the repo. Every other workflow already used `@v7`.
+
+  Note this is the **action runtime**, not the build Node: `node-version: 20` selects the Node that runs `npm ci` / `vitest` / `tsc` and is unaffected by the runner change. Verified no `ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION` opt-out is referenced anywhere, since that escape hatch stopped working on 23 September.
+
+  Also checked before bumping: `setup-node` v5+ auto-enables npm caching when `packageManager` or `devEngines.packageManager` is set, which would change caching behavior. No `package.json` in this repo sets either field, so the bump is inert beyond the runtime version.
+
+- **Control-plane no longer 503s every proxied request when ghost-link is on HTTPS** (`control-plane/pkg/proxy/proxy.go`):
+  `NewChatProxy` computed the loopback check and threw it away (`_ = ...`), so an `https` backend URL got a default `http.Client` with full certificate verification. ghost-link serves TLS whenever `settings.enable_tls` is set, which includes loopback (`use_tls = enable_tls || !is_loopback_host(host)`), and presents a self-signed cert -- so the handshake failed and `forward()` answered `Backend unreachable` (503) for everything it proxied.
+  `/health` kept reporting `status: ok` the whole time, because that handler echoes the configured backend URL without ever using the proxy client. The gateway looked healthy while every real API call failed.
+  Loopback `https` backends now get an `InsecureSkipVerify` transport. Scoped to loopback deliberately: a non-loopback `https` backend keeps full verification, and a plaintext `http` backend is untouched. Covered by `control-plane/pkg/proxy/proxy_tls_test.go` -- 4 tests, including a direct regression test asserting a reachable loopback TLS backend does not produce 503.
+
+- **Streaming chat turns now record a trace event** (`crates/ghost-link/src/main.rs`):
+  `handle_gui_chat`'s three SSE arms each `return Sse::new(...)` before reaching the shared `record_trace` call, so the GUI's default streaming path recorded **no** turn trace at all. Only the non-streaming fallback and the OpenAI-compat server were traced. Added the trace to the Ollama and native stream finalizers, where the TTFT/tokens-per-second metrics were already being recorded -- so the trace carries the same real token count and latency rather than a second, separately-derived number.
+  The third SSE path (replaying a completed `response_text`) already flows through the shared call and needed no change.
+  Found by end-to-end test, not inspection: a live streaming chat left `/api/inference/traces` empty. Verified after the fix -- `{"kind":"chat","latency_ms":1328,"output_tokens":23}`.
+
+- **RAG workspace indexing no longer requires Ollama** (`crates/ghost-link/src/main.rs`):
+  the `/api/workspace/index` pre-flight probe hard-coded an Ollama health check, so a llama-only machine was answered `Ollama isn't reachable ... status: skipped` while its actual embedding backend was running fine. The probe now mirrors `mcp-rag`'s backend selection: an explicit backend probes only that one, and `auto` requires only that *either* answers.
+  This was found by the live test above, not by inspection -- the first version of the change looked correct and still returned the Ollama error.
+- Prebuilt llama.cpp binaries (`tools/llama.cpp/`) and locally-fetched GGUF weights (`models/nomic-embed-text*.gguf`) are gitignored. Neither belongs in the repo.
+
+- **Replaced `brave-search` with a local, keyless web search** (`mcp_servers.example.toml`, `crates/ghost-link/src/capability.rs`):
+  `brave-search` required `BRAVE_API_KEY` and a paid account, which sat awkwardly against this project's all-local constraint. It is replaced by `duckduckgo-mcp-server` (`npx -y duckduckgo-mcp-server`), verified live: it handshakes, advertises a single tool `duckduckgo_web_search`, and returns real results with no API key.
+  **Stated plainly because it matters operationally:** DuckDuckGo's free HTML endpoint rate-limits aggressively and answers `DDG detected an anomaly in the request, you are likely making requests too quickly` under load. That was observed directly during verification. It suits occasional lookups and is not a high-throughput search backend. A self-hosted SearXNG instance is the sturdier option if that becomes a problem -- it needs a container but no account.
+  Two other candidates were evaluated and rejected on evidence rather than reputation: `free-search-mcp` fails at import (its `selectolax` Modest backend was deprecated at 1.0 and now raises), and `one-search-mcp` requires a `.env` file plus a Chromium install before it will start.
+  Classified `Read`: it queries the public web and writes nothing local.
+
+- **Docker MCP Toolkit gateway connected and classified from its live tool set** (`mcp_servers.toml`, `mcp_servers.example.toml`, `crates/ghost-link/src/capability.rs`):
+  `docker mcp gateway run` (Docker 29.8.1) serves 8 tools, all now classified `Exec`: `mcp-exec`, `code-mode`, `mcp-add`, `mcp-remove`, `mcp-config-set`, `mcp-create-profile`, `mcp-activate-profile`, `mcp-find`. `mcp-exec` and `code-mode` run commands outright; the config-mutating ones decide what the gateway is able to run; `mcp-find` is included as Exec rather than Read because it queries the catalog of servers the gateway can activate.
+  The gateway's *dynamically* activated tools (containers, images, compose) arrive at runtime with names this table has never seen, so they hit the unknown-tool default of `Exec`. That fail-closed behavior is the point -- a tool the gateway invents at runtime cannot be quietly treated as a read.
+  Also worth recording: `docker-code-execution`, `docker-terminal`, and `docker-mcp-gateway` were three entries running the **identical** command, `docker mcp gateway run` -- three duplicate connections to one gateway. The two redundant entries are disabled in the active config; `docker-mcp-gateway` is the one to enable.
+
+### Fixed
+
+- **RAG search no longer returns irrelevant documents** (`crates/mcp-rag/src/main.rs`):
+  `search` had no relevance floor — it always returned the top-k *closest* entries, even when none of them matched. Measured on a one-document index: a topically unrelated query (*"quantum chromodynamics lattice gauge theory"*) still scored **0.454** against the only chunk, so the "closest" result was a document about credential rotation.
+
+  That matters because proactive recall injects these hits into the model's context as established fact. A floorless search hands the model the least-relevant thing in the index dressed as an answer.
+
+  Added `min_score` (cosine floor), applied **before** top-k truncation so a top-k full of weak matches cannot push a relevant result out of the list.
+
+  The default is measured rather than guessed. Nine queries against one chunk on `nomic-embed-text-v1.5`:
+
+  ```text
+  related    0.629  0.695  0.625  0.591     (min 0.591)
+  unrelated  0.454  0.429  0.441  0.404  0.458   (max 0.458)
+  ```
+
+  `DEFAULT_MIN_SCORE = 0.52` sits mid-gap, so it keeps all four related queries and drops all five unrelated ones. `min_score: 0.0` restores the old always-return-top-k behaviour.
+
+  A first attempt used 0.45, picked from a two-sample comparison that did not separate the cases. A test pinning the measurement failed and caught it — which is why the full nine-query dataset is recorded in the source next to the constant.
+
+  5 new tests: the floor drops a weak match, keeps a strong one, is applied before truncation, `0.0` disables it, and the constant still sits inside the measured gap.
+
+- **The assistant no longer reports actions it never performed** (`crates/ghost-link/src/grounding.rs`, wired into the buffered and streaming chat paths):
+
+  Asked to "remember that my favourite tea is sencha", Ghostlink replied *"I've saved your favorite tea as sencha"* — over an empty memory database. It had been offered **no tools at all**, since tools are opt-in per request via `mcp.tools`, and it filled the gap with a confident, specific, fictional action report.
+
+  Two independent layers, because a prompt instruction is neither reliable nor enforcement:
+
+  1. **A capability statement** placed immediately above the tool list, naming what the model can actually do this turn. When the list is empty it says so outright — an omitted list reads as "unmentioned", which the model completes with capability it does not have.
+  2. **A server-side claim audit** (`grounding::unverified_action_claims`) that re-checks the reply against the server's own record of executed tools. It does not trust the model at all, so it still fires if the prompt layer is removed.
+
+  The correction is appended as server-authored text prefixed `> **Note from Ghostlink:**`, so a user can tell a correction from a hallucination. `action_claim_corrected` and `tools_run` are exposed on the response, and the trace records the event as a `Blocked` tool decision — never the reply text, which is the content under suspicion.
+
+  Grounding is deliberately conservative: the audit only fires when **no** tool ran, and an explicit list of non-claim patterns keeps truthful refusals ("I can't save that right now") from being corrected. A false positive would append a spurious notice to a fine reply and train the user to ignore it.
+
+  The streaming path is covered too — the GUI streams by default, so fixing only the buffered path would have left the common case unprotected. Streamed text is accumulated to a bounded 32 KiB for the audit, and the notice is sent **before** the state lock is taken, since an `await` while holding a `std::MutexGuard` makes the spawned task non-`Send`.
+
+  Verified live: the exact failing prompt now returns `action_claim_corrected: true` with the correction appended, and four ordinary replies (factual, code request, how-to, and one that *discusses* memory without claiming a write) produced no false positives.
+
+  12 new tests, weighted toward the negative cases — an honest refusal must never be corrected, an ordinary answer must never be corrected, and the audit must fire with no prompt cooperation at all.
+
+- **Conversation summaries now survive a restart** (`crates/ghost-link/src/main.rs`, `.gitignore`):
+  `BackendState::session_summaries` was in-memory only, so a long session that had been trimmed lost its condensed memory on restart and the next turn re-read from scratch — the summarization work was effectively undone by a crash or a redeploy.
+
+  Summaries are now written to `session_summaries.json` (`GHOSTLINK_SESSION_SUMMARIES_PATH`) after each successful trim and loaded at startup. The on-disk shape is a separate `PersistedSessionSummary`, because the in-memory struct carries an `Instant` for LRU eviction that cannot be serialized and means nothing across a restart; wall-clock time is tracked separately for durable ordering.
+
+  Failure paths degrade rather than break: an unreadable or corrupt store loads as "no summaries", which is exactly the pre-existing cold-start behavior, instead of failing boot. Text over `SUMMARY_MAX_CHARS` is trimmed on load too, so a store written by a build with a larger cap cannot reintroduce an oversized summary.
+
+  Verified: a live restart returns `summarized_history: true` for `sess_local_001` purely from the restored file, and 6 new tests cover the round-trip, accumulation across restarts, corrupt/missing stores, oversized rows, and the cap.
+
+  One bug caught by those tests and fixed here: the loader sorted ascending and truncated, which kept the **oldest** rows and silently discarded the most recent work — the opposite of what the cap is for. It now drops the excess oldest and keeps the newest.
+
+- **Bootstrap-code tests no longer fail intermittently in parallel** (`crates/ghost-link/src/bootstrap.rs`):
+  the code store is process-global — one `OnceLock<Mutex<HashMap<..>>>`, which is correct for the server since exactly one code is live per process. Under `cargo test`, though, tests share that store on parallel threads and `issue_code()` *clears* it before inserting, so one test issuing a code could wipe another's mid-assertion.
+
+  Caught on CI, not locally: `redemption_is_single_use` and `refused_from_non_loopback` failed in `Production Gate` while passing on this machine, because the two machines have different core counts and therefore different thread scheduling. The tests now hold a serialising guard. Verified with 25 consecutive runs at `--test-threads 16`.
+
+- **Model loads now warn before a GPU-offload OOM instead of dying inside Vulkan** (`crates/ghost-link/src/native_engine.rs`):
+  full offload allocates a *second* copy of the weights in device memory alongside the host copy, so a model that loads comfortably at `-ngl 0` can fail at `-ngl -1` purely because something else on the machine grew.
+
+  Measured on this machine with Qwen3.8-27B-UD-IQ3_S (12.04GB), 16 threads, 3 runs per configuration:
+
+  | ngl | decode | TTFT | resident | loaded |
+  |---|---|---|---|---|
+  | 0 | 2.28 / 2.37 tok/s | 1.46s | 12.24 GB | 2/2 |
+  | 12 | 2.21 tok/s | 1.64s | 12.27 GB | 1/1 |
+  | 24 | 2.28 tok/s | 1.70s | 12.29 GB | 1/1 |
+  | **-1** | **3.88 / 3.91 tok/s** | 2.25s | 12.64 GB | **2/2** |
+
+  Two findings from that, both contrary to what the repo previously documented:
+  - **Partial offload is not a middle ground here.** `ngl` 12 and 24 land within noise of CPU-only (2.21-2.28 vs 2.28-2.37). Only full offload helps, at **1.65x**.
+  - **The OOM was a memory precondition, not a bad setting.** The same `-ngl -1` load succeeded twice at ~22GB free and failed three times at ~11GB free with `vk::Device::allocateMemory: ErrorOutOfDeviceMemory`. So `-ngl -1` is kept as the default and a precondition check warns when free memory is short, naming the requirement, what is available, and `GHOSTLINK_LLAMA_NGL=0` as the escape hatch.
+
+  The check warns rather than refuses: the estimate is conservative and refusing to load a model that would in fact fit would be worse. CPU-only loads are exempt, since there is no duplicate allocation.
+
+  Also corrects a memory figure in `launch-native.ps1`: CPU-only `ngl 0` shows **12.24 GB resident**, not the ~0.5 GB previously claimed, because resident memory includes the mmap'd model file at every `ngl`. Offload saves the duplicate device copy, not the whole model.
+
+- **Review pane no longer drops the verification verdict, and its note field works** (`ghostlink_gui_modern/src/components/ReviewPane.tsx`, `ghostlink_gui_modern/src/api.ts`):
+  the backend's `ReviewPacket` carries `verification: Vec<VerificationResult>` and `checks`, but `api.ts` never declared either and `ReviewPane` rendered neither. A reviewer saw only `risks: ["Verification produced no results — change is UNVERIFIED"]` next to an empty diff pane -- so the one piece of information that determines whether a change was tested was invisible, and an untested change looked the same as a verified one.
+
+  The pane now renders a tri-state verdict banner in the header, matching the backend's `verification_passed() -> Option<bool>`, which deliberately returns `None` when nothing ran: **passed**, **failed**, or **NOT run — UNVERIFIED**. Each verification command shows pass / exit code / timeout plus the captured excerpt on failure, since the backend truncates output specifically so a reviewer can see *why* something failed. `checks` is now rendered too.
+
+  Also fixed a typo that made the "Request Changes" note field unreachable: the setter was declared `setShowNoteNoteInput` (doubled `Note`) while the button called `setShowNoteInput`, so clicking it threw instead of opening the input.
+
+  `ReviewPacket` was also not exported from `api.ts` despite being imported by `ChatTab`, `ReviewPane` and `TaskView`; it now is.
+
+- Empty-diff state explains itself ("this run produced no diffs to review... check the verification panel") instead of showing a bare blank pane.
+
+- **`launch-native.ps1` pins `GHOSTLINK_TLS_CERT_PATH`, without which the control-plane 503s every proxied request** (`launch-native.ps1`):
+  the control-plane starts with its working directory set to `control-plane/`, but ghost-link writes `tls_cert.pem` to the repo root. So the proxy's pinned cert pool looked in the wrong place, fell back to system roots, failed verification against the self-signed cert, and returned `Backend unreachable` for every proxied request while `/health` kept reporting ok.
+
+  This is the same cwd hazard the launcher already documents for `api_key.txt`, and it now gets the same explicit path. Verified both ways from `control-plane/` as cwd: without the variable `/api/metrics` returns 503, with it 200.
+
+  Worth noting how it slipped through: the proxy's own tests and the live check both passed, because both ran the control-plane from the repo root. Only reading the launcher's actual `-WorkingDirectory` argument exposed it.
+
+- **Windows: the three `uvx`-backed MCP servers could not start at all** (`mcp_servers.example.toml`, `mcp_servers.toml`):
+  `mcp.os.win32.utilities` imports `pywintypes`, which `uvx`'s ephemeral environment does not include, so `fetch`, `git`, and `sqlite` died at import with `ModuleNotFoundError: No module named 'pywintypes'`. Adding `--with pywin32` to each fixes it; verified by MCP handshake, not by assuming.
+  `mcp-server-sqlite` additionally needs an explicit `mcp` pin. Unpinned it resolves against a newer `mcp` whose decorator API dropped `Server.list_resources` and it dies at import; `mcp==1.9.4` works, as do 1.10.1/1.12.0/1.13.0. The existing `mcp==1.9.4` pins on `fetch` and `git` were already correct for a different reason and are kept.
+
+- **Four more tools were defaulting to `Exec`, found by connecting the servers** (`crates/ghost-link/src/capability.rs`):
+  auditing upstream documentation was not enough. Connecting all seven runnable MCP servers exposed **39 tools**, and four were unclassified: `git.git_create_branch`, `git.git_branch`, `sqlite.append_insight`, and `filesystem.read_file` (an alias of `read_text_file` the docs don't mention). Listing branches or reading a file demanded an approval.
+  Branch creation and `append_insight` are classified `Write`, not `Read`: they move refs and append to a durable file respectively. `REAL_TOOLS` is now the live-observed tool set rather than a transcription, and the module comment says to re-derive it by connecting servers rather than by reading docs -- because the docs and the served tool list disagree.
+  Verified live after the fix: 7/7 servers connected, 39/39 tools classified, **24 read / 15 write / 0 spurious exec**.
+
+- **Six ordinary read tools were falling through to the `Exec` default** (`crates/ghost-link/src/capability.rs`):
+  auditing the classification table against the *actual* tool set of every server in `mcp_servers.example.toml` found `git_diff_unstaged`, `git_diff_staged`, `sqlite.list_tables`, `sqlite.describe_table`, `fetch.fetch`, and both `brave-search` tools were unclassified and so defaulted to `Exec`.
+  Failing closed is safe -- no read was wrongly permitted -- but it is not correct: each of these demanded a human approval just to look at a diff, list tables, or fetch a URL. That is exactly the routine false gate that trains people to click Approve without reading, which is the habit the approval tray depends on.
+  `fetch.fetch` was missed for a structural reason worth recording: the table keys on `(server, tool)`, and the old loop filed `brave_web_search` under both `fetch` and `brave-search` while never filing the `fetch` tool that actually exists on the `fetch` server. A `REAL_TOOLS` table in the test module now pins every real tool name to its expected class, so adding a tool upstream without classifying it fails the build instead of silently demanding an approval.
+  Also adds the `memory` server to the active `mcp_servers.toml`, which had only been added to `mcp_servers.example.toml` -- so the phase-1 memory tools were unreachable in a real deployment despite being implemented and classified.
+
 
 ## [2.3.0] - 2026-10-03
 
