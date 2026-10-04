@@ -10211,6 +10211,21 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                                                     true,
                                                 );
                                             }
+                                            // The non-streaming arms below fall through to
+                                            // the shared `record_trace` call, but each
+                                            // streaming arm returns its own `Sse` response
+                                            // before reaching it. Without this, the GUI's
+                                            // streaming path -- the default one -- recorded no
+                                            // turn trace at all.
+                                            record_trace(
+                                                &mut backend,
+                                                trace::TraceEvent::chat(
+                                                    &chat_session_id,
+                                                    chat_workspace.id(),
+                                                )
+                                                .with_tokens(None, Some(accumulated_tokens))
+                                                .with_latency(stream_started.elapsed()),
+                                            );
                                         });
 
                                         request_tracker.decrement().await;
@@ -10454,6 +10469,16 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                                     true,
                                 );
                             }
+                            // See the matching note on the Ollama streaming arm: every
+                            // streaming path returns its own `Sse` before the shared
+                            // `record_trace`, so the trace has to be emitted from the
+                            // finalizer too.
+                            record_trace(
+                                &mut backend,
+                                trace::TraceEvent::chat(&chat_session_id, chat_workspace.id())
+                                    .with_tokens(None, Some(accumulated_tokens))
+                                    .with_latency(stream_started.elapsed()),
+                            );
                         });
 
                         let sse_stream = tokio_stream::wrappers::ReceiverStream::new(rx);

@@ -15,7 +15,11 @@ All notable changes to Ghostlink Studio are documented here.
   Vectors are only comparable within a model, so switching backend requires re-indexing; the config comment says so.
 
 ### Fixed
-- **RAG workspace indexing no longer requires Ollama** (`crates/ghost-link/src/main.rs`):
+- **Streaming chat turns now record a trace event** (`crates/ghost-link/src/main.rs`):
+  `handle_gui_chat`'s three SSE arms each `return Sse::new(...)` before reaching the shared `record_trace` call, so the GUI's default streaming path recorded **no** turn trace at all. Only the non-streaming fallback and the OpenAI-compat server were traced. Added the trace to the Ollama and native stream finalizers, where the TTFT/tokens-per-second metrics were already being recorded -- so the trace carries the same real token count and latency rather than a second, separately-derived number.
+  The third SSE path (replaying a completed `response_text`) already flows through the shared call and needed no change.
+  Found by end-to-end test, not inspection: a live streaming chat left `/api/inference/traces` empty. Verified after the fix -- `{"kind":"chat","latency_ms":1328,"output_tokens":23}`.
+- Prebuilt llama.cpp binaries (`tools/llama.cpp/`)- **RAG workspace indexing no longer requires Ollama** (`crates/ghost-link/src/main.rs`):
   the `/api/workspace/index` pre-flight probe hard-coded an Ollama health check, so a llama-only machine was answered `Ollama isn't reachable ... status: skipped` while its actual embedding backend was running fine. The probe now mirrors `mcp-rag`'s backend selection: an explicit backend probes only that one, and `auto` requires only that *either* answers.
   This was found by the live test above, not by inspection -- the first version of the change looked correct and still returned the Ollama error.
 - Prebuilt llama.cpp binaries (`tools/llama.cpp/`) and locally-fetched GGUF weights (`models/nomic-embed-text*.gguf`) are gitignored. Neither belongs in the repo.
