@@ -153,3 +153,15 @@ ghostlink_memory.db
 # GGUF weights. Neither belongs in the repo.
 tools/llama.cpp/
 models/nomic-embed-text*.gguf
+
+# RAG indexes and memory stores are derived, machine-local, and disposable.
+# A llama-server-embedded index runs ~240MB, so it must never be committed.
+rag_index.json
+rag_llama.json
+*.db
+
+# Scratch notes from working sessions. Documentation that belongs in the repo
+# goes in docs/; these are per-session and only meaningful to their author.
+AGENTS_AND_CHANGELOG_REVIEW.md
+ghostlink_gui_modern/FIX_401_ERROR.md
+test_curl_cleaned.js
