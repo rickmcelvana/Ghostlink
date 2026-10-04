@@ -55,6 +55,103 @@ describe('ReviewPane', () => {
     };
   });
 
+  it('shows UNVERIFIED when no verification was run, not a pass', () => {
+    render(<ReviewPane packet={mockPacket} api={mockApi} />);
+
+    // mockPacket has no `verification` key at all -- the case that matters.
+    const banner = screen.getByRole('status');
+    expect(banner).toHaveTextContent(/Verification NOT run/i);
+    expect(banner).toHaveTextContent(/UNVERIFIED/i);
+    expect(banner.getAttribute('aria-label')).toBe(
+      'Verification not run: this change is UNVERIFIED'
+    );
+    expect(screen.getByText(/No verification commands were run/i)).toBeInTheDocument();
+  });
+
+  it('reports a passing verification run', () => {
+    render(
+      <ReviewPane
+        packet={{
+          ...mockPacket,
+          verification: [
+            { argv: ['cargo', 'test'], exit: 0, passed: true, excerpt: 'test result: ok' },
+          ],
+        }}
+        api={mockApi}
+      />
+    );
+
+    const banner = screen.getByRole('status');
+    expect(banner).toHaveTextContent(/Verification passed/i);
+    expect(banner).toHaveClass('text-green-300');
+  });
+
+  it('reports a failing verification run and shows why it failed', () => {
+    render(
+      <ReviewPane
+        packet={{
+          ...mockPacket,
+          verification: [
+            { argv: ['cargo', 'test'], exit: 0, passed: true, excerpt: 'ok' },
+            {
+              argv: ['cargo', 'clippy'],
+              exit: 101,
+              passed: false,
+              excerpt: 'error: unused variable `x`',
+            },
+          ],
+        }}
+        api={mockApi}
+      />
+    );
+
+    const banner = screen.getByRole('status');
+    expect(banner).toHaveTextContent(/Verification failed/i);
+    expect(banner).toHaveClass('text-rose-300');
+    // The excerpt is the point of capturing it -- a bare "FAIL" is not actionable.
+    expect(screen.getByText(/unused variable/)).toBeInTheDocument();
+    expect(screen.getByText('exit 101')).toBeInTheDocument();
+  });
+
+  it('marks a timed-out verification command as a timeout, not a plain failure', () => {
+    render(
+      <ReviewPane
+        packet={{
+          ...mockPacket,
+          verification: [
+            {
+              argv: ['cargo', 'test'],
+              exit: -1,
+              passed: false,
+              excerpt: '',
+              timed_out: true,
+            },
+          ],
+        }}
+        api={mockApi}
+      />
+    );
+
+    expect(screen.getByText('timeout')).toBeInTheDocument();
+  });
+
+  it('renders the checks list the backend sends', () => {
+    render(<ReviewPane packet={mockPacket} api={mockApi} />);
+    expect(screen.getByText('cargo test passed')).toBeInTheDocument();
+  });
+
+  it('explains the empty-diff state rather than showing a blank pane', () => {
+    render(<ReviewPane packet={{ ...mockPacket, diffs: [] }} api={mockApi} />);
+
+    // The sidebar count and the pane both say "No file changes proposed"; assert
+    // on the heading with its count, and on the pane's added explanation.
+    expect(screen.getByText(/Proposed Diffs \(0\)/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/this run produced no diffs to review/i)
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Select a diff file to review/i)).not.toBeInTheDocument();
+  });
+
   it('renders review packet summary and diff file path', () => {
     render(<ReviewPane packet={mockPacket} api={mockApi} />);
 

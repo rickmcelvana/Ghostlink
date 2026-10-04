@@ -55,6 +55,15 @@ export interface ReviewCommand {
   excerpt: string;
 }
 
+export interface VerificationResult {
+  argv: string[];
+  exit: number;
+  passed: boolean;
+  /** Captured output, truncated by the backend -- enough to see why it failed. */
+  excerpt: string;
+  timed_out?: boolean;
+}
+
 export interface ReviewPacket {
   id: string;
   task_id: string;
@@ -64,6 +73,14 @@ export interface ReviewPacket {
   commands: ReviewCommand[];
   checks: string[];
   risks: string[];
+  /**
+   * Results of the project's own verification plan. Absent or empty means
+   * nothing was run -- which is NOT the same as "passed". The backend keeps that
+   * distinction (see `ReviewPacket::verification_passed` returning Option<bool>)
+   * and the review pane has to preserve it too, or an unverified change renders
+   * as green.
+   */
+  verification?: VerificationResult[];
   created_at: string;
 }
 

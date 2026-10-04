@@ -23,6 +23,18 @@ All notable changes to Ghostlink Studio are documented here.
   Also checked before bumping: `setup-node` v5+ auto-enables npm caching when `packageManager` or `devEngines.packageManager` is set, which would change caching behavior. No `package.json` in this repo sets either field, so the bump is inert beyond the runtime version.
 
 ### Fixed
+- **Review pane no longer drops the verification verdict, and its note field works** (`ghostlink_gui_modern/src/components/ReviewPane.tsx`, `ghostlink_gui_modern/src/api.ts`):
+  the backend's `ReviewPacket` carries `verification: Vec<VerificationResult>` and `checks`, but `api.ts` never declared either and `ReviewPane` rendered neither. A reviewer saw only `risks: ["Verification produced no results — change is UNVERIFIED"]` next to an empty diff pane -- so the one piece of information that determines whether a change was tested was invisible, and an untested change looked the same as a verified one.
+
+  The pane now renders a tri-state verdict banner in the header, matching the backend's `verification_passed() -> Option<bool>`, which deliberately returns `None` when nothing ran: **passed**, **failed**, or **NOT run — UNVERIFIED**. Each verification command shows pass / exit code / timeout plus the captured excerpt on failure, since the backend truncates output specifically so a reviewer can see *why* something failed. `checks` is now rendered too.
+
+  Also fixed a typo that made the "Request Changes" note field unreachable: the setter was declared `setShowNoteNoteInput` (doubled `Note`) while the button called `setShowNoteInput`, so clicking it threw instead of opening the input.
+
+  `ReviewPacket` was also not exported from `api.ts` despite being imported by `ChatTab`, `ReviewPane` and `TaskView`; it now is.
+
+- Empty-diff state explains itself ("this run produced no diffs to review... check the verification panel") instead of showing a bare blank pane.
+
+### Fixed
 - **`launch-native.ps1` pins `GHOSTLINK_TLS_CERT_PATH`, without which the control-plane 503s every proxied request** (`launch-native.ps1`):
   the control-plane starts with its working directory set to `control-plane/`, but ghost-link writes `tls_cert.pem` to the repo root. So the proxy's pinned cert pool looked in the wrong place, fell back to system roots, failed verification against the self-signed cert, and returned `Backend unreachable` for every proxied request while `/health` kept reporting ok.
 
