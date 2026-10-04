@@ -135,6 +135,24 @@ export type McpTransport =
   | { transport: "stdio"; command: string; args: string[]; env: Record<string, string> }
   | { transport: "http"; url: string; headers: Record<string, string> };
 
+/** A queued approval awaiting a human decision.
+ *
+ *  Mirrors the backend's `ActionSummary`. Note the absence of any `args` field:
+ *  the server deliberately omits tool arguments from the list payload, so the
+ *  tray has no access to them and cannot leak them. */
+export interface PendingApproval {
+  id: string;
+  workspace_id: string;
+  turn_id: string;
+  tool: string;
+  server: string;
+  class: string;
+  preview: string;
+  status: string;
+  created_at: number;
+  resolved_at?: number | null;
+}
+
 export interface McpServer {
   name: string;
   slot: string;

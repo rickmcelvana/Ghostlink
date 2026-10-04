@@ -91,3 +91,8 @@ opentelemetry = "0.32.0"
 opentelemetry_sdk = "0.32.1"
 tracing-opentelemetry = "0.33.0"
 opentelemetry-otlp = { version = "0.32.0", features = ["http-proto", "reqwest-blocking-client"] }
+
+[dev-dependencies]
+# Filesystem-scoped capability tests need a real temp directory to check
+# the vetted auto-apply path against.
+tempfile = "3"

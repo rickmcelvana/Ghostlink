@@ -86,6 +86,77 @@ This document summarizes current security assumptions for Ghost-Link runtime and
   Change the default Grafana admin password (`GRAFANA_ADMIN_PASSWORD`)
   before running this profile beyond local evaluation.
 
+- **Server-side tool capability classification** (since 2.4.0, `crates/ghost-link/src/capability.rs`):
+  every MCP tool call in the chat tool loop is classified `read` / `write` / `exec`
+  in Rust, from a `(server, tool)` table, and the classification is enforced
+  *before* dispatch in `invoke_mcp_tool`. This closes a gap the previous
+  per-server `requires_confirmation` flag could not: that flag is per-server, so it
+  could not distinguish `read_text_file` from `write_file` on the same filesystem
+  server, and it could not express "this specific tool is vetted to auto-apply".
+  **Classification fails closed** — any tool not in the table is treated as `exec`,
+  including an unlisted tool on an otherwise-known server. The rationale is
+  asymmetric cost: a wrong `read` permits arbitrary command execution, while a
+  spurious `exec` costs one approval prompt.
+  A system-prompt instruction to the model is explicitly *not* part of this
+  control. The model is not the trust boundary; the server is.
+  Session-scoped grants ("approve for session") are keyed by
+  `(workspace_id, server, tool)` and **never cover `exec`** — a standing grant must
+  not become a standing shell. The grant API refuses an `exec` class outright
+  rather than relying on the caller to check, and `POST
+  /api/inference/chat/tool-confirm` derives the class server-side instead of
+  accepting one from the request body.
+  The vetted auto-apply path admits a `write` only when its target canonicalizes
+  inside the configured workspace root; `exec` and `read` are never auto-applied,
+  and a write with no resolvable path is refused rather than assumed safe.
+  `GET /api/inference/capabilities` exposes the effective classification of every
+  connected tool so the boundary can be audited rather than inferred.
+- **Per-workspace scoping of grants and data** (since 2.4.0, `crates/ghost-link/src/workspace.rs`):
+  tool grants, memories, RAG indexes, and schedules are scoped by
+  `workspace_id`, so a chat bound to workspace A cannot reach workspace B's files
+  or data. A client-supplied `workspace_id` selects *which* workspace's data
+  applies and never selects a filesystem root — the root remains
+  server-configured (`GHOSTLINK_WORKSPACE_ROOT`), because accepting a
+  caller-chosen root would hand out path traversal for free. Ids are sanitized and
+  length-bounded before use as a filename or database key. Path containment uses a
+  single shared `resolve_within` implementation, so the GUI's file routes and the
+  tool caller's scoping cannot drift into two different traversal checks.
+
+- **Workspace scope on memory tools is stamped server-side** (since 2.4.0, `crates/mcp-memory/`, `crates/ghost-link/src/capability.rs`):
+  the memory store filters every statement by `workspace_id`, and `ghost-link`
+  *overwrites* that argument at dispatch with the chat's own binding rather than
+  accepting the model's. A prompt-injected turn can trivially emit
+  `{"workspace_id": "ws_other"}`; that value is discarded, so it cannot read or
+  write another workspace's memories. An unrecognized `kind` or `source` in an
+  existing row degrades to a safe default rather than dropping the row, and
+  `memory_forget` deletes scoped to the workspace, so an id carried over from
+  elsewhere is a no-op instead of a cross-workspace delete.
+  The store holds memory bodies and titles. It does not hold credentials: API
+  keys remain in the hashed `api_keys.json` store and the OS keychain, and
+  secrets are never written to the memory DB, to prompts, or to traces.
+
+- **Non-blocking approval queue for gated tool calls** (since 2.4.0, `crates/ghost-link/src/approvals.rs`):
+  `write` and `exec` calls are recorded as pending actions and surfaced to a
+  review tray rather than stalling the chat turn. Three properties matter:
+  the queued action's capability class is **re-derived server-side** from the
+  classification table on the approve path, so a hand-edited `approvals.json`
+  cannot promote a tool to a weaker class; `approve_for_session` refuses `exec`
+  outright, so a standing grant cannot become a standing shell; and
+  resolution is scoped to the owning `workspace_id`, returning an
+  indistinguishable "not found" for another workspace's ids so the queue
+  cannot be used to probe them.
+  The queue stores full arguments (an approved action must actually run) but
+  only a bounded **preview** leaves the process: `build_preview` reads specific
+  named argument fields per server and has no generic fallback that would dump
+  the argument bag, because that is where a credential would appear. The
+  list endpoint returns `ActionSummary`, a type with no `args` field at all.
+  A queued write is treated as a promise to the user and persisted, so it
+  survives a restart rather than silently disappearing; a corrupt queue file
+  degrades to an empty tray and is left on disk for inspection rather than
+  overwritten. Resolved entries are pruned after 30 days
+  (`GHOSTLINK_APPROVAL_MAX_AGE_DAYS`); pending entries are never pruned at any
+  age. Tool reachability is checked *before* the gate, so an action queued
+  against a disconnected server cannot exist — it would be unactionable.
+
 ## Threats and Risks
 
 - Discovery spoofing or replay on untrusted LAN segments.

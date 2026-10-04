@@ -1681,6 +1681,12 @@ struct BackendState {
     /// would need an append-only file, which is a bigger step than this
     /// first real version takes.
     audit_log: std::collections::VecDeque<audit_log::AuditLogEntry>,
+    /// Recent assistant-turn trace events, oldest first. Bounded like the audit
+    /// feed: an observability tail, not a history. The durable record is the
+    /// audit log, which every trace is also appended to via `record_trace`.
+    /// Bounded because an unbounded per-turn vector in `BackendState` is a slow
+    /// memory leak on a long-lived server.
+    trace_events: std::collections::VecDeque<trace::TraceEvent>,
     /// The live RBAC key store — every `auth_middleware` check and the new
     /// `/api/security/keys` admin endpoints read/write this. Loaded once at
     /// startup via `load_api_keys()` (which handles the bootstrap migration
@@ -1749,6 +1755,128 @@ fn record_audit_event(
     // failure is warned, not propagated, matching every other persistence
     // function in this codebase.
     audit_log::append_durable(&entry);
+}
+
+/// Records a trace event on the in-memory tail and the durable audit trail.
+///
+/// One call so a trace can't end up on one and not the other: the tail feeds the
+/// GUI, the audit log is what survives a restart. The audit entry's `detail` is
+/// the event's own fixed-field rendering, so no caller-supplied string is ever
+/// passed through to the log.
+fn record_trace(backend: &mut BackendState, event: trace::TraceEvent) {
+    let detail = event.to_detail();
+    tracing::debug!(target: "assistant_trace", "{detail}");
+    backend.trace_events.push_back(event);
+    while backend.trace_events.len() > TRACE_MAX_EVENTS {
+        backend.trace_events.pop_front();
+    }
+    let entry = audit_log::AuditLogEntry {
+        event: "trace".to_string(),
+        status: "RECORDED".to_string(),
+        ip: "local".to_string(),
+        time: chrono::Utc::now().to_rfc3339(),
+        detail: Some(detail),
+    };
+    audit_log::push_audit_entry(&mut backend.audit_log, entry.clone());
+    audit_log::append_durable(&entry);
+}
+
+/// Cap on the in-memory trace tail.
+const TRACE_MAX_EVENTS: usize = 500;
+
+/// Records the outcome of a tool dispatch on the `assistant_trace` log target.
+///
+/// Structured logging rather than a durable audit entry, because
+/// `invoke_mcp_tool` runs inside the engine loops, which don't hold a
+/// `BackendState`. The durable record of a gated call is written by the approval
+/// handler that resolves it; this line is the immediate signal, and it carries
+/// tool, class, decision, and latency -- never the tool's arguments or result.
+fn record_tool_trace(
+    tool_name: &str,
+    server: &str,
+    workspace_id: &str,
+    decision: trace::TraceDecision,
+    started_at: std::time::Instant,
+) {
+    let class = capability::classify(server, tool_name);
+    tracing::info!(
+        target: "assistant_trace",
+        tool = tool_name,
+        server,
+        class = class.as_str(),
+        workspace = workspace_id,
+        decision = decision.as_str(),
+        latency_ms = started_at.elapsed().as_millis() as u64,
+        "tool call completed"
+    );
+}
+
+#[cfg(test)]
+mod scheduler_driver_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The driver must dispatch a due schedule through the injected executor and
+    /// record the result -- that wiring is what makes a schedule a real agent
+    /// turn rather than a row nobody acts on.
+    #[tokio::test]
+    async fn driver_dispatches_a_due_schedule_and_records_the_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(scheduler::ScheduleStore::open(dir.path().join("s.json")));
+        let due = store
+            .add(
+                "ws",
+                "n",
+                "do the thing",
+                scheduler::Trigger::At(scheduler::now_secs() - 5),
+            )
+            .unwrap();
+
+        let ran = Arc::new(AtomicUsize::new(0));
+        let exec_store = Arc::clone(&store);
+        let exec_ran = Arc::clone(&ran);
+
+        // One tick's worth of the loop body, not the loop itself: the loop is
+        // infinite by design, so the test drives the same two steps directly.
+        let now = scheduler::now_secs();
+        let due_schedules = store.due(now);
+        assert_eq!(due_schedules.len(), 1, "an overdue schedule must be due");
+
+        for schedule in due_schedules {
+            let (_status, read_only) = {
+                exec_ran.fetch_add(1, Ordering::SeqCst);
+                (scheduler::RunStatus::Ok, true)
+            };
+            exec_store.record_run(&schedule.workspace_id, &schedule.id, _status, read_only);
+        }
+
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+        let after = store.get("ws", &due.id).unwrap();
+        assert!(after.last_status.is_success());
+        assert!(after.last_run_was_read_only);
+        assert!(after.last_run.is_some());
+        // Having run, it must no longer be due.
+        assert!(store.due(scheduler::now_secs()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_due_schedule_does_not_fire_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = scheduler::ScheduleStore::open(dir.path().join("s.json"));
+        let s = store
+            .add(
+                "ws",
+                "n",
+                "p",
+                scheduler::Trigger::At(scheduler::now_secs() - 5),
+            )
+            .unwrap();
+        assert_eq!(store.due(scheduler::now_secs()).len(), 1);
+        store.record_run("ws", &s.id, scheduler::RunStatus::Ok, true);
+        // Second tick: nothing due, so a driver looping on a 1s floor is not
+        // re-firing the same schedule.
+        assert!(store.due(scheduler::now_secs()).is_empty());
+    }
 }
 
 /// Minimum role required to access a route. A method-based default
@@ -2507,6 +2635,41 @@ fn mcp_tools_to_openai_json(tools: &[mcp::McpToolSchema]) -> Vec<serde_json::Val
         .collect()
 }
 
+/// The workspace root every tool call, approval, and memory write is scoped to.
+///
+/// `GHOSTLINK_WORKSPACE_ROOT` if set, otherwise the launch directory. Defined at
+/// module scope rather than inside the API server so the tool-calling loop can
+/// reach it — the capability gate needs the same root the workspace file routes
+/// use, and two definitions would be free to drift.
+fn workspace_root() -> std::path::PathBuf {
+    std::env::var("GHOSTLINK_WORKSPACE_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+        })
+}
+
+/// The active workspace binding for a chat/tool call.
+///
+/// Derived from the configured root, so a single-node deployment behaves exactly
+/// as it did before workspace ids existed.
+fn active_workspace() -> workspace::WorkspaceId {
+    workspace::WorkspaceId::from_root(workspace_root())
+}
+
+/// Resolves the workspace a request is bound to.
+///
+/// A client-supplied id is honored but always paired with the server's
+/// configured root: the id selects *which* workspace's memories, RAG index, and
+/// grants apply, never a filesystem root chosen by the caller. Letting a request
+/// name its own root would hand it path traversal for free.
+fn resolve_request_workspace(requested: Option<&str>) -> workspace::WorkspaceId {
+    match requested {
+        Some(id) => workspace::WorkspaceId::explicit(id, workspace_root()),
+        None => active_workspace(),
+    }
+}
+
 /// Invokes a real MCP tool by name (matched against the caller's already
 /// slot-resolved `tools` catalog) and reports the outcome in the GUI's
 /// `ToolResult` shape — shared by every engine's tool-calling loop so
@@ -2523,28 +2686,148 @@ async fn invoke_mcp_tool(
         tools.iter().map(|t| (t.name.as_str(), t)).collect();
 
     match tool_map.get(tool_name) {
-        Some(schema) => match mcp_registry
-            .call_tool(&schema.server, tool_name, args)
-            .await
-        {
-            Some(outcome) if outcome.success => ToolResult {
-                tool: tool_name.to_string(),
-                result: outcome.result.to_string(),
-                success: true,
-            },
-            Some(outcome) => ToolResult {
-                tool: tool_name.to_string(),
-                result: outcome
-                    .error
-                    .unwrap_or_else(|| "tool call failed".to_string()),
-                success: false,
-            },
-            None => ToolResult {
-                tool: tool_name.to_string(),
-                result: "tool server is not connected".to_string(),
-                success: false,
-            },
-        },
+        Some(schema) => {
+            // Capability gate, enforced here in Rust before dispatch. A system
+            // prompt telling the model to be careful is not enforcement; this
+            // is. Unknown tools classify as Exec and are gated accordingly.
+
+            // Reachability is checked BEFORE the capability gate. A tool whose
+            // server isn't connected can never run, so queueing an approval for
+            // it would put an unactionable row in the user's tray — something the
+            // model would then report as "awaiting your approval" forever. This
+            // is an error, not a decision.
+            let connected = mcp_registry
+                .list_all_servers()
+                .await
+                .map(|servers| {
+                    servers
+                        .iter()
+                        .any(|s| s.name == schema.server && s.connected)
+                })
+                .unwrap_or(false);
+            if !connected {
+                return ToolResult {
+                    tool: tool_name.to_string(),
+                    result: format!("tool server '{}' is not connected", schema.server),
+                    success: false,
+                };
+            }
+
+            let ws = active_workspace();
+            let tool_started_at = std::time::Instant::now();
+            let decision = capability::decide(ws.id(), &schema.server, tool_name, None, ws.root());
+            if !decision.is_allowed() {
+                let capability::Decision::NeedsApproval { class, reason } = decision else {
+                    unreachable!("is_allowed() is false only for NeedsApproval")
+                };
+                record_tool_trace(
+                    tool_name,
+                    &schema.server,
+                    ws.id(),
+                    trace::TraceDecision::Blocked,
+                    tool_started_at,
+                );
+                // Not executed. With a queue available the call is recorded as a
+                // pending action and the model is handed a handle it can talk
+                // about, so the turn finishes normally instead of stalling on a
+                // confirmation round-trip. Without one (unit tests, the legacy
+                // blocking path) it falls back to reporting the refusal.
+                let action = active_approvals().enqueue(
+                    ws.id(),
+                    &active_turn_id(),
+                    &schema.server,
+                    tool_name,
+                    class,
+                    args,
+                );
+                // Queuing is itself an `execute_tool` outcome: the call reached
+                // the gate and stopped there, which is distinct from the
+                // `tool_approval` event written when a human resolves it.
+                let queued = trace::TraceEvent::execute_tool(
+                    tool_name,
+                    ws.id(),
+                    Some(class.as_str()),
+                    trace::TraceDecision::PendingApproval,
+                );
+                tracing::info!(
+                    target: "assistant_trace",
+                    approval_id = %action.id,
+                    trace = %queued,
+                    reason = reason,
+                    "gated tool call queued for approval"
+                );
+                // `success: true` with an explanatory body: the *call* was
+                // handled, and a non-success here would read to the model as a
+                // tool error worth retrying. The observation text is explicit
+                // that nothing ran, so a model that reads it correctly will not
+                // claim the action happened.
+                return ToolResult {
+                    tool: tool_name.to_string(),
+                    result: action.model_observation(),
+                    success: true,
+                };
+            }
+            tracing::debug!(
+                target: "assistant_trace",
+                tool = tool_name,
+                server = %schema.server,
+                workspace = ws.id(),
+                "tool call allowed"
+            );
+            let args = capability::stamp_workspace_scope(&schema.server, tool_name, args, ws.id());
+            match mcp_registry
+                .call_tool(&schema.server, tool_name, args)
+                .await
+            {
+                Some(outcome) if outcome.success => {
+                    // `outcome.result` is deliberately not part of the trace: a
+                    // tool's return value is exactly the kind of content that
+                    // must stay out of the durable trail.
+                    record_tool_trace(
+                        tool_name,
+                        &schema.server,
+                        ws.id(),
+                        trace::TraceDecision::Allowed,
+                        tool_started_at,
+                    );
+                    ToolResult {
+                        tool: tool_name.to_string(),
+                        result: outcome.result.to_string(),
+                        success: true,
+                    }
+                }
+                Some(outcome) => {
+                    record_tool_trace(
+                        tool_name,
+                        &schema.server,
+                        ws.id(),
+                        trace::TraceDecision::Failed,
+                        tool_started_at,
+                    );
+                    ToolResult {
+                        tool: tool_name.to_string(),
+                        result: outcome
+                            .error
+                            .unwrap_or_else(|| "tool call failed".to_string()),
+                        success: false,
+                    }
+                }
+                None => {
+                    record_tool_trace(
+                        tool_name,
+                        &schema.server,
+                        ws.id(),
+                        trace::TraceDecision::Failed,
+                        tool_started_at,
+                    );
+                    ToolResult {
+                        tool: tool_name.to_string(),
+                        result: "tool server is not connected".to_string(),
+                        success: false,
+                    }
+                }
+            }
+        }
         None => ToolResult {
             tool: tool_name.to_string(),
             result: format!("unknown tool '{tool_name}'"),
@@ -2635,33 +2918,92 @@ async fn native_tool_loop_core(
     history: &[(String, String)],
     mut scratchpad: String,
     mut tool_results: Vec<ToolResult>,
-    mut iterations_left: usize,
+    iterations_left: usize,
 ) -> NativeLoopStep {
     let tool_map: std::collections::HashMap<&str, &mcp::McpToolSchema> =
         tools.iter().map(|t| (t.name.as_str(), t)).collect();
 
-    while iterations_left > 0 {
-        iterations_left -= 1;
+    // Phase 4: the bare `iterations_left` becomes a three-limit budget tracker.
+    // `iterations_left` (resumed turns pass a remainder) still seeds max_steps,
+    // so a paused-and-resumed turn keeps its original step ceiling instead of
+    // silently getting a fresh full budget.
+    let mut budget = agent::BudgetTracker::new(agent::Budget::new(
+        iterations_left.max(1),
+        agent::Budget::default().max_tool_calls,
+        agent::Budget::from_env().max_tokens,
+    ));
+
+    while budget.begin_step() {
         let prompt = format!("{tool_instructions}Question: {user_message}\n{scratchpad}");
 
-        let gen = match native_engine_client
-            .generate(
-                model,
-                &prompt,
-                exec_tokens,
-                temp,
-                top_p,
-                top_k,
-                penalty,
-                native_engine,
-                history,
-                None,
-                None,
-                false,
-                None,
-            )
-            .await
-        {
+        // Wall-clock backstop for the whole turn. The engine layers already have
+        // their own connect and first-token timeouts; this bounds the *composite*
+        // of several steps, which those cannot see.
+        let gen_result = match agent::turn_timeout() {
+            Some(limit) => {
+                match tokio::time::timeout(
+                    limit,
+                    native_engine_client.generate(
+                        model,
+                        &prompt,
+                        exec_tokens,
+                        temp,
+                        top_p,
+                        top_k,
+                        penalty,
+                        native_engine,
+                        history,
+                        None,
+                        None,
+                        false,
+                        None,
+                    ),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        // Names the wall clock rather than reusing a budget
+                        // exhaustion message: the budget may well have room
+                        // left, and saying otherwise would misdirect whoever
+                        // raises the limit.
+                        return NativeLoopStep::Done(NativeToolLoopOutcome {
+                            text: format!(
+                                "\n\n(stopped: turn exceeded GHOSTLINK_AGENT_TURN_TIMEOUT_SECS after {} step(s) and {} tool call(s))",
+                                budget.steps_used(),
+                                budget.tool_calls_used()
+                            ),
+                            real_inference: false,
+                            tokens: None,
+                            tokens_per_sec: None,
+                            latency_ms: None,
+                            tool_results,
+                        });
+                    }
+                }
+            }
+            None => {
+                native_engine_client
+                    .generate(
+                        model,
+                        &prompt,
+                        exec_tokens,
+                        temp,
+                        top_p,
+                        top_k,
+                        penalty,
+                        native_engine,
+                        history,
+                        None,
+                        None,
+                        false,
+                        None,
+                    )
+                    .await
+            }
+        };
+
+        let gen = match gen_result {
             Ok(gen) => gen,
             Err(err) => {
                 return NativeLoopStep::Done(NativeToolLoopOutcome {
@@ -2680,6 +3022,7 @@ async fn native_tool_loop_core(
         let tokens = gen
             .tokens_generated
             .or_else(|| Some((gen.text.split_whitespace().count() as u32).max(1)));
+        budget.charge_tokens(tokens.unwrap_or(0));
 
         let Some(call) = mcp::toolcall::extract_tool_call(&gen.text) else {
             // Plain-text answer with no tool call - the model is done.
@@ -2708,7 +3051,11 @@ async fn native_tool_loop_core(
                     top_p,
                     top_k,
                     penalty,
-                    iterations_left,
+                    iterations_left: budget
+                        .budget()
+                        .max_steps
+                        .saturating_sub(budget.steps_used())
+                        .max(1),
                     tool: call.tool.clone(),
                     server: schema.server.clone(),
                     args: call.args.clone(),
@@ -2735,13 +3082,19 @@ async fn native_tool_loop_core(
         ));
     }
 
-    // MAX_TOOL_ITERATIONS exhausted without a plain-text final answer - surface
-    // whatever the model last said rather than looping forever.
+    // A budget ran out without a plain-text final answer - surface whatever the
+    // model last said rather than looping forever, and name the limit that
+    // actually stopped it (steps vs tool calls vs tokens).
+    let reason = agent::StopReason::classify_end(budget.stop_reason());
+    debug_assert!(
+        reason.is_exhausted(),
+        "reached the loop tail with no stop reason; the budget said it had room"
+    );
     NativeLoopStep::Done(NativeToolLoopOutcome {
         text: format!(
-            "{}\n\n(stopped after {} tool round-trips without a final answer)",
+            "{}\n\n{}",
             scratchpad.trim(),
-            mcp::toolcall::MAX_TOOL_ITERATIONS
+            agent::exhaustion_message(reason, &budget)
         ),
         real_inference: true,
         tokens: None,
@@ -2952,6 +3305,7 @@ fn parse_ollama_tool_call(call: &serde_json::Value) -> (String, serde_json::Valu
 /// silently skipping the gate for later calls in the same batch.
 async fn ollama_process_call_batch(
     mcp_registry: &mcp::McpRegistry,
+    budget: &mut agent::BudgetTracker,
     tools: &[mcp::McpToolSchema],
     calls: Vec<serde_json::Value>,
     messages: &mut Vec<ollama::ChatMessage>,
@@ -2959,6 +3313,19 @@ async fn ollama_process_call_batch(
 ) -> Option<(String, String, serde_json::Value, Vec<serde_json::Value>)> {
     let tool_map: std::collections::HashMap<&str, &mcp::McpToolSchema> =
         tools.iter().map(|t| (t.name.as_str(), t)).collect();
+
+    // Charge the whole batch up front: `charge_tool_calls` is all-or-nothing, so
+    // a batch that would overrun the budget is refused whole rather than having
+    // its tail silently dropped.
+    let batch_len = calls.len();
+    if !budget.charge_tool_calls(batch_len) {
+        return Some((
+            "(tool-call budget exhausted)".to_string(),
+            String::new(),
+            serde_json::Value::Null,
+            Vec::new(),
+        ));
+    }
 
     let mut iter = calls.into_iter();
     while let Some(call) = iter.next() {
@@ -2994,10 +3361,17 @@ async fn ollama_chat_loop_core(
     max_tokens: usize,
     mut messages: Vec<ollama::ChatMessage>,
     mut tool_results: Vec<ToolResult>,
-    mut iterations_left: usize,
+    iterations_left: usize,
 ) -> Result<OllamaLoopStep, String> {
-    while iterations_left > 0 {
-        iterations_left -= 1;
+    // Phase 4: same three-limit budget as the native loop. A resumed turn seeds
+    // max_steps from its remaining iterations so it can't reset its ceiling.
+    let mut budget = agent::BudgetTracker::new(agent::Budget::new(
+        iterations_left.max(1),
+        agent::Budget::default().max_tool_calls,
+        agent::Budget::from_env().max_tokens,
+    ));
+
+    while budget.begin_step() {
         let response = ollama_client
             .chat(
                 model,
@@ -3027,6 +3401,7 @@ async fn ollama_chat_loop_core(
 
         if let Some((tool, server, args, remaining_calls)) = ollama_process_call_batch(
             mcp_registry,
+            &mut budget,
             tools,
             requested_calls,
             &mut messages,
@@ -3150,6 +3525,14 @@ async fn resume_ollama_chat(
         unreachable!("resume_ollama_chat called with a non-Ollama PendingToolCall");
     };
 
+    // A resumed turn gets a fresh tracker seeded from the iteration budget it
+    // was paused with, so it can't exceed the original ceiling.
+    let mut budget = agent::BudgetTracker::new(agent::Budget::new(
+        iterations_left.max(1),
+        agent::Budget::default().max_tool_calls,
+        agent::Budget::from_env().max_tokens,
+    ));
+
     let outcome = if approve {
         invoke_mcp_tool(mcp_registry, &tools, &tool, args).await
     } else {
@@ -3168,6 +3551,7 @@ async fn resume_ollama_chat(
 
     if let Some((next_tool, next_server, next_args, next_remaining)) = ollama_process_call_batch(
         mcp_registry,
+        &mut budget,
         &tools,
         remaining_calls,
         &mut messages,
@@ -3237,6 +3621,7 @@ enum VllmLoopStep {
 /// batch hadn't been reached yet) the moment one needs approval.
 async fn vllm_process_call_batch(
     mcp_registry: &mcp::McpRegistry,
+    budget: &mut agent::BudgetTracker,
     tools: &[mcp::McpToolSchema],
     calls: Vec<vllm::VllmToolCall>,
     messages: &mut Vec<serde_json::Value>,
@@ -3250,6 +3635,17 @@ async fn vllm_process_call_batch(
 )> {
     let tool_map: std::collections::HashMap<&str, &mcp::McpToolSchema> =
         tools.iter().map(|t| (t.name.as_str(), t)).collect();
+
+    // Charged as a whole batch; see `ollama_process_call_batch`.
+    if !budget.charge_tool_calls(calls.len()) {
+        return Some((
+            "(tool-call budget exhausted)".to_string(),
+            String::new(),
+            serde_json::Value::Null,
+            None,
+            Vec::new(),
+        ));
+    }
 
     let mut iter = calls.into_iter();
     while let Some(call) = iter.next() {
@@ -3292,10 +3688,15 @@ async fn vllm_chat_loop_core(
     max_tokens: usize,
     mut messages: Vec<serde_json::Value>,
     mut tool_results: Vec<ToolResult>,
-    mut iterations_left: usize,
+    iterations_left: usize,
 ) -> Result<VllmLoopStep, String> {
-    while iterations_left > 0 {
-        iterations_left -= 1;
+    let mut budget = agent::BudgetTracker::new(agent::Budget::new(
+        iterations_left.max(1),
+        agent::Budget::default().max_tool_calls,
+        agent::Budget::from_env().max_tokens,
+    ));
+
+    while budget.begin_step() {
         let result = vllm_client
             .chat(
                 model,
@@ -3332,6 +3733,7 @@ async fn vllm_chat_loop_core(
 
         if let Some((tool, server, args, call_id, remaining_calls)) = vllm_process_call_batch(
             mcp_registry,
+            &mut budget,
             tools,
             result.tool_calls,
             &mut messages,
@@ -3450,6 +3852,14 @@ async fn resume_vllm_chat(
         unreachable!("resume_vllm_chat called with a non-Vllm PendingToolCall");
     };
 
+    // A resumed turn gets a fresh tracker seeded from the iteration budget it
+    // was paused with, so it can't exceed the original ceiling.
+    let mut budget = agent::BudgetTracker::new(agent::Budget::new(
+        iterations_left.max(1),
+        agent::Budget::default().max_tool_calls,
+        agent::Budget::from_env().max_tokens,
+    ));
+
     let outcome = if approve {
         invoke_mcp_tool(mcp_registry, &tools, &tool, args).await
     } else {
@@ -3469,6 +3879,7 @@ async fn resume_vllm_chat(
     if let Some((next_tool, next_server, next_args, next_call_id, next_remaining)) =
         vllm_process_call_batch(
             mcp_registry,
+            &mut budget,
             &tools,
             remaining_calls,
             &mut messages,
@@ -3566,6 +3977,268 @@ fn sessions_path() -> PathBuf {
     std::env::var("GHOSTLINK_SESSIONS_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("sessions.json"))
+}
+
+/// Prunes resolved approvals older than the configured age, at startup.
+///
+/// Pending actions are never pruned regardless of age (see
+/// `ApprovalStore::prune_resolved`) — an unanswered request is still a promise.
+/// Tunable because a busy single-node assistant can accumulate a lot of resolved
+/// rows; the default is 30 days.
+fn prune_stale_approvals_on_start() {
+    let days = std::env::var("GHOSTLINK_APPROVAL_MAX_AGE_DAYS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(30)
+        .clamp(1, 3650);
+    let removed = active_approvals().prune_resolved(days * 24 * 60 * 60);
+    if removed > 0 {
+        tracing::info!("pruned {removed} resolved approval(s) older than {days} day(s)");
+    }
+}
+
+/// Where the phase-5 schedule store is persisted.
+fn schedules_path() -> PathBuf {
+    std::env::var("GHOSTLINK_SCHEDULES_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("schedules.json"))
+}
+
+/// Runs one scheduled prompt as an ordinary agent turn.
+///
+/// Returns the outcome and whether every tool call it made was observational.
+/// The read-only flag is what lets a schedule auto-run: a schedule that has
+/// only ever read is safe to repeat unattended, while one that wrote or executed
+/// has its results land in the approval queue instead.
+async fn run_scheduled_turn(
+    state: Arc<std::sync::Mutex<BackendState>>,
+    schedule: scheduler::Schedule,
+) -> (scheduler::RunStatus, bool) {
+    let (native_client, mcp_registry) = {
+        let backend = lock_state(&state);
+        (
+            backend.native_engine_client.clone(),
+            Arc::clone(&backend.mcp_registry),
+        )
+    };
+
+    // A schedule is bound to its workspace. The capability gate reads
+    // `active_workspace()`, so the trace and approval records here are stamped
+    // with the schedule's own workspace rather than the server's ambient
+    // default -- otherwise a schedule scoped to workspace A would record its
+    // grants and its queued writes against workspace B.
+    let ws = workspace::WorkspaceId::explicit(&schedule.workspace_id, workspace_root());
+    let turn_label = format!("schedule:{}", schedule.id);
+    tracing::info!(
+        target: "assistant_trace",
+        schedule_id = %schedule.id,
+        workspace = ws.id(),
+        "running scheduled turn"
+    );
+    record_trace(
+        &mut lock_state(&state),
+        trace::TraceEvent::invoke_agent(&turn_label, ws.id()),
+    );
+    set_active_turn_id(&turn_label);
+
+    // No tools are offered to a scheduled turn in this pass: wiring the GUI's
+    // tool-slot selection into a headless run needs a saved per-schedule tool
+    // list, which the brief leaves open. The capability gate still applies to
+    // anything the turn reaches, so this narrows what a schedule can do, never
+    // widens it.
+    let step = run_native_tool_loop(
+        &native_client,
+        &mcp_registry,
+        "",
+        &schedule.prompt,
+        0,
+        0.0,
+        0.0,
+        0,
+        0.0,
+        "",
+        &[],
+        &[],
+    )
+    .await;
+
+    match step {
+        NativeLoopStep::Done(outcome) => {
+            let read_only = outcome.tool_results.iter().all(|r| {
+                // A queued approval is not a completed read: the action never
+                // ran, so the schedule is not read-only.
+                !r.result.contains("Approval required")
+            });
+            if outcome.tool_results.is_empty() {
+                (scheduler::RunStatus::Ok, true)
+            } else {
+                let queued_write = outcome
+                    .tool_results
+                    .iter()
+                    .any(|r| r.result.contains("Approval required"));
+                if queued_write {
+                    (
+                        scheduler::RunStatus::NeedsApproval(
+                            "a tool call is awaiting approval".to_string(),
+                        ),
+                        false,
+                    )
+                } else {
+                    (
+                        scheduler::RunStatus::Failed("tool loop did not finish".to_string()),
+                        read_only,
+                    )
+                }
+            }
+        }
+        NativeLoopStep::NeedsConfirmation(_) => (
+            scheduler::RunStatus::NeedsApproval("awaiting a tool approval".to_string()),
+            false,
+        ),
+    }
+}
+
+/// The scheduler's poll loop.
+///
+/// Sleeps until the next firing rather than polling on a fixed interval, so an
+/// idle server does no repeated work, then dispatches every due schedule.
+///
+/// The executor is injected rather than hard-wired: running a schedule means
+/// executing a full agent turn, which needs the engine clients and the MCP
+/// registry held by the API server's state. Passing a caller-supplied closure
+/// keeps the loop testable and avoids a second copy of the turn-running logic.
+async fn schedule_driver_loop<F, Fut>(store: Arc<scheduler::ScheduleStore>, execute: F)
+where
+    F: Fn(scheduler::Schedule) -> Fut + Send + Sync + 'static + Clone,
+    Fut: std::future::Future<Output = (scheduler::RunStatus, bool)> + Send,
+{
+    // A tick floor, so a schedule whose next firing is "now" doesn't spin the
+    // loop while a run is still in flight.
+    const MIN_TICK: Duration = Duration::from_secs(1);
+    // Upper bound, so a bad schedule can't park the loop indefinitely.
+    const MAX_TICK: Duration = Duration::from_secs(300);
+
+    loop {
+        let now = scheduler::now_secs();
+        let due = store.due(now);
+        for schedule in due {
+            let store_for_run = Arc::clone(&store);
+            let exec = execute.clone();
+            // Runs detached so one long schedule doesn't delay the others or the
+            // next tick. A failure inside is recorded, not propagated: the driver
+            // must survive a bad schedule.
+            tokio::spawn(async move {
+                let (status, read_only) = exec(schedule.clone()).await;
+                store_for_run.record_run(&schedule.workspace_id, &schedule.id, status, read_only);
+            });
+        }
+
+        let sleep = store
+            .next_wakeup(now)
+            .map(|t| (t - scheduler::now_secs()).max(0) as u64)
+            .map(|s| Duration::from_secs(s).clamp(MIN_TICK, MAX_TICK))
+            .unwrap_or(MAX_TICK);
+        tokio::time::sleep(sleep).await;
+    }
+}
+
+/// The active schedule store.
+static ACTIVE_SCHEDULES: OnceLock<Arc<scheduler::ScheduleStore>> = OnceLock::new();
+
+fn active_schedules() -> Arc<scheduler::ScheduleStore> {
+    ACTIVE_SCHEDULES
+        .get_or_init(|| Arc::new(scheduler::ScheduleStore::open(schedules_path())))
+        .clone()
+}
+
+/// Where the phase-3 approval queue is persisted.
+///
+/// Same convention as `sessions_path`: an env override, else a file in the
+/// launch directory. Kept beside the other JSON stores rather than in the memory
+/// server's SQLite file because the queue belongs to the server's own request
+/// path and must be readable even when no MCP server is connected.
+fn approvals_path() -> PathBuf {
+    std::env::var("GHOSTLINK_APPROVALS_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("approvals.json"))
+}
+
+/// Redirects the approval queue at a temp file for the duration of a test.
+///
+/// Without this, a test that reaches the capability gate writes real rows into
+/// the queue beside the binary — polluting a developer's actual tray and leaving
+/// an untracked `approvals.json` behind. Must be called before anything touches
+/// `active_approvals()`, because the store is memoized in a `OnceLock`.
+#[cfg(test)]
+fn use_temp_approvals_path(tag: &str) {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::set_var(
+        "GHOSTLINK_APPROVALS_PATH",
+        std::env::temp_dir().join(format!(
+            "ghostlink-test-approvals-{}-{}-{nanos}.json",
+            std::process::id(),
+            tag
+        )),
+    );
+}
+
+/// Skills loaded from `skills_dir()`, read once per process.
+///
+/// A `OnceLock` because a skill library is operator-authored configuration, not
+/// per-request state. Reload requires a restart; adding a hot-reload endpoint
+/// would mean deciding what happens to a turn already mid-skill, which is more
+/// machinery than this phase should take on.
+static ACTIVE_SKILLS: OnceLock<Arc<skills::SkillSet>> = OnceLock::new();
+
+fn active_skills() -> Arc<skills::SkillSet> {
+    ACTIVE_SKILLS
+        .get_or_init(|| {
+            let (set, skipped) = skills::SkillSet::load_from_dir(&skills::skills_dir());
+            if !set.is_empty() {
+                tracing::info!(
+                    "loaded {} skill(s) from {:?}",
+                    set.len(),
+                    skills::skills_dir()
+                );
+            }
+            if skipped > 0 {
+                tracing::warn!("skipped {skipped} malformed skill file(s)");
+            }
+            Arc::new(set)
+        })
+        .clone()
+}
+
+/// The chat turn currently being served, used to correlate queued approvals.
+///
+/// Set once at the top of `handle_gui_chat` and read by the tool gate. A
+/// `Mutex<String>` rather than a `OnceLock` because it genuinely varies per
+/// request; an empty value means "not in a chat turn" (tests, the OpenAI-compat
+/// path), and queued actions then carry an empty turn id rather than a wrong
+/// one.
+///
+/// This is process-global state, which is a real constraint: two concurrent chats
+/// can interleave. Correlation is display-only — workspace scoping and the
+/// approval itself do not depend on it — so a mislabel is cosmetic rather than a
+/// security or correctness failure.
+static ACTIVE_TURN_ID: OnceLock<std::sync::Mutex<String>> = OnceLock::new();
+
+fn active_turn_id() -> String {
+    ACTIVE_TURN_ID
+        .get_or_init(|| std::sync::Mutex::new(String::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+fn set_active_turn_id(id: &str) {
+    *ACTIVE_TURN_ID
+        .get_or_init(|| std::sync::Mutex::new(String::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = id.to_string();
 }
 
 fn load_persistent_sessions() -> Vec<SessionRecord> {
@@ -3894,12 +4567,64 @@ struct GuiChatRequest {
     /// sibling plain-generation path in `handle_gui_chat`.
     #[serde(default)]
     response_format: Option<serde_json::Value>,
+    /// Scopes this chat to a named workspace. Absent means "the configured
+    /// root", which is what every pre-existing client sends — the id is
+    /// additive, so no current deployment changes behavior.
+    #[serde(default)]
+    workspace_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScheduleCreateRequest {
+    name: Option<String>,
+    prompt: String,
+    /// `cron` with a 5-field expression, or `at` with a unix timestamp.
+    trigger_kind: String,
+    #[serde(default)]
+    trigger_value: String,
+    #[serde(default)]
+    workspace_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScheduleToggleRequest {
+    id: String,
+    enabled: bool,
+    #[serde(default)]
+    workspace_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScheduleIdRequest {
+    id: String,
+    #[serde(default)]
+    workspace_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApprovalDecisionRequest {
+    id: String,
+    /// `true` approves, `false` denies.
+    approve: bool,
+    /// Standing grant for the rest of the session. Refused for exec-class tools.
+    #[serde(default)]
+    approve_for_session: bool,
+    /// Replacement arguments for the `edited` status.
+    #[serde(default)]
+    edited_args: Option<serde_json::Value>,
+    /// Scopes the request; defaults to the active workspace.
+    #[serde(default)]
+    workspace_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ToolConfirmRequest {
     request_id: String,
     approve: bool,
+    /// Standing grant for this (workspace, tool) for the rest of the session.
+    /// Refused for exec-class tools — see `CapabilityClass::session_grant_allowed`.
+    #[serde(default)]
+    approve_for_session: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -7275,46 +8000,17 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
     /// in-browser editor.
     const MAX_WORKSPACE_FILE_BYTES: u64 = 5 * 1024 * 1024;
 
-    fn workspace_root() -> std::path::PathBuf {
-        std::env::var("GHOSTLINK_WORKSPACE_ROOT")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| {
-                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-            })
-    }
-
     /// Resolves a client-supplied relative path against the workspace root
-    /// and rejects anything that escapes it. Canonicalizing both sides and
-    /// checking the prefix is what actually catches `..` traversal and
-    /// symlink escapes — a naive string check on the raw path does not.
+    /// and rejects anything that escapes it.
+    ///
+    /// Delegates to `workspace::resolve_within` — the assistant layer's single
+    /// sandbox implementation — so the Editor tab's file routes and the tool
+    /// caller's path scoping can't drift into two different traversal checks.
     fn resolve_workspace_path(
         root: &std::path::Path,
         rel: &str,
     ) -> Result<std::path::PathBuf, String> {
-        let rel = rel.trim_start_matches(['/', '\\']);
-        let canon_root = root
-            .canonicalize()
-            .map_err(|e| format!("workspace root: {e}"))?;
-        if rel.is_empty() {
-            return Ok(canon_root);
-        }
-        let candidate = canon_root.join(rel);
-        let resolved = if candidate.exists() {
-            candidate.canonicalize().map_err(|e| e.to_string())?
-        } else {
-            // A not-yet-existing file (e.g. the target of a fresh write) can't
-            // be canonicalized itself — canonicalize its parent instead and
-            // reattach the file name, which still catches `..` in `rel`.
-            let parent = candidate.parent().ok_or("invalid path")?;
-            let canon_parent = parent
-                .canonicalize()
-                .map_err(|_| "parent directory does not exist".to_string())?;
-            canon_parent.join(candidate.file_name().ok_or("invalid path")?)
-        };
-        if !resolved.starts_with(&canon_root) {
-            return Err("path escapes workspace root".to_string());
-        }
-        Ok(resolved)
+        workspace::resolve_within(root, rel)
     }
 
     #[derive(serde::Serialize)]
@@ -7890,6 +8586,462 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             "inference_backend": inference,
             "native_engine": backend.settings.native_engine,
             "current_model": backend.current_model,
+        }))
+    }
+
+    /// Reports the capability class of every tool the connected MCP servers
+    /// advertise, plus the active workspace binding.
+    ///
+    /// Read-only. Lets the GUI show the boundary it is operating inside (and lets an
+    /// operator audit why a tool is gated) without inferring it from a blocked tool
+    /// result mid-conversation.
+    /// Returns recent assistant-turn trace events.
+    ///
+    /// Read-only and derived from the same capped in-memory feed the GUI's
+    /// Security tab already reads, so this exposes no more than the audit log
+    /// already does — it is a filter, not a new data source. Bulk history still
+    /// goes through the owner-gated audit-log export.
+    async fn handle_traces(
+        State(state): State<Arc<Mutex<BackendState>>>,
+        Query(params): Query<HashMap<String, String>>,
+    ) -> Json<serde_json::Value> {
+        let kind_filter = params
+            .get("kind")
+            .and_then(|k| trace::TraceEventKind::parse(k));
+        let backend = lock_state(&state);
+        let events: Vec<serde_json::Value> = backend
+            .trace_events
+            .iter()
+            .filter(|e| kind_filter.is_none_or(|k| e.kind == k))
+            .rev()
+            .take(500)
+            .map(|e| {
+                serde_json::json!({
+                    "kind": e.kind.as_str(),
+                    "label": e.label,
+                    "workspace_id": e.workspace_id,
+                    "class": e.capability_class,
+                    "decision": e.decision.map(|d| d.as_str()),
+                    "input_tokens": e.input_tokens,
+                    "output_tokens": e.output_tokens,
+                    "latency_ms": e.latency_ms,
+                })
+            })
+            .collect();
+        Json(serde_json::json!({ "events": events }))
+    }
+
+    /// Lists queued approvals for a workspace.
+    ///
+    /// Returns summaries only: `PendingAction::to_summary` has no `args` field,
+    /// so tool arguments cannot reach this endpoint even by accident. Fetch a
+    /// single action (with its arguments) only through the approve path, which
+    /// needs them to execute.
+    async fn handle_approvals_list(
+        Query(params): Query<HashMap<String, String>>,
+    ) -> Json<serde_json::Value> {
+        let workspace_id =
+            approvals::requested_workspace(params.get("workspace_id").map(|s| s.as_str()));
+        let status_filter = params
+            .get("status")
+            .and_then(|s| approvals::ApprovalStatus::parse(s));
+        // Default to pending-only: an operator opening the tray wants what needs
+        // them, not the whole history. `?all` or an explicit `?status=` widens it.
+        let mut actions = match status_filter {
+            Some(_) => active_approvals().list_all(&workspace_id),
+            None if params.contains_key("all") => active_approvals().list_all(&workspace_id),
+            None => active_approvals().list_pending(&workspace_id),
+        };
+        if let Some(status) = status_filter {
+            actions.retain(|a| a.status == status);
+        }
+        Json(serde_json::json!({
+            "workspace_id": workspace_id,
+            "approvals": actions.iter().map(|a| a.to_summary()).collect::<Vec<_>>(),
+        }))
+    }
+
+    /// Resolves a queued approval and, when approved, executes it.
+    ///
+    /// The class is re-derived server-side from the capability table rather than
+    /// read from the stored row, so a hand-edited queue file cannot promote a
+    /// tool to a weaker class. Exec-class actions never take a session grant.
+    async fn handle_approval_decide(
+        State(state): State<Arc<Mutex<BackendState>>>,
+        Json(req): Json<ApprovalDecisionRequest>,
+    ) -> Json<serde_json::Value> {
+        let workspace_id = approvals::requested_workspace(req.workspace_id.as_deref());
+        let store = active_approvals();
+
+        // Look up first so we can classify before deciding anything.
+        let Some(existing) = store
+            .list_all(&workspace_id)
+            .into_iter()
+            .find(|a| a.id == req.id)
+        else {
+            return Json(serde_json::json!({
+                "error": "no such approval in this workspace",
+            }));
+        };
+        if !existing.status.is_pending() {
+            return Json(serde_json::json!({
+                "error": "approval already resolved",
+                "status": existing.status.as_str(),
+            }));
+        }
+
+        let class = capability::classify(&existing.server, &existing.tool);
+        let tool_class = class.as_str();
+
+        if !req.approve {
+            let resolved = store
+                .resolve(
+                    &workspace_id,
+                    &req.id,
+                    approvals::ApprovalStatus::Denied,
+                    None,
+                )
+                .expect("action was just confirmed to exist");
+            record_trace(
+                &mut lock_state(&state),
+                trace::TraceEvent::tool_approval(
+                    &existing.tool,
+                    &workspace_id,
+                    Some(tool_class),
+                    trace::TraceDecision::Denied,
+                ),
+            );
+            record_audit_event(
+                &mut lock_state(&state),
+                "tool_approval",
+                "DENIED",
+                "local".to_string(),
+                Some(format!("{}[{}]", existing.tool, tool_class)),
+            );
+            return Json(serde_json::json!({
+                "status": resolved.status.as_str(),
+                "id": resolved.id,
+            }));
+        }
+
+        let session_granted = req.approve_for_session
+            && capability::grant_for_session(
+                &workspace_id,
+                &existing.server,
+                &existing.tool,
+                class,
+            );
+        let status = if req.edited_args.is_some() {
+            approvals::ApprovalStatus::Edited
+        } else if session_granted {
+            approvals::ApprovalStatus::ApprovedForSession
+        } else {
+            approvals::ApprovalStatus::Approved
+        };
+        let resolved = store
+            .resolve(&workspace_id, &req.id, status, req.edited_args.clone())
+            .expect("action was just confirmed to exist");
+
+        // Execute now, on the approved (possibly edited) arguments.
+        let registry = {
+            let backend = lock_state(&state);
+            Arc::clone(&backend.mcp_registry)
+        };
+        let args = capability::stamp_workspace_scope(
+            &resolved.server,
+            &resolved.tool,
+            resolved.args.clone(),
+            &workspace_id,
+        );
+        let outcome = registry
+            .call_tool(&resolved.server, &resolved.tool, args)
+            .await;
+        let (result_text, failed) = match outcome {
+            Some(o) if o.success => (o.result.to_string(), false),
+            Some(o) => (
+                o.error.unwrap_or_else(|| "tool call failed".to_string()),
+                true,
+            ),
+            None => ("tool server is not connected".to_string(), true),
+        };
+        store.record_result(&workspace_id, &resolved.id, result_text.clone(), failed);
+
+        let decision = if session_granted {
+            trace::TraceDecision::ApprovedForSession
+        } else if status == approvals::ApprovalStatus::Edited {
+            trace::TraceDecision::Edited
+        } else {
+            trace::TraceDecision::Approved
+        };
+        record_trace(
+            &mut lock_state(&state),
+            trace::TraceEvent::tool_approval(
+                &resolved.tool,
+                &workspace_id,
+                Some(tool_class),
+                decision,
+            ),
+        );
+        record_audit_event(
+            &mut lock_state(&state),
+            "tool_approval",
+            if failed {
+                "APPROVED_FAILED"
+            } else {
+                "APPROVED"
+            },
+            "local".to_string(),
+            Some(format!("{}[{}]", resolved.tool, tool_class)),
+        );
+
+        Json(serde_json::json!({
+            "status": resolved.status.as_str(),
+            "id": resolved.id,
+            "session_granted": session_granted,
+            "executed": true,
+            "success": !failed,
+            "result": result_text,
+        }))
+    }
+
+    /// Lists loadable skills: names, descriptions, and tool counts.
+    ///
+    /// Never returns the procedure body. A turn calls this to discover what
+    /// exists, then the active skill's instructions are injected only when the
+    /// model actually selects one — the same explicit-retrieval discipline the
+    /// memory catalog uses, so a large skill library doesn't sit in every prompt.
+    ///
+    /// `?skill=<name>` returns that one skill's instructions, which is the
+    /// deliberate exception: the caller asked for this specific procedure.
+    /// Lists schedules for a workspace: names, timing, status. No prompts.
+    async fn handle_schedules_list(
+        Query(params): Query<HashMap<String, String>>,
+    ) -> Json<serde_json::Value> {
+        let workspace_id =
+            scheduler::requested_workspace(params.get("workspace_id").map(|s| s.as_str()));
+        let schedules = active_schedules().list(&workspace_id);
+        let now = scheduler::now_secs();
+        Json(serde_json::json!({
+            "workspace_id": workspace_id,
+            "schedules": schedules
+                .iter()
+                .map(|s| {
+                    let mut summary = s.to_summary();
+                    summary.next_run = s.next_fire_after(now);
+                    let mut value =
+                        serde_json::to_value(&summary).unwrap_or(serde_json::Value::Null);
+                    // Human-facing extras alongside the machine fields.
+                    if let Some(obj) = value.as_object_mut() {
+                        obj.insert(
+                            "succeeded".to_string(),
+                            serde_json::Value::Bool(s.last_status.is_success()),
+                        );
+                        obj.insert(
+                            "last_run_display".to_string(),
+                            serde_json::Value::String(
+                                s.last_run
+                                    .map(scheduler::format_ts)
+                                    .unwrap_or_else(|| "never".to_string()),
+                            ),
+                        );
+                        obj.insert(
+                            "next_run_display".to_string(),
+                            serde_json::Value::String(
+                                summary
+                                    .next_run
+                                    .map(scheduler::format_ts)
+                                    .unwrap_or_else(|| "unscheduled".to_string()),
+                            ),
+                        );
+                    }
+                    value
+                })
+                .collect::<Vec<_>>(),
+        }))
+    }
+
+    /// Creates a schedule. An unparseable cron is rejected here, not at fire
+    /// time — a schedule that can never run should say so immediately.
+    async fn handle_schedules_create(
+        Json(req): Json<ScheduleCreateRequest>,
+    ) -> Json<serde_json::Value> {
+        let workspace_id = scheduler::requested_workspace(req.workspace_id.as_deref());
+        let trigger = match req.trigger_kind.as_str() {
+            "cron" => scheduler::Trigger::Cron(req.trigger_value.clone()),
+            "at" => match req.trigger_value.trim().parse::<i64>() {
+                Ok(ts) => scheduler::Trigger::At(ts),
+                Err(_) => {
+                    return Json(serde_json::json!({
+                        "error": "'at' trigger needs a unix timestamp in seconds",
+                    }))
+                }
+            },
+            other => {
+                return Json(serde_json::json!({
+                    "error": format!("unknown trigger kind '{other}'; expected 'cron' or 'at'"),
+                }))
+            }
+        };
+        match active_schedules().add(
+            &workspace_id,
+            req.name.as_deref().unwrap_or(""),
+            &req.prompt,
+            trigger,
+        ) {
+            Ok(s) => Json(serde_json::json!({ "schedule": s.to_summary() })),
+            Err(e) => Json(serde_json::json!({ "error": e })),
+        }
+    }
+
+    /// Returns one schedule including its prompt, for editing.
+    async fn handle_schedules_get(
+        Query(params): Query<HashMap<String, String>>,
+    ) -> Json<serde_json::Value> {
+        let workspace_id =
+            scheduler::requested_workspace(params.get("workspace_id").map(|s| s.as_str()));
+        let Some(id) = params.get("id") else {
+            return Json(serde_json::json!({ "error": "id is required" }));
+        };
+        match active_schedules().get(&workspace_id, id) {
+            Some(s) => Json(serde_json::json!({ "schedule": s })),
+            None => Json(serde_json::json!({ "error": "no such schedule in this workspace" })),
+        }
+    }
+
+    async fn handle_schedules_toggle(
+        Json(req): Json<ScheduleToggleRequest>,
+    ) -> Json<serde_json::Value> {
+        let workspace_id = scheduler::requested_workspace(req.workspace_id.as_deref());
+        if active_schedules().set_enabled(&workspace_id, &req.id, req.enabled) {
+            Json(serde_json::json!({ "success": true }))
+        } else {
+            Json(serde_json::json!({ "success": false, "error": "no such schedule" }))
+        }
+    }
+
+    async fn handle_schedules_delete(
+        Json(req): Json<ScheduleIdRequest>,
+    ) -> Json<serde_json::Value> {
+        let workspace_id = scheduler::requested_workspace(req.workspace_id.as_deref());
+        if active_schedules().remove(&workspace_id, &req.id) {
+            Json(serde_json::json!({ "success": true }))
+        } else {
+            Json(serde_json::json!({ "success": false, "error": "no such schedule" }))
+        }
+    }
+
+    /// Marks a schedule for firing on its next driver tick.
+    ///
+    /// Run-now doesn't execute the prompt inline: that would need the whole
+    /// engine stack wired through the API handler, and doing it in the driver
+    /// keeps one execution path (so a manual run and a scheduled run are
+    /// genuinely identical, and a read-only schedule's auto-run permission can't
+    /// diverge from a manual one).
+    async fn handle_schedules_run_now(
+        Json(req): Json<ScheduleIdRequest>,
+    ) -> Json<serde_json::Value> {
+        let workspace_id = scheduler::requested_workspace(req.workspace_id.as_deref());
+        let Some(schedule) = active_schedules().get(&workspace_id, &req.id) else {
+            return Json(serde_json::json!({ "success": false, "error": "no such schedule" }));
+        };
+        // Backdating `last_run` is what marks it due; the driver then runs it
+        // through the identical path a timer firing would take.
+        active_schedules().record_run(
+            &workspace_id,
+            &req.id,
+            scheduler::RunStatus::Pending,
+            schedule.last_run_was_read_only,
+        );
+        Json(serde_json::json!({
+            "success": true,
+            "queued": true,
+            "note": "queued for the next driver tick",
+        }))
+    }
+
+    async fn handle_skills(
+        Query(params): Query<HashMap<String, String>>,
+    ) -> Json<serde_json::Value> {
+        let set = active_skills();
+        if let Some(name) = params.get("skill") {
+            return match set.get(name) {
+                Some(skill) => Json(serde_json::json!({
+                    "name": skill.name,
+                    "description": skill.description,
+                    // Instructions are operator-authored procedures, not secrets,
+                    // and the caller explicitly asked for this one.
+                    "instructions": skill.instructions,
+                    "tools": skill.tools,
+                    "workspace_subdir": skill.workspace_subdir,
+                })),
+                None => Json(serde_json::json!({ "error": "no such skill" })),
+            };
+        }
+        Json(serde_json::json!({ "skills": set.catalog() }))
+    }
+
+    async fn handle_capabilities(
+        State(state): State<Arc<Mutex<BackendState>>>,
+    ) -> Json<serde_json::Value> {
+        let registry = {
+            let backend = lock_state(&state);
+            Arc::clone(&backend.mcp_registry)
+        };
+        let servers = match registry.list_all_servers().await {
+            Ok(servers) => servers,
+            Err(err) => return Json(serde_json::json!({ "tools": [], "error": err })),
+        };
+
+        let ws = active_workspace();
+        let mut classified = Vec::new();
+        // `(server, tool)` pairs, kept alongside the JSON so the skill
+        // narrowing below intersects against real names rather than a
+        // re-derivation that could drift from this loop.
+        let mut tool_pairs: Vec<(String, String)> = Vec::new();
+        for server in &servers {
+            // A server that isn't connected reports no tools; skipping it keeps the
+            // response to what is actually reachable right now.
+            if !server.connected {
+                continue;
+            }
+            for tool in registry.tool_schemas_for_server(&server.name).await {
+                let class = capability::classify_schema(&tool);
+                tool_pairs.push((tool.server.clone(), tool.name.clone()));
+                classified.push(serde_json::json!({
+                    "server": tool.server,
+                    "tool": tool.name,
+                    "class": class.as_str(),
+                    "requires_approval": class.requires_approval(),
+                    "session_grant_allowed": class.session_grant_allowed(),
+                    "session_granted": capability::has_session_grant(ws.id(), &tool.server, &tool.name),
+                }));
+            }
+        }
+
+        let set = active_skills();
+        let skill_entries: Vec<serde_json::Value> = set
+            .catalog()
+            .into_iter()
+            .map(|c| {
+                serde_json::json!({
+                    "name": c.name,
+                    "description": c.description,
+                    "tool_count": c.tool_count,
+                    // The narrowing result, so an operator can see what a skill
+                    // actually grants without reading the classification logic.
+                    // A skill listing `write_file` grants nothing: writes stay
+                    // behind the approval gate.
+                    "granted_tools": set.permitted_tools(&c.name, &tool_pairs),
+                    "cannot_widen_boundary": true,
+                })
+            })
+            .collect();
+
+        Json(serde_json::json!({
+            "workspace_id": ws.id(),
+            "workspace_source": ws.source().as_str(),
+            "tools": classified,
+            "skills": skill_entries,
         }))
     }
 
@@ -8547,6 +9699,14 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
     ) -> axum::response::Response {
         let started = Instant::now();
 
+        // Which workspace this turn's grants, memories, and RAG index resolve
+        // against. A client-supplied id selects the *scope*, never a filesystem
+        // root — the root stays server-configured (see `resolve_request_workspace`).
+        let chat_workspace = resolve_request_workspace(req.workspace_id.as_deref());
+        // Correlates any approval this turn queues. Set before any tool dispatch
+        // can happen.
+        set_active_turn_id(req.session_id.as_deref().unwrap_or("sess_local_001"));
+
         // Legacy chat "tool slot" names the GUI's tool checkboxes send (calculator,
         // file_operations, ...) - resolved against real MCP servers below, then
         // dispatched via whichever protocol the active engine actually speaks
@@ -8704,7 +9864,9 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         let exec_micro_batch = chat_exec_micro_batch();
         let request_tracker = active_runtime_switcher().request_tracker().clone();
         request_tracker.increment().await;
-
+        // Trace recorded *after* generation (below) rather than here, so it can
+        // carry real token counts and end-to-end latency instead of claiming
+        // STARTED and going silent if the turn errors out.
         let mut gen_tokens: Option<u32> = None;
         let mut gen_tps: Option<f32> = None;
         let mut gen_latency_ms: Option<f32> = None;
@@ -9328,6 +10490,17 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             },
         };
 
+        // Trace recorded *after* generation so it carries real token counts and
+        // end-to-end latency. Input count is `None` rather than a fabricated
+        // zero: the engines don't surface it today, and a wrong number in an
+        // observability feed is worse than an absent one.
+        record_trace(
+            &mut lock_state(&state),
+            trace::TraceEvent::chat(&chat_session_id, chat_workspace.id())
+                .with_tokens(None, gen_tokens)
+                .with_latency(started.elapsed()),
+        );
+
         {
             let mut available_flag = ollama_available.lock().await;
             *available_flag = real_inference;
@@ -9572,12 +10745,50 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             PendingToolCall::Ollama { tool, server, .. } => (tool.clone(), server.clone()),
             PendingToolCall::Vllm { tool, server, .. } => (tool.clone(), server.clone()),
         };
+        // Classified from the Rust-side table, never from the request: the
+        // caller can't assert a class to obtain a broader grant. Recorded on the
+        // audit trail because a session grant outlives the turn that made it.
+        let tool_class = capability::classify(&server_name, &tool_name);
+        let ws = active_workspace();
+        let session_granted = req.approve
+            && req.approve_for_session
+            && capability::grant_for_session(ws.id(), &server_name, &tool_name, tool_class);
+
+        // A standing grant is recorded as its own decision value so a later
+        // audit can tell "approved once" from "approved for the rest of the
+        // session" without parsing the detail text.
+        let approval_decision = if !req.approve {
+            trace::TraceDecision::Denied
+        } else if session_granted {
+            trace::TraceDecision::ApprovedForSession
+        } else {
+            trace::TraceDecision::Approved
+        };
+        record_trace(
+            &mut lock_state(&state),
+            trace::TraceEvent::tool_approval(
+                &tool_name,
+                ws.id(),
+                Some(tool_class.as_str()),
+                approval_decision,
+            )
+            .with_latency(std::time::Duration::ZERO),
+        );
+
         record_audit_event(
             &mut lock_state(&state),
             "tool_confirm",
             if req.approve { "APPROVED" } else { "DENIED" },
             addr.ip().to_string(),
-            Some(format!("{tool_name} @ {server_name}")),
+            Some(format!(
+                "{tool_name} @ {server_name} [class={}]{}",
+                tool_class.as_str(),
+                if session_granted {
+                    " session_granted"
+                } else {
+                    ""
+                }
+            )),
         );
 
         let mut tool_results: Vec<ToolResult> = Vec::new();
@@ -10442,6 +11653,10 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         .map(|m| m.name.clone())
         .unwrap_or_else(|| "none".to_string());
 
+    // Sweep resolved approvals once at startup. Pending rows are never
+    // pruned -- an unanswered request is still a promise.
+    prune_stale_approvals_on_start();
+
     let state = Arc::new(Mutex::new(BackendState {
         models,
         current_model: initial_model.clone(),
@@ -10482,6 +11697,7 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         plugin_registry: backend_plugin::BackendPluginRegistry::from_env(),
         enable_tls_active: use_tls,
         audit_log: std::collections::VecDeque::new(),
+        trace_events: std::collections::VecDeque::new(),
         api_keys,
         models_scan_cache: ApiResponseCache::new(),
         session_summaries: HashMap::new(),
@@ -10490,7 +11706,29 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
     // Background CPU/RAM/GPU sampler — keeps /api/metrics non-blocking.
     host_metrics::ensure_host_sampler();
 
+    // Built here, spawned inside `rt.block_on` below: `tokio::spawn` panics with
+    // "there is no reactor running" if called before the runtime is entered, and
+    // this function constructs the runtime itself. The CI backend smoke test
+    // caught that the hard way.
+    let scheduler_state = Arc::clone(&state);
+
     rt.block_on(async {
+        // The scheduler driver. Each run is a real agent turn through the native
+        // path, so a scheduled run gets the same capability gate, approval
+        // queue, and workspace scoping as interactive chat -- a schedule is not
+        // a privileged route.
+        {
+            let exec_state = Arc::clone(&scheduler_state);
+            let schedules = active_schedules();
+            tokio::spawn(async move {
+                schedule_driver_loop(schedules, move |schedule| {
+                    let state = Arc::clone(&exec_state);
+                    async move { run_scheduled_turn(state, schedule).await }
+                })
+                .await;
+            });
+        }
+
         // Connects every enabled server in mcp_servers.toml (spawning stdio
         // child processes, some of which pull an npx package on first run) —
         // done in the background so a slow/misconfigured server can't delay
@@ -10668,6 +11906,29 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             .route(
                 "/api/inference/chat/tool-confirm",
                 post(handle_tool_confirm),
+            )
+            .route("/api/inference/capabilities", get(handle_capabilities))
+            .route("/api/inference/traces", get(handle_traces))
+            .route("/api/inference/skills", get(handle_skills))
+            .route("/api/inference/schedules", get(handle_schedules_list))
+            .route("/api/inference/schedules", post(handle_schedules_create))
+            .route("/api/inference/schedules/get", get(handle_schedules_get))
+            .route(
+                "/api/inference/schedules/toggle",
+                post(handle_schedules_toggle),
+            )
+            .route(
+                "/api/inference/schedules/delete",
+                post(handle_schedules_delete),
+            )
+            .route(
+                "/api/inference/schedules/run-now",
+                post(handle_schedules_run_now),
+            )
+            .route("/api/inference/approvals", get(handle_approvals_list))
+            .route(
+                "/api/inference/approvals/:id/decide",
+                post(handle_approval_decide),
             )
             .route("/api/inference/engines", get(handle_inference_engines))
             .route(
@@ -12793,12 +14054,15 @@ fn run_gui_preflight_checks() -> Result<()> {
     Ok(())
 }
 
+mod agent;
+mod approvals;
 mod audit_log;
 mod auth;
 mod backend_api;
 mod backend_config;
 mod backend_plugin;
 mod backend_registry;
+mod capability;
 mod host_metrics;
 mod inference_engine;
 mod mcp;
@@ -12808,8 +14072,30 @@ mod otel;
 mod rpc_cluster;
 mod runtime;
 mod runtime_switcher;
+mod scheduler;
+mod skills;
 mod tls;
+mod trace;
 mod vllm;
+mod workspace;
+
+/// The process-wide approval queue.
+///
+/// A `OnceLock` rather than a threaded parameter for the same reason
+/// `ACTIVE_BACKEND_REGISTRY` and `ACTIVE_RUNTIME_SWITCHER` already exist: the
+/// queue is process state, and reaching it from the five engine-loop functions
+/// that dispatch tools would mean adding a parameter to each. Those loops sit
+/// several call layers below the request handler that owns `BackendState`, and
+/// `turn_id` in particular is per-call, so the turn id stays an explicit
+/// parameter while the store itself is ambient.
+static ACTIVE_APPROVALS: OnceLock<Arc<approvals::ApprovalStore>> = OnceLock::new();
+
+/// Returns the active approval queue, initializing it on first use.
+fn active_approvals() -> Arc<approvals::ApprovalStore> {
+    ACTIVE_APPROVALS
+        .get_or_init(|| Arc::new(approvals::ApprovalStore::open(approvals_path())))
+        .clone()
+}
 
 static ACTIVE_BACKEND_REGISTRY: OnceLock<Arc<backend_registry::BackendRegistry>> = OnceLock::new();
 static ACTIVE_RUNTIME_SWITCHER: OnceLock<runtime_switcher::RuntimeSwitcher> = OnceLock::new();
@@ -13073,6 +14359,7 @@ mod tests {
             enable_tls_active: false,
             plugin_registry: backend_plugin::BackendPluginRegistry::from_env(),
             audit_log: std::collections::VecDeque::new(),
+            trace_events: std::collections::VecDeque::new(),
             api_keys: vec![auth::create_key("test-admin".to_string(), auth::Role::Owner).0],
             models_scan_cache: ApiResponseCache::new(),
             session_summaries: HashMap::new(),
@@ -13974,11 +15261,28 @@ mod tests {
             });
         }
 
+        // Must precede any queue use: `active_approvals()` memoizes its path in a
+        // OnceLock, so redirecting afterwards would still write to the real file.
+        use_temp_approvals_path("hashmap");
+
         let config_path = std::env::temp_dir().join("ghostlink-test-mcp-servers-hashmap-test.toml");
         let registry = mcp::McpRegistry::new(mcp::McpConfigManager::new(config_path));
         let outcome = invoke_mcp_tool(&registry, &tools, "tool-42", json!({})).await;
         assert_eq!(outcome.tool, "tool-42");
+        // A disconnected server must fail rather than queue an approval the user
+        // can never act on. Regression test: the capability gate used to run
+        // first and queue one, which the model then reported as "awaiting your
+        // approval" indefinitely.
         assert!(!outcome.success);
+        // The error text is the observable signal. Asserting the approval queue
+        // is empty here would be wrong: it is process-global and shared with
+        // every other test that queues an action, so emptiness is not this
+        // test's to claim.
+        assert!(
+            outcome.result.contains("not connected"),
+            "unreachable tool must report an error, got: {}",
+            outcome.result
+        );
 
         let calls = vec![
             json!({
@@ -13996,9 +15300,16 @@ mod tests {
         ];
         let mut messages = Vec::new();
         let mut tool_results = Vec::new();
-        let pending =
-            ollama_process_call_batch(&registry, &tools, calls, &mut messages, &mut tool_results)
-                .await;
+        let mut scratch = agent::BudgetTracker::new(agent::Budget::default());
+        let pending = ollama_process_call_batch(
+            &registry,
+            &mut scratch,
+            &tools,
+            calls,
+            &mut messages,
+            &mut tool_results,
+        )
+        .await;
 
         assert!(pending.is_none());
         assert_eq!(messages.len(), 2);
