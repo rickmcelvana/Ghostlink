@@ -10114,18 +10114,11 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         // file_operations, ...) - resolved against real MCP servers below, then
         // dispatched via whichever protocol the active engine actually speaks
         // (native TOOL_CALL: prompt shim, Ollama/vLLM's own OpenAI-style tools).
-        let enabled_tool_slots: Vec<String> = req
-            .mcp
-            .as_ref()
-            .and_then(|mcp| mcp.get("tools"))
-            .and_then(|t| t.as_array())
-            .map(|tools| {
-                tools
-                    .iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
+        //
+        // Whether the client named any tool slots. Absent means "server decides"
+        // -- see `toolselect` for why that default is the read-only set and why an
+        // explicit empty list is still honored as "none".
+        let tool_selection = toolselect::selection_from_request(req.mcp.as_ref());
 
         let (
             current_model,
@@ -10194,10 +10187,52 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         // callers pausing via PendingToolCall), not by hiding the tool from
         // the model entirely.
         let mut enabled_tools: Vec<mcp::McpToolSchema> = Vec::new();
+        // Resolve the slot list. When the client did not specify one, the server
+        // supplies the read-only default (see `toolselect`): previously an absent
+        // `mcp.tools` silently produced a toolless assistant, so a scheduled turn
+        // or any non-GUI client could not act and the model would improvise a
+        // claim that it had.
+        //
+        // The default is computed from what is actually connected *and* how each
+        // tool classifies right now, so an unreachable server contributes nothing
+        // and a slot carrying any Write or Exec tool is excluded whole.
+        let connected_slots: Vec<(String, Vec<(String, capability::CapabilityClass)>)> = {
+            let mut out: Vec<(String, Vec<(String, capability::CapabilityClass)>)> = Vec::new();
+            for server in mcp_registry.list_all_servers().await.unwrap_or_default() {
+                if !server.connected {
+                    continue;
+                }
+                // `slot` is a plain String on the server record, not an Option --
+                // an unslotted server resolves to an empty string.
+                let slot = server.slot.clone();
+                if slot.is_empty() {
+                    continue;
+                }
+                let classified = mcp_registry
+                    .tool_schemas_for_server(&server.name)
+                    .await
+                    .into_iter()
+                    .map(|t| (t.name.clone(), capability::classify(&server.name, &t.name)))
+                    .collect();
+                out.push((slot, classified));
+            }
+            out
+        };
+        let enabled_tool_slots = toolselect::resolve_slots(&tool_selection, &connected_slots);
         for slot in &enabled_tool_slots {
             if let Some(server_name) = mcp_registry.server_for_slot(slot).await {
                 enabled_tools.extend(mcp_registry.tool_schemas_for_server(&server_name).await);
             }
+        }
+        if matches!(tool_selection, toolselect::ToolSelection::Unspecified)
+            && !enabled_tool_slots.is_empty()
+        {
+            tracing::debug!(
+                target: "assistant_trace",
+                slots = %enabled_tool_slots.join(","),
+                tools = enabled_tools.len(),
+                "client sent no tool list; using the read-only server default"
+            );
         }
 
         let token_estimate = req.message.split_whitespace().count().clamp(1, 1024);
@@ -14627,6 +14662,7 @@ mod runtime_switcher;
 mod scheduler;
 mod skills;
 mod tls;
+mod toolselect;
 mod trace;
 mod vllm;
 mod workspace;

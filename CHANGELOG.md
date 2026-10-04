@@ -6,6 +6,29 @@ All notable changes to Ghostlink Studio are documented here.
 
 ## [Unreleased]
 
+### Changed
+- **A chat request that names no tools now gets the server's read-only default** (`crates/ghost-link/src/toolselect.rs`):
+  `req.mcp.tools` was the only source of enabled tool slots and defaulted to empty, so any client that omitted it received an assistant with **no tools at all** — silently, and with nothing in the response to indicate it. Scheduled turns and non-GUI clients hit this permanently; the GUI happens to send its checkbox list, which is why it went unnoticed.
+
+  Now:
+
+  | request | meaning |
+  |---|---|
+  | `mcp.tools` absent | server default: every connected slot with at least one `Read` tool |
+  | `mcp.tools: []` | explicitly none — honored as sent |
+  | `mcp.tools: [...]` | exactly those slots |
+
+  The absent/empty distinction is deliberate. A client sending `[]` has decided it wants no tools, and overriding that would be the same class of bug in the opposite direction. A malformed `tools` value is treated as unspecified rather than as "none", so a client bug cannot silently disarm the assistant.
+
+  **Visibility, not permission.** The default widens what the model can *see*, never what it can *do*: `capability::decide` still runs per call, so `memory_remember` routes through vetted auto-apply and `memory_forget` and the Docker gateway tools still require approval.
+
+  A slot qualifies when it offers *any* read. The first implementation excluded slots containing a `Write` entirely, on the reasoning that partial availability is confusing — but that excluded `memory` and `rag`, whose servers each mix reads with writes, leaving the default offering exactly one slot while four servers were connected. "Use the default" then quietly meant "you get almost nothing", which is the silent-disablement this change exists to remove. An `Exec`-only slot still never qualifies.
+
+  Measured live on this machine: default went from 1 slot / 1 tool to **4 slots / 21 tools**, and a request with no `mcp.tools` had the model call `rag.search` and `memory_search` on its own — impossible before.
+
+  11 new tests, including that `memory_forget` and `docker-mcp-gateway/mcp-exec` still require approval under the default, and that the default derives from the live `classify` rather than a hand-maintained list.
+
+
 ### Fixed
 - **The assistant no longer reports actions it never performed** (`crates/ghost-link/src/grounding.rs`, wired into the buffered and streaming chat paths):
 
