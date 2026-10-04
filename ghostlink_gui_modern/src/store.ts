@@ -201,7 +201,14 @@ export interface ChatMessage {
   toolCalls?: ToolCallTrace[];
   pendingToolCall?: PendingToolCall;
   compareGroupId?: string;
+  /** The server dropped older turns from *this* reply's context to fit the token
+   *  limit, so the gap sits immediately above this message. */
   truncatedBefore?: boolean;
+  /** This reply was produced while the session had a running summary of turns
+   *  trimmed in *earlier* requests -- the model is working from condensed memory
+   *  rather than the full transcript. Distinct from `truncatedBefore`, which
+   *  describes trimming that happened on this turn. */
+  summarizedHistory?: boolean;
   isDivider?: boolean;
   taskId?: string;
   agentRootPath?: string;

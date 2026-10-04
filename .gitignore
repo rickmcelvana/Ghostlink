@@ -167,3 +167,4 @@ ghostlink_gui_modern/FIX_401_ERROR.md
 test_curl_cleaned.js
 # SQLite WAL sidecars for the memory store.
 ghostlink_memory.db-*
+session_summaries.json
