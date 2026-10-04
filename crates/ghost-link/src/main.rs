@@ -1841,6 +1841,99 @@ mod scheduler_driver_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// Regression test for the wakeup nudge.
+    ///
+    /// Without it the driver sleeps `MAX_TICK` (300s) whenever nothing is due, so
+    /// a schedule created just after a tick goes unnoticed for five minutes. That
+    /// was not theoretical: a live `at` schedule took over four minutes to fire,
+    /// and the driver's own log showed a single tick with `sleep_ms=300000`
+    /// followed by nothing. A cron entry set for 09:00 could fire materially late
+    /// for the same reason.
+    ///
+    /// The driver here has no schedules at all when it starts, so its first sleep
+    /// is the full `MAX_TICK`. The nudge must cut that short.
+    #[tokio::test]
+    async fn a_nudge_wakes_a_driver_that_has_nothing_due() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(scheduler::ScheduleStore::open(dir.path().join("s.json")));
+        assert!(
+            store.due(scheduler::now_secs()).is_empty(),
+            "precondition: the store starts empty, so the driver would sleep MAX_TICK"
+        );
+
+        let ran = Arc::new(AtomicUsize::new(0));
+        let exec_store = Arc::clone(&store);
+        let exec_ran = Arc::clone(&ran);
+        let driver_store = Arc::clone(&store);
+        let driver = tokio::spawn(schedule_driver_loop(driver_store, move |_s| {
+            let ran = Arc::clone(&exec_ran);
+            let store = Arc::clone(&exec_store);
+            async move {
+                ran.fetch_add(1, Ordering::SeqCst);
+                store.record_run("ws", "x", scheduler::RunStatus::Ok, true);
+                (scheduler::RunStatus::Ok, true)
+            }
+        }));
+
+        // Let the driver reach its (long) sleep.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "nothing is due, so nothing should have run yet"
+        );
+
+        // Now do what the create route does: add a due schedule and nudge.
+        let sched = store
+            .add(
+                "ws",
+                "n",
+                "do it",
+                scheduler::Trigger::At(scheduler::now_secs() - 1),
+            )
+            .unwrap();
+        nudge_schedule_driver();
+
+        // Well under MAX_TICK: if this only passes because 300s elapsed, the test
+        // would have timed out instead.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            1,
+            "the nudge should have woken the driver and dispatched the schedule"
+        );
+        assert!(store.get("ws", &sched.id).is_some());
+
+        driver.abort();
+    }
+
+    /// A nudge with nothing to run must not crash or spin the driver.
+    #[tokio::test]
+    async fn a_nudge_with_no_due_schedule_is_harmless() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(scheduler::ScheduleStore::open(dir.path().join("s.json")));
+        let ran = Arc::new(AtomicUsize::new(0));
+        let exec_ran = Arc::clone(&ran);
+        let driver = tokio::spawn(schedule_driver_loop(store, move |_s| {
+            let ran = Arc::clone(&exec_ran);
+            async move {
+                ran.fetch_add(1, Ordering::SeqCst);
+                (scheduler::RunStatus::Ok, true)
+            }
+        }));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        for _ in 0..5 {
+            nudge_schedule_driver();
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "an empty store has nothing to run, however often it is nudged"
+        );
+        driver.abort();
+    }
+
     /// The driver must dispatch a due schedule through the injected executor and
     /// record the result -- that wiring is what makes a schedule a real agent
     /// turn rather than a row nobody acts on.
@@ -2682,6 +2775,133 @@ fn active_workspace() -> workspace::WorkspaceId {
     workspace::WorkspaceId::from_root(workspace_root())
 }
 
+/// Runs proactive recall for a turn and returns the assembled system block.
+///
+/// Best-effort by construction: a retriever that is disabled, disconnected, slow
+/// or failing yields `None` and the turn proceeds. Retrieval must never be able
+/// to fail a request -- the worst outcome is that the assistant forgets, which is
+/// exactly where it started.
+///
+/// Read-only. Calls only `memory_search` and `rag.search`, the two `Read`-class
+/// tools, so no approval is involved and nothing is persisted by this path. The
+/// workspace id is stamped from the request, never taken from the model.
+async fn recall_for_turn(
+    registry: &mcp::McpRegistry,
+    query: &str,
+    workspace_id: &str,
+) -> (Option<String>, recall::RecallOutcome) {
+    // A query too short to rank against is not worth two round trips.
+    let query = query.trim();
+    if query.chars().count() < 8 {
+        return (None, recall::RecallOutcome::default());
+    }
+
+    let memory_fut = async {
+        let args = capability::stamp_workspace_scope(
+            "memory",
+            "memory_search",
+            recall::memory_search_args(query, workspace_id, recall::TOP_K),
+            workspace_id,
+        );
+        registry.call_tool("memory", "memory_search", args).await
+    };
+    let rag_fut = async {
+        let args = recall::rag_search_args(query, recall::TOP_K);
+        registry.call_tool("rag", "search", args).await
+    };
+
+    // Bound the whole recall: two sequential MCP subprocess round trips on the hot
+    // path of a chat turn would be felt as TTFT. Best-effort means we also drop a
+    // slow retriever entirely rather than making the user wait for it.
+    let (memory_outcome, rag_outcome) = match tokio::time::timeout(
+        Duration::from_secs(RECALL_TIMEOUT_SECS),
+        futures::future::join(memory_fut, rag_fut),
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(_) => {
+            tracing::debug!(
+                target: "assistant_trace",
+                timeout_secs = RECALL_TIMEOUT_SECS,
+                "proactive recall timed out; continuing without it"
+            );
+            let outcome = recall::RecallOutcome {
+                retriever_failed: true,
+                ..Default::default()
+            };
+            return (None, outcome);
+        }
+    };
+
+    let memory_json = memory_outcome.map(|o| o.result);
+    let rag_json = rag_outcome.map(|o| o.result);
+
+    // `ToolCallOutcome.result` may be a string or structured JSON depending on the
+    // server, so hand both to the parser as-is; it ignores anything unrecognised.
+    let (block, outcome) = recall::build_recall_block(memory_json.as_ref(), rag_json.as_ref());
+
+    if outcome.any() {
+        // Counts only -- never the recalled text, which may contain user content.
+        tracing::info!(
+            target: "assistant_trace",
+            memory_hits = outcome.memory_hits,
+            rag_hits = outcome.rag_hits,
+            block_chars = outcome.block_chars,
+            "proactive recall injected"
+        );
+    }
+    (block, outcome)
+}
+
+/// Merges a recall block into the session summary string handed to the backends.
+///
+/// Done here rather than as a new parameter on every `generate` call because the
+/// backends already treat this string as "extra system context". Threading a
+/// second optional argument through five call sites, three backends and their
+/// streaming variants would add a parameter nobody would ever pass differently.
+fn merge_recall_into_summary(summary: Option<&str>, recall_block: Option<&str>) -> Option<String> {
+    // Whitespace-only input counts as absent. Without this, a summary that is
+    // present but blank would pass through as `Some("")` and inject an empty
+    // system message -- which still shifts the chat template, and is exactly the
+    // kind of thing that shows up as a subtly wrong prompt rather than a crash.
+    let summary = summary.map(str::trim).filter(|t| !t.is_empty());
+    let recall_block = recall_block.map(str::trim).filter(|t| !t.is_empty());
+    match (summary, recall_block) {
+        (None, None) => None,
+        (Some(s), None) => Some(s.to_string()),
+        (None, Some(r)) => Some(r.to_string()),
+        (Some(s), Some(r)) => Some(format!("{s}\n\n{r}")),
+    }
+}
+
+/// Upper bound on reply text retained for the grounding audit.
+///
+/// The audit is a keyword scan, so it does not need the whole reply — but it does
+/// need enough that a claim placed after a long preamble is still caught. 32 KiB
+/// is far past any claim position that matters and bounds the per-stream buffer.
+const GROUNDING_AUDIT_MAX_CHARS: usize = 32 * 1024;
+
+/// A request to start an implementer subagent.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SpawnAgentRequest {
+    /// What the subagent should do. Required: a subagent with no goal would burn
+    /// a budget producing nothing.
+    pub goal: String,
+    /// Project root. Defaults to the server's workspace root.
+    #[serde(default)]
+    pub root_path: Option<String>,
+    /// Existing project to attach to, instead of creating one.
+    #[serde(default)]
+    pub project_id: Option<String>,
+    /// Override the model for this run.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+/// Wall-clock budget for proactive recall on the chat hot path.
+const RECALL_TIMEOUT_SECS: u64 = 4;
+
 /// Resolves the workspace a request is bound to.
 ///
 /// A client-supplied id is honored but always paired with the server's
@@ -3144,7 +3364,13 @@ async fn run_native_tool_loop(
     tools: &[mcp::McpToolSchema],
     history: &[(String, String)],
 ) -> NativeLoopStep {
-    let tool_instructions = mcp::toolcall::build_tool_instructions(tools);
+    // The capability statement goes first, immediately above the tool list, so the
+    // model cannot read the tools without also reading what it may claim. When the
+    // list is empty the statement says so outright — an omitted list reads as
+    // "unmentioned", which the model fills in with capability it does not have.
+    let tool_names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+    let mut tool_instructions = grounding::capability_statement(&tool_names, 0);
+    tool_instructions.push_str(&mcp::toolcall::build_tool_instructions(tools));
     native_tool_loop_core(
         native_engine_client,
         mcp_registry,
@@ -4189,11 +4415,48 @@ async fn run_scheduled_turn(
     );
     set_active_turn_id(&turn_label);
 
-    // No tools are offered to a scheduled turn in this pass: wiring the GUI's
-    // tool-slot selection into a headless run needs a saved per-schedule tool
-    // list, which the brief leaves open. The capability gate still applies to
-    // anything the turn reaches, so this narrows what a schedule can do, never
-    // widens it.
+    // A scheduled turn gets the same read-only tool default as an interactive chat
+    // turn. It previously got none, which meant a schedule could talk but never
+    // check anything -- "check the build every morning" was unrunnable, because
+    // the tools that would read the build output were not offered.
+    //
+    // Read-only by construction, not by policy: `toolselect::default_read_slots`
+    // selects slots with at least one `Read` tool, and `capability::decide` still
+    // runs per call, so anything a schedule reaches is gated exactly as an
+    // interactive turn's would be. A write queues for approval like any other, and
+    // a schedule that only ever reads is what `RunStatus` auto-repeat keys on.
+    let schedule_slots: Vec<(String, Vec<(String, capability::CapabilityClass)>)> = {
+        let mut out: Vec<(String, Vec<(String, capability::CapabilityClass)>)> = Vec::new();
+        for server in mcp_registry.list_all_servers().await.unwrap_or_default() {
+            if !server.connected || server.slot.is_empty() {
+                continue;
+            }
+            let classified = mcp_registry
+                .tool_schemas_for_server(&server.name)
+                .await
+                .into_iter()
+                .map(|t| (t.name.clone(), capability::classify(&server.name, &t.name)))
+                .collect();
+            out.push((server.slot.clone(), classified));
+        }
+        out
+    };
+    let schedule_slot_names = toolselect::default_read_slots(&schedule_slots);
+    let mut schedule_tools: Vec<mcp::McpToolSchema> = Vec::new();
+    for slot in &schedule_slot_names {
+        if let Some(server_name) = mcp_registry.server_for_slot(slot).await {
+            schedule_tools.extend(mcp_registry.tool_schemas_for_server(&server_name).await);
+        }
+    }
+    if !schedule_tools.is_empty() {
+        tracing::debug!(
+            target: "assistant_trace",
+            schedule_id = %schedule.id,
+            slots = %schedule_slot_names.join(","),
+            tools = schedule_tools.len(),
+            "scheduled turn using the read-only tool default"
+        );
+    }
     let step = run_native_tool_loop(
         &native_client,
         &mcp_registry,
@@ -4205,7 +4468,7 @@ async fn run_scheduled_turn(
         0,
         0.0,
         "",
-        &[],
+        &schedule_tools,
         &[],
     )
     .await;
@@ -4286,12 +4549,51 @@ where
             .map(|t| (t - scheduler::now_secs()).max(0) as u64)
             .map(|s| Duration::from_secs(s).clamp(MIN_TICK, MAX_TICK))
             .unwrap_or(MAX_TICK);
-        tokio::time::sleep(sleep).await;
+        // Wake on either the timer or an out-of-band nudge (a schedule was just
+        // created or changed), whichever comes first. `enable`/`Notify` pairing
+        // matters: without it a nudge arriving during `due()` could be missed and
+        // the driver would still sleep out the full tick.
+        // Bound first: the future returned by `notified()` borrows the
+        // `Notify`, and `schedule_wakeup()` hands back a temporary Arc.
+        let wakeup = schedule_wakeup();
+        tokio::select! {
+            _ = tokio::time::sleep(sleep) => {}
+            _ = wakeup.notified() => {
+                tracing::info!(
+                    target: "assistant_trace",
+                    "scheduler driver woken by a schedule change"
+                );
+            }
+        }
     }
 }
 
 /// The active schedule store.
 static ACTIVE_SCHEDULES: OnceLock<Arc<scheduler::ScheduleStore>> = OnceLock::new();
+
+/// Tripped whenever a schedule is created, removed, enabled or disabled.
+///
+/// Without this the driver sleeps out `MAX_TICK` (5 minutes) whenever it has
+/// nothing due, so a schedule created a second after a tick waits nearly five
+/// minutes before it is even noticed -- long enough that a freshly created `at`
+/// schedule looks broken, and a 09:00 cron entry can fire materially late. The
+/// store has no way to interrupt the driver's sleep, so the nudge is a channel
+/// rather than a return value.
+///
+/// A `tokio::sync::Notify` rather than a `Condvar`: the driver is async, and
+/// awaiting a notification cannot block a runtime worker thread.
+static SCHEDULE_WAKEUP: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
+
+fn schedule_wakeup() -> Arc<tokio::sync::Notify> {
+    SCHEDULE_WAKEUP
+        .get_or_init(|| Arc::new(tokio::sync::Notify::new()))
+        .clone()
+}
+
+/// Wakes the driver so it re-evaluates due schedules immediately.
+fn nudge_schedule_driver() {
+    schedule_wakeup().notify_one();
+}
 
 fn active_schedules() -> Arc<scheduler::ScheduleStore> {
     ACTIVE_SCHEDULES
@@ -4725,6 +5027,17 @@ struct GuiChatRequest {
     /// additive, so no current deployment changes behavior.
     #[serde(default)]
     workspace_id: Option<String>,
+    /// Start a detached implementer subagent on this turn instead of answering
+    /// inline, and return its ids.
+    ///
+    /// Opt-in per request rather than a tool the model can call. A subagent writes
+    /// proposed files and runs builds, so making it model-selectable would mean the
+    /// model deciding to spawn work that costs minutes of compute — the approval
+    /// queue would then have to gate every spawn, which is the friction this is
+    /// meant to avoid. The user asks for it; the server starts it; the review gate
+    /// still applies before anything reaches the working tree.
+    #[serde(default)]
+    spawn_agent: Option<SpawnAgentRequest>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -9165,12 +9478,16 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                 }))
             }
         };
-        match active_schedules().add(
+        let result = active_schedules().add(
             &workspace_id,
             req.name.as_deref().unwrap_or(""),
             &req.prompt,
             trigger,
-        ) {
+        );
+        // A newly created schedule may already be due, so wake the driver instead
+        // of letting it sit unnoticed until its next tick.
+        nudge_schedule_driver();
+        match result {
             Ok(s) => Json(serde_json::json!({ "schedule": s.to_summary() })),
             Err(e) => Json(serde_json::json!({ "error": e })),
         }
@@ -9196,6 +9513,9 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
     ) -> Json<serde_json::Value> {
         let workspace_id = scheduler::requested_workspace(req.workspace_id.as_deref());
         if active_schedules().set_enabled(&workspace_id, &req.id, req.enabled) {
+            // A change can make a schedule due (or remove one), so wake
+            // the driver rather than leaving it asleep until its next tick.
+            nudge_schedule_driver();
             Json(serde_json::json!({ "success": true }))
         } else {
             Json(serde_json::json!({ "success": false, "error": "no such schedule" }))
@@ -9207,6 +9527,9 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
     ) -> Json<serde_json::Value> {
         let workspace_id = scheduler::requested_workspace(req.workspace_id.as_deref());
         if active_schedules().remove(&workspace_id, &req.id) {
+            // A change can make a schedule due (or remove one), so wake
+            // the driver rather than leaving it asleep until its next tick.
+            nudge_schedule_driver();
             Json(serde_json::json!({ "success": true }))
         } else {
             Json(serde_json::json!({ "success": false, "error": "no such schedule" }))
@@ -9892,6 +10215,82 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         (kept, truncated)
     }
 
+    /// Generates a short title for a session and returns it.
+    ///
+    /// Runs detached from the request path, like `summarize_dropped_turns`: a chat turn
+    /// must never wait on an extra generation, and a title is cosmetic. Failure is
+    /// silent by design -- the caller falls back to the first few words of the message,
+    /// which is what the GUI already did.
+    ///
+    /// The result is written back to `SessionRecord::name`, which is the server's own
+    /// record of the session. The response also carries it so a streaming client can
+    /// apply the title immediately without a follow-up request.
+    async fn generate_session_title(
+        state: Arc<Mutex<BackendState>>,
+        session_id: String,
+        turns: Vec<(String, String)>,
+    ) -> Option<String> {
+        if turns.is_empty() {
+            return None;
+        }
+        let (native_engine_client, model, engine_kind) = {
+            let backend = lock_state(&state);
+            (
+                backend.native_engine_client.clone(),
+                backend.current_model.clone(),
+                backend.settings.native_engine.clone(),
+            )
+        };
+
+        // Small and low-temperature: a title is 3-6 words, and a longer budget only
+        // buys prose that `clean_title` then throws away.
+        let generated = native_engine_client
+            .generate(
+                &model,
+                &title::build_title_prompt(&turns),
+                32,
+                0.3,
+                0.9,
+                40,
+                1.1,
+                &engine_kind,
+                &[],
+                None,
+                None,
+                false,
+                None,
+            )
+            .await;
+
+        let title_text = match generated {
+            Ok(gen) if gen.real_inference => title::clean_title(&gen.text),
+            _ => None,
+        }
+        // Nothing usable from the model: derive one locally rather than leaving the
+        // session nameless.
+        .or_else(|| {
+            turns
+                .iter()
+                .find(|(role, _)| !role.eq_ignore_ascii_case("assistant"))
+                .map(|(_, content)| title::fallback_title(content))
+        })?;
+
+        {
+            let mut backend = lock_state(&state);
+            let session = backend.sessions.iter_mut().find(|s| s.id == session_id)?;
+            // Never overwrite a title the user set by hand.
+            let is_untouched = session.name.trim().is_empty()
+                || session.name == "New Chat"
+                || session.name.starts_with("Session ");
+            if !is_untouched {
+                return None;
+            }
+            session.name = title_text.clone();
+        }
+        save_persistent_sessions(&lock_state(&state).sessions);
+        Some(title_text)
+    }
+
     /// Generates a summary for `new_turns` and folds it into `session_id`'s
     /// running summary. Runs detached from the request path (spawned by the
     /// caller) so a chat turn never waits on an extra generation.
@@ -9994,22 +10393,67 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         // can happen.
         set_active_turn_id(req.session_id.as_deref().unwrap_or("sess_local_001"));
 
+        // A subagent request replaces the inline answer. Handled first and returned
+        // immediately: there is no point resolving tools, running recall, or
+        // generating a reply for a turn whose real work happens in a detached run.
+        if let Some(spawn) = req.spawn_agent.clone() {
+            if spawn.goal.trim().is_empty() {
+                return Json(serde_json::json!({
+                    "error": "spawn_agent.goal is required",
+                }))
+                .into_response();
+            }
+            let root = spawn
+                .root_path
+                .clone()
+                .unwrap_or_else(|| workspace_root().display().to_string());
+            match crate::task_api::start_implementer(
+                Arc::clone(&state),
+                Some(root.clone()),
+                spawn.project_id.clone(),
+                spawn.goal.clone(),
+                spawn.model.clone(),
+            )
+            .await
+            {
+                Ok((project, task, run)) => {
+                    return Json(serde_json::json!({
+                        "response": format!(
+                            "Started a subagent on: {}\n\nTask {} under project {}. It runs in the background; poll `/api/tasks/{}/events` for progress and `/api/tasks/{}/review` for the proposed diff.",
+                            spawn.goal, task.id, project.id, task.id, task.id
+                        ),
+                        "request_id": format!("req-{}", uuid::Uuid::new_v4()),
+                        "session_id": req.session_id.clone().unwrap_or_else(|| "sess_local_001".to_string()),
+                        "model": lock_state(&state).current_model.clone(),
+                        "inference_backend": "agent",
+                        "spawned": {
+                            "project_id": project.id,
+                            "task_id": task.id,
+                            "run_id": run.id,
+                            "role": run.role,
+                            "status": run.status,
+                        },
+                    }))
+                    .into_response();
+                }
+                Err(e) => {
+                    return Json(serde_json::json!({
+                        "error": format!("could not start subagent: {e}"),
+                    }))
+                    .into_response();
+                }
+            }
+        }
+
         // Legacy chat "tool slot" names the GUI's tool checkboxes send (calculator,
         // file_operations, ...) - resolved against real MCP servers below, then
         // dispatched via whichever protocol the active engine actually speaks
         // (native TOOL_CALL: prompt shim, Ollama/vLLM's own OpenAI-style tools).
-        let enabled_tool_slots: Vec<String> = req
-            .mcp
-            .as_ref()
-            .and_then(|mcp| mcp.get("tools"))
-            .and_then(|t| t.as_array())
-            .map(|tools| {
-                tools
-                    .iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
+        //
+        // Whether the client named any tool slots. Absent means "server decides"
+        // -- see `toolselect` for why that default is the read-only set and why an
+        // explicit empty list is still honored as "none".
+        let tool_selection = toolselect::selection_from_request(req.mcp.as_ref());
 
         let (
             current_model,
@@ -10078,10 +10522,52 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         // callers pausing via PendingToolCall), not by hiding the tool from
         // the model entirely.
         let mut enabled_tools: Vec<mcp::McpToolSchema> = Vec::new();
+        // Resolve the slot list. When the client did not specify one, the server
+        // supplies the read-only default (see `toolselect`): previously an absent
+        // `mcp.tools` silently produced a toolless assistant, so a scheduled turn
+        // or any non-GUI client could not act and the model would improvise a
+        // claim that it had.
+        //
+        // The default is computed from what is actually connected *and* how each
+        // tool classifies right now, so an unreachable server contributes nothing
+        // and a slot carrying any Write or Exec tool is excluded whole.
+        let connected_slots: Vec<(String, Vec<(String, capability::CapabilityClass)>)> = {
+            let mut out: Vec<(String, Vec<(String, capability::CapabilityClass)>)> = Vec::new();
+            for server in mcp_registry.list_all_servers().await.unwrap_or_default() {
+                if !server.connected {
+                    continue;
+                }
+                // `slot` is a plain String on the server record, not an Option --
+                // an unslotted server resolves to an empty string.
+                let slot = server.slot.clone();
+                if slot.is_empty() {
+                    continue;
+                }
+                let classified = mcp_registry
+                    .tool_schemas_for_server(&server.name)
+                    .await
+                    .into_iter()
+                    .map(|t| (t.name.clone(), capability::classify(&server.name, &t.name)))
+                    .collect();
+                out.push((slot, classified));
+            }
+            out
+        };
+        let enabled_tool_slots = toolselect::resolve_slots(&tool_selection, &connected_slots);
         for slot in &enabled_tool_slots {
             if let Some(server_name) = mcp_registry.server_for_slot(slot).await {
                 enabled_tools.extend(mcp_registry.tool_schemas_for_server(&server_name).await);
             }
+        }
+        if matches!(tool_selection, toolselect::ToolSelection::Unspecified)
+            && !enabled_tool_slots.is_empty()
+        {
+            tracing::debug!(
+                target: "assistant_trace",
+                slots = %enabled_tool_slots.join(","),
+                tools = enabled_tools.len(),
+                "client sent no tool list; using the read-only server default"
+            );
         }
 
         let token_estimate = req.message.split_whitespace().count().clamp(1, 1024);
@@ -10128,6 +10614,47 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                 .get(&chat_session_id)
                 .map(|s| s.text.clone())
                 .filter(|t| !t.trim().is_empty())
+        };
+
+        // Proactive recall (Phase 1). Runs the retrievers server-side so the model
+        // knows what it already knows without spending a tool call discovering
+        // that it has a memory at all.
+        //
+        // Only on the first turn of a session: with no history there is nothing
+        // else to go on and recall is at its most useful, while on every later
+        // turn the transcript already carries the relevant material and a second
+        // retrieval would be latency spent for nothing.
+        let (recall_block, recall_outcome) = if req.messages.as_deref().unwrap_or(&[]).is_empty() {
+            let ws = resolve_request_workspace(req.workspace_id.as_deref());
+            let registry = {
+                let backend = lock_state(&state);
+                Arc::clone(&backend.mcp_registry)
+            };
+            recall_for_turn(&registry, &req.message, ws.id()).await
+        } else {
+            (None, recall::RecallOutcome::default())
+        };
+        // Recalled context goes into the same extra-system-message slot as the
+        // session summary, so every backend picks it up unchanged.
+        let session_summary =
+            merge_recall_into_summary(session_summary.as_deref(), recall_block.as_deref());
+
+        // Title generation, on a session's first turn only. Detached, so the turn
+        // never waits on it; the title arrives on a later response (or is fetched
+        // from /api/sessions). Previously the GUI derived it from
+        // `firstUser.content.slice(0, 32)`, which cut mid-word and named every
+        // thread after its opening tokens.
+        let first_turn_of_session = req.messages.as_deref().unwrap_or(&[]).is_empty();
+        let title_task = if first_turn_of_session && !req.message.trim().is_empty() {
+            let title_state = Arc::clone(&state);
+            let title_session = chat_session_id.clone();
+            let first_exchange: Vec<(String, String)> =
+                vec![("user".to_string(), req.message.clone())];
+            Some(tokio::spawn(async move {
+                generate_session_title(title_state, title_session, first_exchange).await
+            }))
+        } else {
+            None
         };
         let temp = req.temperature.unwrap_or(settings.temperature);
         let top_p = req.top_p.unwrap_or(settings.top_p);
@@ -10299,6 +10826,10 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                                             let stream_started = Instant::now();
                                             let mut first_token_ms: Option<f32> = None;
                                             let mut accumulated_tokens: u32 = 0;
+                                            // Held so the finalizer can audit the reply
+                                            // (see `grounding`). Bounded so a runaway
+                                            // stream cannot grow this without limit.
+                                            let mut accumulated_text = String::new();
                                             loop {
                                                 let next = if first_token_ms.is_none()
                                                     && first_token_timeout_secs > 0
@@ -10354,6 +10885,10 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                                                         }
                                                         accumulated_tokens =
                                                             accumulated_tokens.saturating_add(1);
+                                                        if accumulated_text.len() < GROUNDING_AUDIT_MAX_CHARS
+                                                        {
+                                                            accumulated_text.push_str(&text);
+                                                        }
                                                         let escaped = serde_json::to_string(&text)
                                                             .unwrap_or_else(|_| {
                                                                 String::from("\"\"")
@@ -10403,6 +10938,39 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                                                 .as_secs_f32()
                                                 * 1000.0)
                                                 .max(0.1);
+                                            // Streamed turns get the same grounding
+                                            // audit as buffered ones -- the GUI streams
+                                            // by default, so skipping this would leave
+                                            // the common path unprotected.
+                                            //
+                                            // Deliberately before the state lock: the
+                                            // `tx.send().await` below would otherwise
+                                            // hold a std MutexGuard across an await and
+                                            // make the whole task non-Send.
+                                            let (_corrected, audit) = grounding::apply_grounding(
+                                                &accumulated_text,
+                                                0,
+                                            );
+                                            if audit.unsupported {
+                                                let escaped = serde_json::to_string(
+                                                    &grounding::correction_notice(0),
+                                                )
+                                                .unwrap_or_else(|_| String::from("\"\""));
+                                                let _ = tx
+                                                    .send(Ok(Event::default().data(
+                                                        format!(
+                                                            r#"{{"token":{escaped},"request_id":"{}","correction":true}}"#,
+                                                            request_id_str
+                                                        ),
+                                                    )))
+                                                    .await;
+                                                tracing::warn!(
+                                                    target: "assistant_trace",
+                                                    session_id = %chat_session_id,
+                                                    "streamed reply claimed an action that never ran; correction appended"
+                                                );
+                                            }
+
                                             let mut backend = lock_state(&state_clone);
                                             if let Some(ttft_ms) = first_token_ms {
                                                 backend.inference_metrics.record_ttft(ttft_ms);
@@ -10914,6 +11482,50 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             (request_seq, session_id, metrics_json)
         };
 
+        // Collect the title if this turn spawned one. Bounded: the generation is
+        // capped at 32 tokens, and a hung title task must not delay the response,
+        // so a short wait and then give up on it.
+        let generated_title = match title_task {
+            Some(handle) => tokio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .flatten(),
+            None => None,
+        };
+
+        // Ground the reply against what actually ran.
+        //
+        // A model with no tools will confidently describe having saved, written or
+        // sent something it never touched — observed live, where it reported a
+        // stored memory over an empty database. The audit is server-side and uses
+        // the server's own record of executed tools, so it holds regardless of what
+        // the prompt said. See `grounding` for why this is not a prompt fix.
+        let tools_run = tool_results.len();
+        let (response_text, claim_audit) = grounding::apply_grounding(&response_text, tools_run);
+        if claim_audit.unsupported {
+            // Field-level, like every other trace event: tool and class names,
+            // counts, latency. Never the reply text, which is the very content
+            // under suspicion.
+            // `execute_tool` is the closest existing shape: a named operation with
+            // a decision. Reusing it keeps the trace vocabulary closed rather than
+            // inventing an event kind for a condition that is, from the audit
+            // trail's perspective, exactly this -- an action that did not execute.
+            let flagged = trace::TraceEvent::execute_tool(
+                "action_claim",
+                chat_workspace.id(),
+                Some("claim"),
+                trace::TraceDecision::Blocked,
+            );
+            tracing::warn!(
+                target: "assistant_trace",
+                workspace = %chat_workspace.id(),
+                tools_run = claim_audit.tools_run,
+                trace = %flagged,
+                "reply claimed an action that never ran; correction appended"
+            );
+        }
+
         // No "Tools used:" text footer here: every engine's tool results are
         // now real (see run_native_tool_loop/run_ollama_chat/run_vllm_chat)
         // and already woven into the model's own final answer, so appending
@@ -10941,6 +11553,18 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             // trimmed in earlier requests — the GUI can show that the model is
             // working from a condensed memory rather than the full transcript.
             "summarized_history": session_summary.is_some(),
+            // Counts only. Lets the GUI and an operator tell "remembered nothing"
+            // from "retrieval never ran" without any recalled text leaving here.
+            // Present only when the first turn of a session just generated one.
+            // The GUI applies it to the thread title; `renameThread` still wins if
+            // the user has already named the thread.
+            "session_title": generated_title,
+            // True when the model asserted a completed action with no tool
+            // behind it and `response` now carries a server-authored correction.
+            "action_claim_corrected": claim_audit.unsupported,
+            "tools_run": tools_run,
+            "recalled_memories": recall_outcome.memory_hits,
+            "recalled_documents": recall_outcome.rag_hits,
             "metrics": metrics_json
         });
 
@@ -14393,18 +15017,22 @@ mod backend_plugin;
 mod backend_registry;
 mod bootstrap;
 mod capability;
+mod grounding;
 mod host_metrics;
 mod inference_engine;
 mod mcp;
 mod native_engine;
 mod ollama;
 mod otel;
+mod recall;
 mod rpc_cluster;
 mod runtime;
 mod runtime_switcher;
 mod scheduler;
 mod skills;
+mod title;
 mod tls;
+mod toolselect;
 mod trace;
 mod vllm;
 mod workspace;
@@ -15975,5 +16603,48 @@ mod tests {
             summaries.contains_key(&format!("s{}", SUMMARY_MAX_SESSIONS + 4)),
             "newest should survive"
         );
+    }
+
+    // --- proactive recall: summary/recall merge -----------------------------
+    //
+    // The merge is where a bug would silently drop context rather than fail
+    // loudly, so each combination of present/absent/blank is pinned.
+
+    #[test]
+    fn merge_keeps_both_summary_and_recall() {
+        let merged =
+            merge_recall_into_summary(Some("earlier we chose JWTs"), Some("- [memory] likes Rust"));
+        let m = merged.expect("both present must merge");
+        assert!(m.contains("earlier we chose JWTs"), "summary lost: {m}");
+        assert!(m.contains("likes Rust"), "recall lost: {m}");
+    }
+
+    #[test]
+    fn merge_passes_through_a_lone_summary() {
+        assert_eq!(
+            merge_recall_into_summary(Some("only summary"), None).as_deref(),
+            Some("only summary")
+        );
+    }
+
+    #[test]
+    fn merge_passes_through_a_lone_recall_block() {
+        assert_eq!(
+            merge_recall_into_summary(None, Some("only recall")).as_deref(),
+            Some("only recall")
+        );
+    }
+
+    #[test]
+    fn merge_of_neither_is_none() {
+        // A turn with no history and no recall must not inject an empty system
+        // message -- an empty string still shifts the chat template.
+        assert!(merge_recall_into_summary(None, None).is_none());
+    }
+
+    #[test]
+    fn merge_treats_blank_inputs_as_absent() {
+        assert!(merge_recall_into_summary(Some("   "), None).is_none());
+        assert!(merge_recall_into_summary(None, Some("  \n ")).is_none());
     }
 }

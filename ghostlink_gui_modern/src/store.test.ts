@@ -127,4 +127,54 @@ describe('AppStore', () => {
     expect(active?.temperature).toBe(0.2);
     expect(active?.maxTokens).toBe(512);
   });
+
+  // Server-generated titles. The precedence rule is the part that matters: a
+  // late-arriving generation must never clobber a name the user typed.
+
+  it('applyServerTitle replaces an untouched placeholder', () => {
+    const now = Date.now();
+    useAppStore.setState({
+      threads: [{ id: 't1', title: 'New Chat', createdAt: now, updatedAt: now, messages: [] }],
+    });
+    useAppStore.getState().applyServerTitle('t1', 'Auth middleware failure');
+    expect(useAppStore.getState().threads[0].title).toBe('Auth middleware failure');
+  });
+
+  it('applyServerTitle never overwrites a user-set title', () => {
+    const now = Date.now();
+    useAppStore.setState({
+      threads: [{ id: 't1', title: 'My own name', createdAt: now, updatedAt: now, messages: [] }],
+    });
+    useAppStore.getState().applyServerTitle('t1', 'Generated title');
+    expect(useAppStore.getState().threads[0].title).toBe('My own name');
+  });
+
+  it('applyServerTitle replaces a legacy Session-prefixed title', () => {
+    const now = Date.now();
+    useAppStore.setState({
+      threads: [{ id: 't1', title: 'Session 2026-10-04', createdAt: now, updatedAt: now, messages: [] }],
+    });
+    useAppStore.getState().applyServerTitle('t1', 'RAG relevance floor');
+    expect(useAppStore.getState().threads[0].title).toBe('RAG relevance floor');
+  });
+
+  it('applyServerTitle ignores an empty or whitespace title', () => {
+    const now = Date.now();
+    useAppStore.setState({
+      threads: [{ id: 't1', title: 'New Chat', createdAt: now, updatedAt: now, messages: [] }],
+    });
+    useAppStore.getState().applyServerTitle('t1', '   ');
+    expect(useAppStore.getState().threads[0].title).toBe('New Chat');
+  });
+
+  it('applyServerTitle is a no-op for an unknown thread', () => {
+    const now = Date.now();
+    useAppStore.setState({
+      threads: [{ id: 't1', title: 'New Chat', createdAt: now, updatedAt: now, messages: [] }],
+    });
+    useAppStore.getState().applyServerTitle('missing', 'Whatever');
+    expect(useAppStore.getState().threads).toHaveLength(1);
+    expect(useAppStore.getState().threads[0].title).toBe('New Chat');
+  });
+
 });

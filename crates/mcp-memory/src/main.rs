@@ -242,10 +242,16 @@ impl Memory {
         serde_json::to_string(&serde_json::json!({ "memories": items })).unwrap_or_else(err)
     }
 
-    /// Store a new memory. Requires approval — this is a write.
+    /// Store a new memory.
+    ///
+    /// The description deliberately does *not* say this needs approval. It used
+    /// to, and that was actively harmful: the model read "Requires user approval"
+    /// and declined to call the tool at all, so nothing was ever remembered even
+    /// when the user explicitly asked. It is now a vetted auto-apply write
+    /// (`capability::is_vetted_memory_write`), so calling it just works.
     #[tool(
         name = "memory_remember",
-        description = "Store a memory for the current workspace. Requires user approval."
+        description = "Store a memory for the current workspace. Call this whenever the user states a durable fact, preference, decision or open loop worth recalling later. Takes effect immediately -- no approval needed."
     )]
     async fn memory_remember(
         &self,
@@ -339,7 +345,7 @@ impl Memory {
     /// harder to undo than writing.
     #[tool(
         name = "memory_forget",
-        description = "Delete a memory by id. Requires user approval."
+        description = "Delete a memory by id. Requires user approval -- deletion cannot be undone."
     )]
     async fn memory_forget(
         &self,

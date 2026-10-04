@@ -209,6 +209,20 @@ export interface ChatMessage {
    *  rather than the full transcript. Distinct from `truncatedBefore`, which
    *  describes trimming that happened on this turn. */
   summarizedHistory?: boolean;
+  /** How many stored memories the server injected as context for this turn.
+   *  Counts only -- the server never sends the recalled text, so a user can see
+   *  that recall happened without the recalled content being duplicated into the
+   *  client. Absent means recall did not run for this turn. */
+  recalledMemories?: number;
+  /** How many indexed documents `rag.search` contributed. Same counts-only rule. */
+  recalledDocuments?: number;
+  /** True when the model claimed a completed action that no tool backed, and the
+   *  server appended a correction to the reply. Surfaced as its own badge so a
+   *  user reading a transcript can see which replies were corrected. */
+  actionClaimCorrected?: boolean;
+  /** Tools that actually executed this turn, as the server counted them. Zero with
+   *  no tools offered and none run is the normal case for a plain question. */
+  toolsRun?: number;
   isDivider?: boolean;
   taskId?: string;
   agentRootPath?: string;
@@ -373,6 +387,10 @@ interface AppState {
   selectThread: (id: string) => void;
   updateActiveThread: (updater: (thread: Thread) => Thread) => void;
   renameThread: (id: string, title: string) => void;
+  /** Adopt a title the server generated for a session. No-ops when the thread has
+   *  already been renamed by the user, so a manual name is never overwritten by a
+   *  late-arriving generation. */
+  applyServerTitle: (id: string, title: string) => void;
   deleteThread: (id: string) => void;
   togglePinThread: (id: string) => void;
   addPreset: (preset: Omit<SystemPromptPreset, "id">) => void;
@@ -585,6 +603,26 @@ export const useAppStore = create<AppState>((set) => ({
       saveThreadsToStorage(threads);
       return { threads };
     }),
+  applyServerTitle: (id, title) => {
+      const t = title?.trim();
+      if (!t) return;
+      set((state) => {
+        const thread = state.threads.find((x) => x.id === id);
+        if (!thread) return state;
+        // A user-set title wins. `renameThread` sets an explicit title; the
+        // auto-title path leaves "New Chat"/"Session ..." placeholders.
+        const untouched =
+          thread.title === "New Chat" ||
+          thread.title.startsWith("Session ") ||
+          thread.title.trim() === "";
+        if (!untouched || thread.title === t) return state;
+        const threads = state.threads.map((x) =>
+          x.id === id ? { ...x, title: t } : x
+        );
+        saveThreadsToStorage(threads);
+        return { ...state, threads };
+      });
+  },
 
   deleteThread: (id) =>
     set((state) => {

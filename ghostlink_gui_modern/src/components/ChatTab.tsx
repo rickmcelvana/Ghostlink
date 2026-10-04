@@ -25,6 +25,9 @@ import {
   AlertTriangle,
   Layers,
   Pin,
+  Brain,
+  FileSearch,
+  ShieldAlert,
   PinOff,
   Square,
   BookOpen,
@@ -287,6 +290,7 @@ export const ChatTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
     threads, activeThreadId, selectThread, createThread, renameThread, deleteThread, togglePinThread,
     updateActiveThread, presets, userPrompts,
     addToast, setActiveTab, metrics,
+    applyServerTitle,
   } = useAppStore();
 
   const activeThread = useMemo(() => threads.find((t) => t.id === activeThreadId), [threads, activeThreadId]);
@@ -571,6 +575,13 @@ export const ChatTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
 
     if (result.success) {
       const data = result.data || {};
+
+      // Adopt a server-generated session title. The server generates one on the
+      // first turn of a session; it names the subject, where the local fallback
+      // (first 30 chars of the opening message) often cut mid-word.
+      if (typeof data.session_title === "string" && data.session_title.trim()) {
+        applyServerTitle(activeThreadId ?? "", data.session_title);
+      }
       setMessages((prev) =>
         prev.map((m) =>
           m.id === assistantId
@@ -581,6 +592,10 @@ export const ChatTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
                 pendingToolCall: data.pending_tool_call,
                 truncatedBefore: !!data.truncated,
                 summarizedHistory: !!data.summarized_history,
+                recalledMemories: data.recalled_memories,
+                recalledDocuments: data.recalled_documents,
+                actionClaimCorrected: !!data.action_claim_corrected,
+                toolsRun: data.tools_run,
                 timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
               }
             : m
@@ -1278,7 +1293,12 @@ export const ChatTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
                           only the second would hide the case where the gap is still
                           growing; showing only the first would imply nothing is being
                           retained. */}
-                      {!isUser && (m.truncatedBefore || m.summarizedHistory) && (
+                      {!isUser &&
+                        (m.truncatedBefore ||
+                          m.summarizedHistory ||
+                          m.recalledMemories ||
+                          m.recalledDocuments ||
+                          m.actionClaimCorrected) && (
                         <div className="mb-1.5 flex flex-wrap items-center gap-1.5">
                           {m.truncatedBefore && (
                             <span
@@ -1298,6 +1318,55 @@ export const ChatTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
                             >
                               <Layers size={10} aria-hidden="true" />
                               answering from summary
+                            </span>
+                          )}
+                          {/* Recall counts, not content. The server deliberately
+                              sends how many memories/documents it injected and never
+                              the text, so a user can confirm recall happened without
+                              the recalled material being duplicated into the client
+                              or written into browser storage. */}
+                          {!!m.recalledMemories && (
+                            <span
+                              title={`${m.recalledMemories} stored ${
+                                m.recalledMemories === 1 ? "memory was" : "memories were"
+                              } injected as context for this reply. The content is not sent to the client.`}
+                              aria-label={`${m.recalledMemories} stored ${
+                                m.recalledMemories === 1 ? "memory was" : "memories were"
+                              } used as context for this reply`}
+                              className="inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded-full border border-emerald-500/30 bg-emerald-500/10 text-emerald-300"
+                            >
+                              <Brain size={10} aria-hidden="true" />
+                              {m.recalledMemories}{" "}
+                              {m.recalledMemories === 1 ? "memory" : "memories"} recalled
+                            </span>
+                          )}
+                          {!!m.recalledDocuments && (
+                            <span
+                              title={`${m.recalledDocuments} indexed ${
+                                m.recalledDocuments === 1 ? "document was" : "documents were"
+                              } retrieved for this reply. The content is not sent to the client.`}
+                              aria-label={`${m.recalledDocuments} indexed ${
+                                m.recalledDocuments === 1 ? "document was" : "documents were"
+                              } retrieved for this reply`}
+                              className="inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded-full border border-cyan-500/30 bg-cyan-500/10 text-cyan-300"
+                            >
+                              <FileSearch size={10} aria-hidden="true" />
+                              {m.recalledDocuments}{" "}
+                              {m.recalledDocuments === 1 ? "document" : "documents"} found
+                            </span>
+                          )}
+                          {/* A corrected claim is the most important of these: it means
+                              the model asserted something that did not happen and the
+                              server caught it. Kept visually distinct so it reads as a
+                              correction rather than another piece of metadata. */}
+                          {m.actionClaimCorrected && (
+                            <span
+                              title="This reply claimed an action that no tool performed. The server appended a correction; read the reply's final paragraph."
+                              aria-label="This reply claimed an action that never ran, and the server corrected it"
+                              className="inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded-full border border-rose-500/40 bg-rose-500/10 text-rose-300"
+                            >
+                              <ShieldAlert size={10} aria-hidden="true" />
+                              corrected: claimed an action that didn't run
                             </span>
                           )}
                         </div>

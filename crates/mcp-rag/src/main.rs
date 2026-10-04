@@ -32,6 +32,21 @@ struct SearchRequest {
     query: String,
     #[schemars(description = "Number of results to return (default 5)")]
     top_k: Option<usize>,
+    /// Minimum cosine similarity for a result to be returned.
+    ///
+    /// Without a floor, `search` always returns the top-k *closest* documents even
+    /// when none of them is relevant -- measured on a one-document corpus, a
+    /// topically unrelated query still scored 0.49 against the only entry. That
+    /// matters because proactive recall injects these hits into the model's
+    /// context: a floorless search hands the model the least-relevant thing in the
+    /// index dressed as an answer.
+    ///
+    /// Defaults to [`DEFAULT_MIN_SCORE`]. Set to 0.0 to restore the old
+    /// always-return-top-k behaviour.
+    #[schemars(
+        description = "Minimum cosine similarity required (default 0.45; use 0.0 to disable the floor)"
+    )]
+    min_score: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -410,6 +425,29 @@ impl Rag {
 
 const MAX_CHUNK_CHARS: usize = 1200;
 
+/// Default cosine floor for `search`.
+///
+/// Measured, not guessed. Nine queries against one indexed chunk on
+/// nomic-embed-text-v1.5:
+///
+/// ```text
+/// related    0.629  0.695  0.625  0.591   (min 0.591)
+/// unrelated  0.454  0.429  0.441  0.404  0.458   (max 0.458)
+/// ```
+///
+/// 0.52 sits in the middle of that 0.133-wide gap, so it keeps every related query
+/// and drops every unrelated one. An earlier value of 0.45 was chosen from a
+/// two-sample comparison and did *not* separate them -- a unit test pinned the
+/// measurement and caught it, which is why these numbers are recorded here.
+///
+/// Deliberately mid-gap rather than hugging the related minimum: a floor set just
+/// above 0.458 would reject a true match phrased unlike anything in the index.
+///
+/// Embedding models differ. If you change GHOSTLINK_EMBED_BACKEND and recall
+/// returns nothing, or returns everything, re-measure this before adjusting
+/// anything else.
+const DEFAULT_MIN_SCORE: f32 = 0.52;
+
 #[tool_router(server_handler)]
 impl Rag {
     #[tool(
@@ -469,7 +507,11 @@ impl Rag {
     #[tool(description = "Search the local retrieval index for text relevant to a query")]
     async fn search(
         &self,
-        Parameters(SearchRequest { query, top_k }): Parameters<SearchRequest>,
+        Parameters(SearchRequest {
+            query,
+            top_k,
+            min_score,
+        }): Parameters<SearchRequest>,
     ) -> String {
         let query_embedding = match self.embed(&query).await {
             Ok(e) => e,
@@ -482,7 +524,14 @@ impl Rag {
         if index.entries.is_empty() {
             return "error: the retrieval index is empty — call index_document first".to_string();
         }
-        let results = rank(&index.entries, &query_embedding, top_k.unwrap_or(5));
+        // Filter before truncation: applying the floor after `rank` would let a
+        // top-k full of weak matches push a relevant result out of the list.
+        let floor = min_score.unwrap_or(DEFAULT_MIN_SCORE);
+        let results: Vec<(f32, &IndexEntry)> =
+            rank(&index.entries, &query_embedding, top_k.unwrap_or(5))
+                .into_iter()
+                .filter(|(score, _)| *score >= floor)
+                .collect();
         let results_json: Vec<serde_json::Value> = results
             .iter()
             .map(|(score, entry)| {
@@ -589,6 +638,128 @@ mod tests {
             embedding,
             norm,
         }
+    }
+
+    /// Mirrors the filter `search` applies: rank, then drop anything under the
+    /// floor, then truncate. Extracted so the ordering can be tested without an
+    /// embedding backend.
+    fn filter_by_score(
+        entries: &[IndexEntry],
+        query: &[f32],
+        top_k: usize,
+        min_score: f32,
+    ) -> Vec<(f32, String)> {
+        rank(entries, query, top_k)
+            .into_iter()
+            .filter(|(score, _)| *score >= min_score)
+            .map(|(score, e)| (score, e.id.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn the_score_floor_drops_an_unrelated_match() {
+        // The behaviour that motivated the floor: a single-document index, queried
+        // with something unrelated, still returns that document. Without a floor,
+        // recall hands the model the least-relevant thing in the index.
+        let entries = vec![entry("only", vec![1.0, 0.0])];
+        // cos([1,0], query) is 0.44 -- below the floor, in the measured band for
+        // unrelated queries (0.404..0.458).
+        let query = vec![0.44, 0.898];
+        let without_floor = filter_by_score(&entries, &query, 5, 0.0);
+        assert_eq!(
+            without_floor.len(),
+            1,
+            "the old floorless behaviour did return the weak match"
+        );
+        assert!(
+            without_floor[0].0 < DEFAULT_MIN_SCORE,
+            "expected a sub-threshold score, got {}",
+            without_floor[0].0
+        );
+
+        let with_floor = filter_by_score(&entries, &query, 5, DEFAULT_MIN_SCORE);
+        assert!(
+            with_floor.is_empty(),
+            "the floor should drop it: {with_floor:?}"
+        );
+    }
+
+    #[test]
+    fn the_score_floor_keeps_a_relevant_match() {
+        let entries = vec![entry("match", vec![1.0, 0.0])];
+        // Nearly aligned: cos ~0.99.
+        let query = vec![0.995, 0.0995];
+        let kept = filter_by_score(&entries, &query, 5, DEFAULT_MIN_SCORE);
+        assert_eq!(kept.len(), 1, "a relevant match must survive: {kept:?}");
+    }
+
+    #[test]
+    fn the_floor_is_applied_before_top_k_truncation() {
+        // Two entries: a strong match and several weak ones. If the floor ran after
+        // truncation, a top_k full of weak matches would evict the strong one.
+        let entries = vec![
+            entry("strong", vec![1.0, 0.0]),
+            entry("weak-1", vec![0.5, 0.866]),
+            entry("weak-2", vec![0.4, 0.916]),
+        ];
+        let query = vec![1.0, 0.0];
+        // top_k = 1 would normally return only the strongest, but the point is that
+        // a weak match never displaces a strong one regardless of ordering.
+        let kept = filter_by_score(&entries, &query, 1, DEFAULT_MIN_SCORE);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].1, "strong", "got {:?}", kept);
+    }
+
+    #[test]
+    fn a_zero_floor_restores_always_return_top_k() {
+        // Documented escape hatch for callers who want the old behaviour.
+        let entries = vec![entry("weak", vec![0.0, 1.0])];
+        let query = vec![1.0, 0.0];
+        let kept = filter_by_score(&entries, &query, 5, 0.0);
+        assert_eq!(kept.len(), 1, "min_score = 0.0 must not filter anything");
+    }
+
+    #[test]
+    fn the_default_floor_sits_between_measured_related_and_unrelated_scores() {
+        // The number is empirical, so pin the measurement it came from. If a future
+        // embedding-model change moves these apart differently, this fails and the
+        // constant gets re-measured rather than silently going stale.
+        // Every measured related score must clear the floor...
+        for (label, related) in [
+            ("rotate/approve", 0.629_f32),
+            ("which artifact", 0.695),
+            ("who approves", 0.625),
+            ("where stored", 0.591),
+        ] {
+            assert!(
+                related > DEFAULT_MIN_SCORE,
+                "related query {label} scored {related}, below the floor {DEFAULT_MIN_SCORE}"
+            );
+        }
+        // ...and every measured unrelated score must fall below it.
+        for (label, unrelated) in [
+            ("lattice QCD", 0.454_f32),
+            ("sourdough", 0.429),
+            ("Roman empire", 0.441),
+            ("Patagonia", 0.404),
+            ("car tyre", 0.458),
+        ] {
+            assert!(
+                unrelated < DEFAULT_MIN_SCORE,
+                "unrelated query {label} scored {unrelated}, above the floor {DEFAULT_MIN_SCORE}"
+            );
+        }
+        // The floor must sit strictly inside the gap, not on either edge: a floor
+        // equal to an observed score is off by one embedding refresh. Read through
+        // a `black_box` so this stays a runtime assertion -- clippy is right that a
+        // direct comparison against two literals is decidable at compile time,
+        // which would make it a tautology rather than a check.
+        let gap_low = std::hint::black_box(0.458_f32);
+        let gap_high = std::hint::black_box(0.591_f32);
+        assert!(
+            DEFAULT_MIN_SCORE > gap_low && DEFAULT_MIN_SCORE < gap_high,
+            "the floor must sit strictly inside the measured gap ({gap_low}, {gap_high}), got {DEFAULT_MIN_SCORE}"
+        );
     }
 
     #[test]

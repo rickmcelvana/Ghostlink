@@ -281,6 +281,26 @@ pub fn is_vetted_auto_apply(
     canon_path.starts_with(canon_root)
 }
 
+/// Whether a specific memory write is safe to apply without asking.
+///
+/// `memory_remember` is the one write in the system with no filesystem target and
+/// no irreversible consequence: it appends a row the user can delete, scoped to a
+/// workspace the server stamps itself. Gating it meant nothing was ever
+/// remembered unless the user answered an approval prompt for each fact -- which
+/// made both the memory store and the recall that reads it close to dead weight.
+///
+/// `memory_forget` is deliberately NOT included. Forgetting is not reversible --
+/// there is no un-forget -- so a misfired delete should still cost a human
+/// decision. Nothing that destroys data earns a blanket exemption, however
+/// convenient it would be.
+///
+/// Scope is the real control here, not the prompt: `is_scope_stamped` forces the
+/// workspace id at dispatch, so an auto-applied write lands in the same workspace
+/// the chat is bound to and cannot be redirected by the model.
+pub fn is_vetted_memory_write(server: &str, tool: &str) -> bool {
+    server == "memory" && tool == "memory_remember"
+}
+
 /// Memory tools whose arguments carry a workspace scope the server must not be
 /// able to choose for itself.
 ///
@@ -418,6 +438,12 @@ pub fn decide(
     }
 
     if is_vetted_auto_apply(class, resolved_path, workspace_root) {
+        return Decision::Allow;
+    }
+
+    // Pathless vetted write (memory). Checked after the path-based rule so a
+    // memory call can never be how an arbitrary workspace edit sneaks through.
+    if class == CapabilityClass::Write && is_vetted_memory_write(server, tool) {
         return Decision::Allow;
     }
 
@@ -816,5 +842,93 @@ mod tests {
             assert_eq!(classify("git", tool), CapabilityClass::Write);
         }
         assert_eq!(classify("sqlite", "append_insight"), CapabilityClass::Write);
+    }
+
+    // --- vetted memory write -------------------------------------------------
+    //
+    // The whole point of this path is that remembering stops requiring a prompt,
+    // so the security-relevant assertions are about what must NOT be exempted.
+
+    #[test]
+    fn memory_remember_auto_applies() {
+        assert!(is_vetted_memory_write("memory", "memory_remember"));
+    }
+
+    #[test]
+    fn memory_forget_is_never_auto_applied() {
+        // Irreversible. There is no un-forget, so a misfired delete must still
+        // cost a human decision.
+        assert!(!is_vetted_memory_write("memory", "memory_forget"));
+        let d = decide(
+            "ws",
+            "memory",
+            "memory_forget",
+            None,
+            std::path::Path::new("."),
+        );
+        assert!(
+            matches!(d, Decision::NeedsApproval { .. }),
+            "forget must still require approval, got {d:?}"
+        );
+    }
+
+    #[test]
+    fn only_the_memory_server_gets_the_exemption() {
+        // A different server offering a same-named tool is not covered.
+        assert!(!is_vetted_memory_write("filesystem", "memory_remember"));
+        assert!(!is_vetted_memory_write(
+            "brand-new-server",
+            "memory_remember"
+        ));
+    }
+
+    #[test]
+    fn the_exemption_does_not_reach_other_tools_on_the_memory_server() {
+        for tool in ["memory_search", "memory_catalog"] {
+            assert!(!is_vetted_memory_write("memory", tool), "{tool}");
+        }
+    }
+
+    #[test]
+    fn a_write_on_another_server_still_needs_approval() {
+        // rag.index_document stays gated: indexing is not a free local append.
+        let d = decide(
+            "ws",
+            "rag",
+            "index_document",
+            None,
+            std::path::Path::new("."),
+        );
+        assert!(matches!(d, Decision::NeedsApproval { .. }), "{d:?}");
+    }
+
+    #[test]
+    fn the_exemption_does_not_reach_exec() {
+        // The gate is keyed on class == Write, so an Exec tool on the memory
+        // server cannot pick up this path.
+        assert!(!is_vetted_memory_write("memory", "memory_shell"));
+        let d = decide(
+            "ws",
+            "memory",
+            "memory_shell",
+            None,
+            std::path::Path::new("."),
+        );
+        assert!(matches!(d, Decision::NeedsApproval { .. }), "{d:?}");
+    }
+
+    #[test]
+    fn the_exemption_is_workspace_scoped_not_path_scoped() {
+        // No filesystem path is involved; the control is the stamped workspace.
+        // So a call is allowed regardless of cwd, and the scope is enforced at
+        // dispatch by is_scope_stamped rather than here.
+        let d = decide(
+            "ws_a",
+            "memory",
+            "memory_remember",
+            None,
+            std::path::Path::new("."),
+        );
+        assert!(d.is_allowed(), "a stamped-scope memory write should apply");
     }
 }

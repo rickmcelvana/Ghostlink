@@ -211,14 +211,54 @@ if ($env:GHOSTLINK_GPU_NAME -or $env:GHOSTLINK_VRAM_GB -or $env:GHOSTLINK_LLAMA_
 }
 
 # --- 1. Build ghost-link.exe (native Windows binary, real GPU auto-detection) ---
+#
+# Built on EVERY launch, not just the first. The previous `if (-not (Test-Path
+# $ApiBin))` meant a stale binary was never rebuilt -- so an edited source tree
+# kept serving the code from whenever the binary happened to be created. That is
+# exactly how a release build a day older than the source ended up running: it
+# existed, so nothing rebuilt it.
+#
+# cargo is incremental, so an unchanged tree costs a few seconds rather than a full
+# rebuild.
 Write-Step "Ghost-Link API binary"
 $ApiBin = Join-Path $RootDir "target\release\ghost-link.exe"
-if (-not (Test-Path $ApiBin)) {
-    Write-Warn "Building release binary (first run only)..."
-    cargo build --release -p ghost-link
-    if ($LASTEXITCODE -ne 0) { Write-Err "cargo build failed"; exit 1 }
-}
+cargo build --release -p ghost-link
+if ($LASTEXITCODE -ne 0) { Write-Err "cargo build failed (ghost-link)"; exit 1 }
+if (-not (Test-Path $ApiBin)) { Write-Err "ghost-link.exe missing after build"; exit 1 }
 Write-Ok "API binary: $ApiBin"
+
+# --- 1b. Build the MCP servers the registry points at ---
+#
+# These are separate binaries referenced by path from mcp_servers.toml. They were
+# never built by the launcher, so they silently stayed at whatever vintage they
+# were last built at -- which is how `mcp-rag.exe` served code predating its
+# relevance floor while `ghost-link.exe` was current.
+#
+# Built unconditionally for the same reason as above. Failure is a warning, not a
+# fatal: a missing optional MCP server degrades the assistant's tools, but the
+# server itself is still worth starting so the user can see what is connected.
+Write-Step "MCP server binaries"
+foreach ($McpCrate in @("mcp-memory", "mcp-rag", "mcp-calculator", "mcp-vision")) {
+    $McpBin = Join-Path $RootDir "target\release\$McpCrate.exe"
+    if (Test-Path $McpBin) {
+        # Skip the cargo call when the built binary is already newer than every
+        # source file in the crate -- keeps a normal launch fast while still
+        # guaranteeing a source change is never served stale.
+        $NewestSource = Get-ChildItem -Path (Join-Path $RootDir "crates\$McpCrate\src") -Recurse -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($NewestSource -and $McpBin -and ((Get-Item $McpBin).LastWriteTime -ge $NewestSource.LastWriteTime)) {
+            Write-Ok "$McpCrate.exe is current"
+            continue
+        }
+    }
+    Write-Warn "Building $McpCrate..."
+    cargo build --release -p $McpCrate
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warn "$McpCrate failed to build; its tools will be unavailable"
+    } else {
+        Write-Ok "$McpCrate.exe"
+    }
+}
 
 # --- 2. Build control-plane.exe (Go gateway in front of ghost-link) ---
 Write-Step "Control-plane binary"
