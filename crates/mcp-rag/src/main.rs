@@ -244,9 +244,32 @@ fn rank<'a>(
     scored
 }
 
-#[derive(Debug, Clone)]
+/// Which local embedding backend to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmbedBackend {
+    /// llama-server's OpenAI-compatible `/v1/embeddings`.
+    Llama,
+    /// Ollama's native `/api/embeddings`.
+    Ollama,
+    /// Try llama, fall back to Ollama.
+    Auto,
+}
+
+impl EmbedBackend {
+    fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "llama" | "llamacpp" | "llama-server" => Self::Llama,
+            "ollama" => Self::Ollama,
+            _ => Self::Auto,
+        }
+    }
+}
+
 struct Rag {
     ollama_url: String,
+    /// Base URL of the llama-server instance serving `/v1/embeddings`.
+    embed_url: String,
+    backend: EmbedBackend,
     embed_model: String,
     client: reqwest::Client,
     index_path: PathBuf,
@@ -262,6 +285,14 @@ impl Rag {
         Self {
             ollama_url: std::env::var("OLLAMA_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string()),
+            // A second llama-server, separate from the chat model on :8080 --
+            // an embedding model and a chat model cannot share one instance.
+            embed_url: std::env::var("EMBEDDING_URL")
+                .or_else(|_| std::env::var("GHOSTLINK_EMBEDDING_URL"))
+                .unwrap_or_else(|_| "http://127.0.0.1:8081".to_string()),
+            backend: EmbedBackend::parse(
+                &std::env::var("GHOSTLINK_EMBED_BACKEND").unwrap_or_else(|_| "auto".to_string()),
+            ),
             embed_model: std::env::var("OLLAMA_EMBED_MODEL")
                 .unwrap_or_else(|_| "nomic-embed-text".to_string()),
             client: reqwest::Client::new(),
@@ -270,7 +301,81 @@ impl Rag {
         }
     }
 
+    /// Embeds `text` via whichever local backend is configured.
+    ///
+    /// Two supported backends, chosen by `GHOSTLINK_EMBED_BACKEND` (default
+    /// `auto`):
+    ///
+    /// - `llama` — llama-server's OpenAI-compatible `POST /v1/embeddings`, which
+    ///   returns `{"data":[{"embedding":[...]}]}`. This is the path that removes
+    ///   the Ollama dependency; run a second `llama-server --embedding
+    ///   --pooling mean` on its own port and point `EMBEDDING_URL` at it.
+    /// - `ollama` — the original `POST /api/embeddings`, kept so an existing
+    ///   Ollama-based setup keeps working untouched.
+    ///
+    /// `auto` tries llama first and falls back to Ollama. Embedding vectors are
+    /// only comparable within a model, so a fallback that silently changes model
+    /// would quietly corrupt the index -- the error messages name the expected
+    /// backend and how to start it for that reason.
     async fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
+        match self.backend {
+            EmbedBackend::Llama => self.embed_llama(text).await,
+            EmbedBackend::Ollama => self.embed_ollama(text).await,
+            EmbedBackend::Auto => match self.embed_llama(text).await {
+                Ok(v) => Ok(v),
+                Err(llama_err) => match self.embed_ollama(text).await {
+                    Ok(v) => Ok(v),
+                    Err(ollama_err) => Err(format!(
+                        "no embedding backend reachable. llama-server: {llama_err}\n\
+                         Ollama: {ollama_err}"
+                    )),
+                },
+            },
+        }
+    }
+
+    async fn embed_llama(&self, text: &str) -> Result<Vec<f32>, String> {
+        let url = format!("{}/v1/embeddings", self.embed_url.trim_end_matches('/'));
+        // `input` as a single-element array is the OpenAI shape; the reply nests
+        // the vector under `data[0].embedding`.
+        let payload = serde_json::json!({ "model": self.embed_model, "input": [text] });
+        let resp = self
+            .client
+            .post(&url)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|err| {
+                format!(
+                    "failed to reach llama-server at {url}: {err} (start it with \
+                     `llama-server -m <embedding-model>.gguf --embedding --pooling mean \
+                     --host 127.0.0.1 --port 8081`, and set EMBEDDING_URL)"
+                )
+            })?;
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|err| format!("invalid JSON from llama-server: {err}"))?;
+        let embedding = body
+            .get("data")
+            .and_then(|d| d.get(0))
+            .and_then(|d| d.get("embedding"))
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                "llama-server reply had no data[0].embedding (is it running with \
+                 --embedding --pooling mean?)"
+                    .to_string()
+            })?
+            .iter()
+            .filter_map(|v| v.as_f64().map(|f| f as f32))
+            .collect::<Vec<f32>>();
+        if embedding.is_empty() {
+            return Err("llama-server returned an empty embedding".to_string());
+        }
+        Ok(embedding)
+    }
+
+    async fn embed_ollama(&self, text: &str) -> Result<Vec<f32>, String> {
         let url = format!("{}/api/embeddings", self.ollama_url.trim_end_matches('/'));
         let payload = serde_json::json!({ "model": self.embed_model, "prompt": text });
         let resp = self
@@ -295,7 +400,10 @@ impl Rag {
             .ok_or_else(|| "error: no 'embedding' field in Ollama's reply".to_string())?
             .iter()
             .filter_map(|v| v.as_f64().map(|f| f as f32))
-            .collect();
+            .collect::<Vec<f32>>();
+        if embedding.is_empty() {
+            return Err("Ollama returned an empty embedding".to_string());
+        }
         Ok(embedding)
     }
 }

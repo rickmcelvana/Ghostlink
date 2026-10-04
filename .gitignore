@@ -148,3 +148,8 @@ ghostlink_gui_modern/public/env-config.js
 approvals.json
 schedules.json
 ghostlink_memory.db
+
+# llama.cpp prebuilt binaries (downloaded, not source) and locally-fetched
+# GGUF weights. Neither belongs in the repo.
+tools/llama.cpp/
+models/nomic-embed-text*.gguf

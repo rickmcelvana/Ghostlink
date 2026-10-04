@@ -7,6 +7,20 @@ All notable changes to Ghostlink Studio are documented here.
 ## [Unreleased]
 
 ### Changed
+- **`mcp-rag` can now embed via llama-server, removing the Ollama dependency** (`crates/mcp-rag/src/main.rs`, `mcp_servers.example.toml`, `mcp_servers.toml`, `.gitignore`):
+  `rag_embed` now selects a backend via `GHOSTLINK_EMBED_BACKEND`. `llama` targets llama-server's OpenAI-compatible `POST /v1/embeddings` (`data[0].embedding`); `ollama` keeps the original `POST /api/embeddings` (`embedding`) untouched; `auto` tries llama then falls back. **An existing Ollama setup keeps working with no config change** -- `auto` is the default.
+  Verified live with Ollama pointed at a dead port: indexed and searched in 0.0s, 768-dim vectors from `nomic-embed-text-v1.5.Q4_K_M` (84MB), with real semantic separation (cosine 0.918 for a paraphrase vs 0.407 across unrelated topics).
+  Requires a **second** llama-server on its own port -- an embedding model and a chat model cannot share one instance:
+  `llama-server -m models/nomic-embed-text-v1.5.Q4_K_M.gguf --embedding --pooling mean --host 127.0.0.1 --port 8081`
+  Vectors are only comparable within a model, so switching backend requires re-indexing; the config comment says so.
+
+### Fixed
+- **RAG workspace indexing no longer requires Ollama** (`crates/ghost-link/src/main.rs`):
+  the `/api/workspace/index` pre-flight probe hard-coded an Ollama health check, so a llama-only machine was answered `Ollama isn't reachable ... status: skipped` while its actual embedding backend was running fine. The probe now mirrors `mcp-rag`'s backend selection: an explicit backend probes only that one, and `auto` requires only that *either* answers.
+  This was found by the live test above, not by inspection -- the first version of the change looked correct and still returned the Ollama error.
+- Prebuilt llama.cpp binaries (`tools/llama.cpp/`) and locally-fetched GGUF weights (`models/nomic-embed-text*.gguf`) are gitignored. Neither belongs in the repo.
+
+### Changed
 - **Replaced `brave-search` with a local, keyless web search** (`mcp_servers.example.toml`, `crates/ghost-link/src/capability.rs`):
   `brave-search` required `BRAVE_API_KEY` and a paid account, which sat awkwardly against this project's all-local constraint. It is replaced by `duckduckgo-mcp-server` (`npx -y duckduckgo-mcp-server`), verified live: it handshakes, advertises a single tool `duckduckgo_web_search`, and returns real results with no API key.
   **Stated plainly because it matters operationally:** DuckDuckGo's free HTML endpoint rate-limits aggressively and answers `DDG detected an anomaly in the request, you are likely making requests too quickly` under load. That was observed directly during verification. It suits occasional lookups and is not a high-throughput search backend. A self-hosted SearXNG instance is the sturdier option if that becomes a problem -- it needs a container but no account.
