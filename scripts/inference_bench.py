@@ -131,6 +131,45 @@ def build_prompt(target_tokens: int) -> str:
     return text
 
 
+# A deliberately tiny prompt, used to measure per-request fixed overhead.
+#
+# Added because the harness could not see a 3,800-token constant: every prompt it
+# generated was thousands of tokens of filler, where fixed overhead is noise. Real
+# chat turns are often a sentence long, and there the overhead *is* the latency.
+#
+# Kept tiny and literal rather than generated, so the token count is stable across
+# runs and the number is comparable over time.
+OVERHEAD_PROMPT = "Reply with exactly: OK"
+
+
+def measure_overhead(bench: "Bench", runs: int = 5) -> dict:
+    """Prompt tokens and TTFT for a five-word request.
+
+    This is the number that should be watched for regressions in prompt assembly. It is
+    reported separately from prefill throughput on purpose: throughput can be healthy
+    while the constant is enormous, which is exactly the failure this found.
+    """
+    for _ in range(2):
+        bench.run_once(OVERHEAD_PROMPT, "overhead-warmup")
+    samples = []
+    for _ in range(runs):
+        s = bench.run_once(OVERHEAD_PROMPT, "overhead")
+        s.ttft_ms = bench._stream_once(OVERHEAD_PROMPT)
+        samples.append(s)
+    ok = [s for s in samples if s.error is None]
+    return {
+        "prompt_tokens": median_of(s.prompt_tokens for s in ok),
+        "ttft_ms": median_of(s.ttft_ms for s in ok),
+        "errors": [s.error for s in samples if s.error],
+        "runs": len(ok),
+    }
+
+
+def median_of(values):
+    vals = sorted(v for v in values if v is not None)
+    return vals[len(vals) // 2] if vals else None
+
+
 class Bench:
     def __init__(self, base: str, token: str, timeout: int = 600):
         self.base = base.rstrip("/")
@@ -407,6 +446,11 @@ def main() -> int:
     ap.add_argument("--label", default="run", help="label for this configuration")
     ap.add_argument("--compare", default="", help="comma-separated labels to compare, e.g. local,rpc")
     ap.add_argument("--no-warmup", action="store_true", help="skip the warmup request")
+    ap.add_argument(
+        "--overhead-only",
+        action="store_true",
+        help="measure only per-request fixed overhead (a five-word prompt) and exit",
+    )
     args = ap.parse_args()
 
     try:
@@ -424,10 +468,33 @@ def main() -> int:
     ctx = bench.describe()
     print(f"measuring: model={ctx.get('model')} mcp={len(ctx.get('mcp_servers') or [])} servers")
 
+    if args.overhead_only:
+        # The short-prompt probe, on its own. Exits here so it can be run in CI or a
+        # pre-commit hook as a regression gate on prompt assembly, independently of any
+        # throughput configuration.
+        oh = measure_overhead(bench, runs=max(3, args.runs))
+        print("\nper-request fixed overhead (five-word prompt)")
+        print(f"  prompt tokens : {oh['prompt_tokens']}")
+        print(f"  ttft          : {fmt(oh['ttft_ms'], ' ms', 12)}")
+        if oh["errors"]:
+            print(f"  errors        : {oh['errors']}")
+        # A number, not a threshold: this tool reports, it does not gate. A hard limit
+        # would need a per-model baseline, and a baseline that silently encodes today's
+        # tool catalog is exactly the kind of number that rots.
+        return 0
+
     res = bench.measure(
         args.label, args.runs, args.prompt_tokens, warmup=0 if args.no_warmup else 1
     )
     report([res], ctx)
+
+    # Always show the overhead alongside throughput. The two answer different questions
+    # and averaging them hides both: a healthy prefill rate says nothing about whether
+    # every request is carrying thousands of tokens of constant.
+    oh = measure_overhead(bench, runs=max(3, args.runs))
+    print("\nper-request fixed overhead (five-word prompt)")
+    print(f"  prompt tokens : {oh['prompt_tokens']}")
+    print(f"  ttft          : {fmt(oh['ttft_ms'], ' ms', 12)}")
 
     if args.compare:
         names = [n.strip() for n in args.compare.split(",") if n.strip()]
