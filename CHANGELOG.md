@@ -7,6 +7,141 @@ All notable changes to Ghostlink Studio are documented here.
 ## [Unreleased]
 
 ### Added
+- **Speculative decoding is now wired to `llama-server`.** `GHOSTLINK_DRAFT_MODEL`, `GHOSTLINK_DRAFT_MAX` and `GHOSTLINK_DRAFT_P_MIN` were documented in `LOCAL_INFERENCE_TUNING.md` with a specific promise about which flags they set, and **no code in the repository read any of them** -- setting them did nothing.
+
+  The documented flag names were also stale for this build. `llama-server --help`:
+  ```
+  --draft, --draft-n, --draft-max N   the argument has been removed.
+                                     use --spec-draft-n-max or ...
+  ```
+  Passing `--draft-max` as documented would make `llama-server` exit on an unknown argument. Now passes `--spec-draft-model`, `--spec-draft-n-max`, `--spec-draft-p-min`.
+
+  Off by default, and not enabled automatically: a draft model close in size to the target costs more than it saves. A `GHOSTLINK_DRAFT_MODEL` that does not exist disables the feature with a log line rather than failing the load -- the primary model is fine and this was only ever an optimization.
+
+- **`-t` now uses performance cores on a hybrid CPU.** `SystemProfile::cpu.performance_cores` was measured on every probe and never read; `get_threads` returned `available_parallelism`. Measured on this host (Ryzen AI 7 350, `-ngl 0` so the question is genuinely CPU-bound, 4 runs, medians):
+
+  | `-t` | prefill | decode |
+  |---|---|---|
+  | 4 | 254.2 tok/s | 22.36 tok/s |
+  | 8 (P-cores + SMT) | 254.1 tok/s | 21.55 tok/s |
+  | 16 (all logical) | 246.2 tok/s | 20.18 tok/s |
+
+  **1.07x decode.** Modest rather than 2x -- llama.cpp's own thread scaling is good -- but it was not being applied at all. `-t 8` rather than `-t 4`: `performance_cores` is a physical count, so it is scaled by `logical / physical` to keep SMT on the performance cores. Falls back to `available_parallelism` unchanged when there is no real P/E split, since halving threads on a uniform-core CPU would be a large invisible regression.
+
+### Changed
+- **`docs/LOCAL_INFERENCE_TUNING.md` records the draft-model flags that actually exist**, and notes that the host's CPU topology is not what its name suggests: "Ryzen AI 7 350" reads as uniform-core, but `GetLogicalProcessorInformationEx` reports 8 processor-core records with `EfficiencyClass = [1,0,1,0,1,0,1,0]` -- 4 performance, 4 efficiency. Read, not assumed.
+
+
+### Added
+- **Single-node knob A/B harness** (`scripts/llama_knob_ab.py`): A/Bs batch size, Flash Attention and KV-cache precision against the vendored `llama-server`, one variable at a time, on a single node. Prefill and decode are reported separately and a `-` is printed for anything llama.cpp did not report.
+
+  Item 4 of the inference audit is a list of knobs with upstream numbers attached. This makes each one checkable instead of assumed.
+
+  Waits for `/completion` to answer rather than for the port to bind. llama-server binds while the model is still loading and returns HTTP 503 until it is done, so a socket check reports "ready" immediately and the first measured request dies -- which is exactly what the first version of this script did.
+
+### Changed
+- **`docs/LOCAL_INFERENCE_TUNING.md` no longer claims `-b 2048 -ub 512` is the difference between ~70 and 300+ prompt tok/s.** Measured on this project's reference hardware (Radeon 860M / Vulkan / 16.4GB, Llama-3.2-3B Q3_K_M, 3,372-token prompt where prefill dominates, 4 runs, medians):
+
+  | config | prefill | decode |
+  |---|---|---|
+  | `-b 512 -ub 128` | 303.0 tok/s | 12.55 tok/s |
+  | `-b 2048 -ub 512` | 327.2 tok/s | 12.77 tok/s |
+  | `-b 2048 -ub 2048` | 321.0 tok/s | 12.71 tok/s |
+
+  **+8% prefill**, not 4x. That figure is presumably about discrete-GPU CUDA with a much larger batch; it does not reproduce here. `-ub 2048` is slightly worse than `-ub 512`, so raising it further buys nothing.
+
+  Prompt size changes the sign of the result. At 893 prompt tokens the same change measured as a *regression* (0.62x prefill, 3.04x slower decode) because wall time there is decode-dominated and the larger batch just holds more VRAM. Neither number is wrong; averaging them is.
+
+
+### Added
+- **Tensor-class planning for distributed offload** (`crates/ghost-link/src/tensor_plan.rs`): `-ts` says *how much* goes to each device; it does not say *which tensors*. llama-server therefore spreads whole layers -- attention, KV cache and `lm_head` included -- across the link, paying a network round trip per token for tensors that are tiny or reused constantly. The new planner routes FFN and MoE experts remotely and pins embeddings, attention, KV and `lm_head` locally, with a latency term that refuses a peer whose RPC RTT exceeds the local CPU-offload penalty.
+
+  `GHOSTLINK_RPC_RTT_MS` and `GHOSTLINK_CPU_OFFLOAD_PENALTY_MS` configure the comparison.
+
+- **`-ot` now actually reaches `llama-server`.** `GHOSTLINK_LLAMA_OVERRIDE_TENSOR` already named the right split (`ffn=RPC,exps=RPC`) but existed only as a string literal inside a unit test -- there was no code path from it to the process. The plan is now computed at peer discovery and passed through `load_model_into_slot`.
+
+### Fixed
+- **Distributed inference no longer hands `llama-server` flags it rejects.** This repo's vendored `llama.cpp` was built with `GGML_RPC:BOOL=OFF`, verified three ways:
+  ```
+  $ llama-server ... --rpc 127.0.0.1:59999
+  error: invalid argument: --rpc          (exit 1)
+  $ grep GGML_RPC build/CMakeCache.txt
+  GGML_RPC:BOOL=OFF
+  $ grep -- --rpc <(llama-server --help)  -> no match
+  ```
+  A load with `distributed_inference` on was being passed `--rpc` and `-ts` and failed with a bare `invalid argument: --rpc`, which reads like a malformed command line rather than a build without distributed-inference support. `native_engine::binary_supports_rpc` now probes the configured binary once and returns a specific, actionable error naming `GGML_RPC=ON`.
+
+  This was never caught because the RPC path has never been exercised on this machine. It is a fix to the failure mode, not a claim that distributed inference now works -- it cannot, until llama.cpp is rebuilt with RPC enabled.
+
+- **`-ot` buffer types are addressed the way llama.cpp resolves them.** `arg.cpp:272` resolves every `-ot` value against the buffer types of *registered* devices and throws `unknown buffer type` otherwise; `ggml-rpc.cpp:1092` builds a remote device's name as `RPC0[endpoint]`. The bare word `RPC` was tested against the real binary and rejected:
+  ```
+  $ llama-server -m model.gguf -ot ffn=RPC
+  error while handling argument "-ot": unknown buffer type
+  ```
+  The emitted value is now `RPC0[<endpoint>]`, built from the same peer address passed to `--rpc`.
+
+- **"Fits locally" now accounts for the KV cache** (`rpc_cluster::model_fits_locally`). The check was `model_size + 1.0 <= vram`, which passes for a model whose *weights* fit but whose KV cache does not -- and that is a failed model load, not a slow one. Now weights + KV (scaled by context length) + 1 GB headroom.
+
+- **`TCP_NODELAY` on both legs of the RPC allowlist proxy.** `ggml-rpc` moves small, latency-critical frames -- one per matmul, one result per token. Nagle's algorithm can hold a small write for up to the delayed-ACK timeout (~40ms) in each direction, and forwarding through a userspace proxy built on default sockets silently reintroduced it after llama.cpp had set it on its own. Best-effort: a socket that cannot be configured still works, just slower, and this is never a reason to drop a legitimate peer. Security checks are unchanged.
+
+  Scoped honestly: the proxy only runs when `rpc_allowed_peers` or `rpc_shared_secret` is configured. With both empty, `ggml-rpc-server` binds the public address directly and there is no data path to slow down.
+
+
+### Added
+- **Sliding window for chat history** (`crates/ghost-link/src/context_window.rs`): the audit's item 5 said sliding window / compact policies were "documented and not implemented on the chat path". `GHOSTLINK_KEEP_LAST_TURNS` did not exist anywhere in the codebase. Now there is a window with a completion reserve and a bounded keep-last floor, plus `GHOSTLINK_KEEP_LAST_TURNS` (default 4) and `GHOSTLINK_COMPLETION_RESERVE_TOKENS`.
+
+  Every turn re-evaluated the whole history against the token ceiling. With prefill measured at 245 tok/s, a long conversation paid a ~21.7s prefill on *every* turn, so TTFT grew without bound until the ceiling finally bit.
+
+- **History budget clamped to the context the model actually runs** (`native_engine::probe_running_ctx_size`). `conversation_token_limit` is a user preference; the running context is derived from VRAM and model size. They disagreed, and budgeting against the preference alone produced requests the model rejects outright:
+  ```
+  request (18848 tokens) exceeds the available context size (8192 tokens)
+  ```
+  That is an HTTP 400, not a degraded answer. The chat path now asks the server itself (`/props`) rather than predicting. `n_ctx` is also divided by `total_slots` — llama-server splits context across slots, so `-np 2` on an 8192 ctx is two 4096 contexts, and budgeting against 8192 is rejected at ~4096.
+
+- **Summarization prompt is bounded as a whole** (`context_window::bound_turns`). It previously clipped each turn to 2000 characters and nothing else, so a trim that dropped 80 turns still assembled 80 x 2000 chars — a 21,485-token request against an 8192 context. The user saw nothing: summarization runs detached, so they got an answer and silently lost the summary.
+
+### Changed
+- **Fallback token estimate is conservative** (`context_window::conservative_token_estimate`). Whitespace counting undercounted by ~15% against the real tokenizer (420 words vs 481 tokens, measured on the running server's `/tokenize`). Undercounting is the dangerous direction — it admits prompts the server then rejects. Now words plus 15% of characters.
+
+  Worth being explicit about: the native path uses the real tokenizer, so this only affects non-native backends and tokenizer failures. The measured undercount was on real English prose, not a synthetic edge case.
+
+### Fixed
+- **A long conversation no longer fails outright.** Verified live: an 80-turn, ~60,000-token history previously returned HTTP 400 on every attempt and now answers with 6,743 prompt tokens at 195 tok/s prefill, 8.6 tok/s decode, and summarization succeeding.
+
+  This took four attempts to fix because each attempt fixed a real defect and none of them was the one causing the 400. In order: the budget ignored the completion reserve; the budget exceeded the real context; the derived context size was absent whenever Ghostlink reused a server it did not launch; and the failing request was not the chat request at all but a detached summarization with no total bound.
+
+  That last one is the actual lesson, and it is why the harness came first. Reading the chat path carefully, four times over, would not have found it — the log line `summarization failed (llama_server request failed with status 400 ... request (21485 tokens))` named a different function than the one under inspection. Grep the log, not the code you assume is running.
+
+  26 new tests. The load-bearing ones assert that a per-item cap is not a total cap (80 x 2000 chars must not assemble into 21,485 tokens), that the newest turn survives an overflowing budget, and that the fallback estimate never lands below the real tokenizer's answer.
+
+
+### Added
+- **Inference measurement harness** (`scripts/inference_bench.py`, `crates/ghost-link/src/native_engine.rs`):
+  reports **prefill and decode separately**, because a single tok/s figure over a chat request averages two unrelated costs. Prefill is compute-bound and batches; decode is bandwidth-bound and does not. Averaged together they move for reasons that have nothing to do with each other, which makes them useless for deciding whether a change helped.
+
+  The server was already returning llama.cpp's `prompt_n`, `prompt_ms` and `prompt_per_second` in the same `timings` object as the decode fields — and never read them. Only `predicted_*` was parsed, so prefill throughput, the number that decides whether a long history is affordable, was unmeasurable and every local-vs-RPC comparison had to fall back on end-to-end latency.
+
+  `NativeGeneration` and the chat response now carry `prompt_tokens`, `prompt_ms`, `prompt_tokens_per_sec` and `decode_tokens_per_sec`; the tool-loop path carries the same fields so both paths report the same split. `null` means llama.cpp did not report it — deliberately not `0`, which would read as "measured, and zero".
+
+  The harness refuses to guess. A missing measurement prints as `-`; `--compare` reports `INCONCLUSIVE` rather than picking a winner; a degraded backend returning error text instead of a generation is recorded as a failure rather than counted from its word count. It also flags the case it exists to catch: when a distributed configuration decodes measurably slower than a local one on a model that fits in a single device.
+
+  Measured on this machine (Llama-3.2-3B, ~5,300-token prompt, 3 runs):
+
+  ```text
+  prompt 245 tok/s   decode 13.3 tok/s   ttft 28,790 ms
+  ```
+
+  A 16x gap between the two halves, invisible before. The TTFT is consistent with the prefill figure (5324 / 245 ≈ 21.7s plus queueing), which is the cross-check that makes both believable.
+
+  6 new tests cover the timings parser, including that an absent field stays absent rather than becoming `Some(0.0)` — "not measured" and "measured as zero" must not look alike in a report.
+
+### Fixed
+- **TTFT is no longer recorded only on the streaming path.** Both `record_ttft` call sites were inside the SSE finalizers, so a buffered request — what an automated benchmark wants, since it can read the `timings` object — recorded no TTFT at all. The buffered path now cannot produce one (it never observes its own first token), so instead of a proxy the harness measures TTFT on the streaming path and the response exposes the rolling `ttft_p50_ms`/`ttft_p95_ms` as context.
+
+  Found by running the harness, not by reading the code: the first run reported `-` for TTFT on a path that had always claimed to measure it.
+
+
+### Added
 
 - **The chat shows why it answered the way it did** (`ghostlink_gui_modern/src/components/ChatTab.tsx`, `store.ts`):
   the server was already reporting four explanatory fields and the GUI read **none** of them — `recalled_memories`, `recalled_documents`, `action_claim_corrected` and `tools_run` were all sent on every response and all discarded. Every fact needed to answer "why did it say that" was on the wire and thrown away.

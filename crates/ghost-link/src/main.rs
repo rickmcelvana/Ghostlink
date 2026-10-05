@@ -3116,6 +3116,12 @@ struct NativeToolLoopOutcome {
     tokens: Option<u32>,
     tokens_per_sec: Option<f32>,
     latency_ms: Option<f32>,
+    /// Prefill, carried through from `NativeGeneration` so the tool-loop path
+    /// reports the same split as the plain one. A harness that measures one path
+    /// and not the other cannot compare them.
+    prompt_tokens: Option<u32>,
+    prompt_ms: Option<f32>,
+    prompt_tokens_per_sec: Option<f32>,
     tool_results: Vec<ToolResult>,
 }
 
@@ -3222,6 +3228,11 @@ async fn native_tool_loop_core(
                             tokens: None,
                             tokens_per_sec: None,
                             latency_ms: None,
+                            // No generation reached this path (turn timeout), so there is nothing
+                            // to measure. Left absent rather than zero.
+                            prompt_tokens: None,
+                            prompt_ms: None,
+                            prompt_tokens_per_sec: None,
                             tool_results,
                         });
                     }
@@ -3259,6 +3270,11 @@ async fn native_tool_loop_core(
                     tokens: None,
                     tokens_per_sec: None,
                     latency_ms: None,
+                    // No generation reached this path (backend error), so there is nothing
+                    // to measure. Left absent rather than zero.
+                    prompt_tokens: None,
+                    prompt_ms: None,
+                    prompt_tokens_per_sec: None,
                     tool_results,
                 });
             }
@@ -3277,6 +3293,9 @@ async fn native_tool_loop_core(
                 tokens,
                 tokens_per_sec: gen.tokens_per_sec,
                 latency_ms: gen.latency_ms,
+                prompt_tokens: gen.prompt_tokens,
+                prompt_ms: gen.prompt_ms,
+                prompt_tokens_per_sec: gen.prompt_tokens_per_sec,
                 tool_results,
             });
         };
@@ -3345,6 +3364,11 @@ async fn native_tool_loop_core(
         tokens: None,
         tokens_per_sec: None,
         latency_ms: None,
+        // No generation reached this path (budget exhausted), so there is nothing
+        // to measure. Left absent rather than zero.
+        prompt_tokens: None,
+        prompt_ms: None,
+        prompt_tokens_per_sec: None,
         tool_results,
     })
 }
@@ -5683,20 +5707,54 @@ fn build_summary_prompt(running_summary: &str, new_turns: &[(String, String)]) -
         out.push_str(running_summary.trim());
         out.push_str("\n\nNewer transcript:\n");
     }
-    for (role, content) in new_turns {
+    // Bound the transcript as a whole, not just each turn.
+    //
+    // The per-turn cap alone is not a total cap. A trim that dropped 80 turns still
+    // assembled 80 x 2000 chars, which reached llama-server as a 21,485-token request
+    // against an 8192 context and was rejected:
+    //
+    //     request (21485 tokens) exceeds the available context size (8192 tokens)
+    //
+    // Silent to the user, because the summarization runs detached -- they got an
+    // answer and lost the summary. Trimming *more* history made it worse: every turn
+    // feeds this prompt.
+    let budget = context_window::history_budget(
+        SUMMARY_PROMPT_TOKEN_BUDGET,
+        SUMMARY_PROMPT_REPLY_TOKENS,
+        native_engine::NativeEngineClient::running_ctx_size(),
+    );
+    let bounded = context_window::bound_turns(new_turns, budget, |(_, content)| {
+        context_window::conservative_token_estimate(
+            &content
+                .chars()
+                .take(SUMMARY_TURN_MAX_CHARS)
+                .collect::<String>(),
+        )
+    });
+    for (role, content) in bounded {
         let label = if role.eq_ignore_ascii_case("assistant") {
             "Assistant"
         } else {
             "User"
         };
-        // Bound each turn so one huge pasted message cannot blow the
-        // summarizer's own context.
-        let trimmed: String = content.chars().take(2000).collect();
+        let trimmed: String = content.chars().take(SUMMARY_TURN_MAX_CHARS).collect();
         out.push_str(&format!("{label}: {trimmed}\n"));
     }
     out.push_str("\nSummary:");
     out
 }
+
+/// Token budget for the transcript half of a summarization prompt.
+///
+/// Half the context by default: the running summary also has to fit, and a summary is
+/// a bounded 512-token generation, so there is no reason to spend more.
+const SUMMARY_PROMPT_TOKEN_BUDGET: usize = 2048;
+
+/// Completion allowance subtracted from the summarization budget.
+const SUMMARY_PROMPT_REPLY_TOKENS: usize = 512;
+
+/// Per-turn character cap inside a summarization prompt.
+const SUMMARY_TURN_MAX_CHARS: usize = 2000;
 
 /// Stores a session's summary, evicting the least-recently-updated entries
 /// once `SUMMARY_MAX_SESSIONS` is exceeded, and trimming the text itself to
@@ -7148,7 +7206,7 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         // qualifying peers, or (once `rpc_shared_secret` is set) every peer
         // fails the handshake — all of which reproduce single-node
         // behavior exactly.
-        let (rpc_servers, tensor_split, dist_warning, require_offload) = async {
+        let (rpc_servers, tensor_split, tensor_override, dist_warning, require_offload) = async {
             let (
                 peers,
                 local_vram,
@@ -7202,17 +7260,30 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                 }
             }; // <-- short-lived discovery lock dropped here, before any .await
 
-            let model_size_gb = native_engine::NativeEngineClient::resolve_model_path(&selected_model)
-                .ok()
-                .and_then(|p| fs::metadata(p).ok())
-                .map(|m| m.len() as f32 / (1024.0 * 1024.0 * 1024.0))
-                .unwrap_or(0.0);
+            let model_size_gb =
+                native_engine::NativeEngineClient::resolve_model_path(&selected_model)
+                    .ok()
+                    .and_then(|p| fs::metadata(p).ok())
+                    .map(|m| m.len() as f32 / (1024.0 * 1024.0 * 1024.0))
+                    .unwrap_or(0.0);
 
             let mut peers = peers;
-            if !peers.is_empty() && local_vram > 0.0 && (model_size_gb + 1.0) <= local_vram && !require_offload {
+            // Weights + KV + headroom, not weights alone. The old test was
+            // `model_size + 1.0 <= vram`, which passes for a model whose weights fit but
+            // whose KV cache does not -- and that is a failed model load, not a slow one.
+            let fits_locally = rpc_cluster::model_fits_locally(
+                model_size_gb,
+                local_vram,
+                native_engine::NativeEngineClient::running_ctx_size(),
+            );
+            if !peers.is_empty() && fits_locally && !require_offload {
                 tracing::warn!(
-                    "rpc_cluster: model ({:.2} GB) fits locally in VRAM ({:.2} GB) \u{2014} auto-disabling distributed inference to avoid unnecessary Ethernet RPC. Set GHOSTLINK_REQUIRE_CLUSTER_OFFLOAD=1 to force.",
-                    model_size_gb, local_vram
+                    "rpc_cluster: model ({:.2} GB) plus KV cache fits locally in VRAM \
+                     ({:.2} GB) \u{2014} auto-disabling distributed inference to avoid \
+                     unnecessary Ethernet RPC. Set GHOSTLINK_REQUIRE_CLUSTER_OFFLOAD=1 to \
+                     force.",
+                    model_size_gb,
+                    local_vram
                 );
                 peers.clear();
             }
@@ -7251,20 +7322,57 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             };
 
             if peers.is_empty() {
-                (None, None, None, require_offload)
+                (None, None, None, None, require_offload)
             } else {
                 let split =
                     rpc_cluster::compute_tensor_split(local_vram, local_system_memory, &peers);
                 match rpc_cluster::validate_distributed_offload(effective_ngl, &split) {
-                    Ok(()) => (
-                        Some(rpc_cluster::rpc_flag_value(&peers)),
-                        Some(rpc_cluster::tensor_split_flag_value(&split)),
-                        None,
-                        require_offload,
-                    ),
+                    Ok(()) => {
+                        // Which tensors go remote, decided by class rather than by an
+                        // equal layer share. A `-ts` ratio alone puts attention, the KV
+                        // cache and lm_head behind a network round trip per token.
+                        let peer_vram = peers.iter().map(|p| p.vram_gb).sum::<f32>();
+                        let plan = tensor_plan::plan_tensor_classes(
+                            local_vram,
+                            model_size_gb,
+                            peer_vram,
+                            tensor_plan::LatencyProfile {
+                                peer_rtt_ms: rpc_peer_rtt_ms(),
+                                local_cpu_penalty_ms: local_cpu_offload_penalty_ms(),
+                            },
+                        );
+                        // `-ot` resolves buffer types against *registered* devices, and
+                        // ggml-rpc names a remote device `RPC0[endpoint]` (ggml-rpc.cpp:1092).
+                        // The bare word "RPC" is rejected by llama-server, so the peer
+                        // address has to go in the value.
+                        let buffer_type = tensor_plan::rpc_buffer_type(&peers[0].addr.to_string());
+                        let override_value = tensor_plan::override_flag_value(&plan, &buffer_type);
+                        if override_value.is_empty() {
+                            tracing::info!(
+                                "rpc_cluster: no tensor class is worth placing remotely \
+                                 (local_vram={:.2} GB, model={:.2} GB, peer_vram={:.2} GB, \
+                                 rtt={} ms) -- keeping the whole model local",
+                                local_vram,
+                                model_size_gb,
+                                peer_vram,
+                                rpc_peer_rtt_ms()
+                            );
+                        } else {
+                            tracing::info!(
+                                "rpc_cluster: routing tensor classes remotely: {override_value}"
+                            );
+                        }
+                        (
+                            Some(rpc_cluster::rpc_flag_value(&peers)),
+                            Some(rpc_cluster::tensor_split_flag_value(&split)),
+                            Some(override_value).filter(|s| !s.is_empty()),
+                            None,
+                            require_offload,
+                        )
+                    }
                     Err(warn_msg) => {
                         tracing::warn!("Distributed offload no-op: {warn_msg}");
-                        (None, None, Some(warn_msg), require_offload)
+                        (None, None, None, Some(warn_msg), require_offload)
                     }
                 }
             }
@@ -7394,6 +7502,7 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                         &path,
                         rpc_servers.as_deref(),
                         tensor_split.as_deref(),
+                        tensor_override.as_deref(),
                     )
                 }
             })
@@ -7419,6 +7528,7 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                             &path,
                             rpc_servers.as_deref(),
                             tensor_split.as_deref(),
+                            tensor_override.as_deref(),
                         )
                     }
                 })
@@ -10153,11 +10263,69 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
     /// `token_estimate` computed a few lines into `handle_gui_chat`) rather
     /// than a real tokenizer - consistent, not exact, which is all a rough
     /// budget needs.
+    /// How many recent turns the sliding window protects from eviction.
+    ///
+    /// `GHOSTLINK_KEEP_LAST_TURNS`, default 4 (two full exchanges). Clamped to
+    /// `MAX_PROTECTED_TURNS`: the floor keeps the current exchange coherent, it does not
+    /// exempt an unbounded tail from the budget.
+    ///
+    /// This is the knob the inference audit named and could not find anywhere in the
+    /// codebase. It did not exist, so every turn re-evaluated the whole history against
+    /// the token ceiling and could resend all of it.
+    /// Round trip to an RPC peer, in milliseconds.
+    ///
+    /// Measured or configured. `GHOSTLINK_RPC_RTT_MS` overrides; the default is a fast
+    /// LAN. Used by the tensor-class planner to refuse placing work on a peer whose latency
+    /// exceeds the local CPU-offload penalty.
+    fn rpc_peer_rtt_ms() -> f32 {
+        std::env::var("GHOSTLINK_RPC_RTT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(tensor_plan::LatencyProfile::default().peer_rtt_ms)
+    }
+
+    /// Penalty for offloading a layer to the local CPU instead of VRAM, in milliseconds.
+    ///
+    /// A layer placed remotely pays `GHOSTLINK_RPC_RTT_MS` every token. A layer placed on
+    /// the local CPU pays bandwidth, not latency. Comparing the two is what decides whether
+    /// a peer is worth using at all.
+    fn local_cpu_offload_penalty_ms() -> f32 {
+        std::env::var("GHOSTLINK_CPU_OFFLOAD_PENALTY_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(tensor_plan::LatencyProfile::default().local_cpu_penalty_ms)
+    }
+
+    fn keep_last_turns() -> usize {
+        std::env::var("GHOSTLINK_KEEP_LAST_TURNS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(context_window::DEFAULT_KEEP_LAST_TURNS)
+            .min(context_window::MAX_PROTECTED_TURNS)
+    }
+
+    /// Completion headroom reserved out of the context for the reply.
+    ///
+    /// Without this the history budget can consume the whole context, leaving the answer
+    /// to be truncated against a limit produced by arithmetic rather than intent.
+    /// Defaults to the per-response allowance; `GHOSTLINK_COMPLETION_RESERVE_TOKENS`
+    /// overrides it.
+    fn completion_reserve_tokens(per_response: usize) -> usize {
+        std::env::var("GHOSTLINK_COMPLETION_RESERVE_TOKENS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(per_response)
+            .max(1)
+    }
+
     async fn trim_conversation_history_async(
         native_engine_client: &native_engine::NativeEngineClient,
         is_native: bool,
         messages: &[ChatHistoryTurn],
         token_budget: usize,
+        keep_last_turns: usize,
     ) -> (Vec<(String, String)>, bool) {
         let prior = if messages.is_empty() {
             &[][..]
@@ -10165,27 +10333,54 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             &messages[..messages.len() - 1]
         };
 
-        let mut budget = token_budget;
-        let mut kept: Vec<(String, String)> = Vec::new();
-        for turn in prior.iter().rev() {
+        // Measure every turn with the real tokenizer first, then let the sliding
+        // window decide. Tokenizing up front costs one round trip per turn, but it is
+        // the only way to know a turn's cost before deciding whether to keep it, and
+        // a budget built on estimated costs is a budget that is quietly wrong.
+        let mut measured: Vec<context_window::Turn> = Vec::with_capacity(prior.len());
+        for turn in prior {
             let cost = if is_native {
                 native_engine_client
                     .tokenize(&turn.content)
                     .await
-                    .unwrap_or_else(|| turn.content.split_whitespace().count().max(1))
+                    .unwrap_or_else(|| context_window::conservative_token_estimate(&turn.content))
             } else {
                 turn.content.split_whitespace().count().max(1)
             };
-            if cost > budget {
-                break;
-            }
-            budget -= cost;
-            kept.push((turn.role.clone(), turn.content.clone()));
+            measured.push(context_window::Turn {
+                role: turn.role.clone(),
+                tokens: cost,
+            });
         }
-        kept.reverse();
 
-        let truncated = kept.len() < prior.len();
-        (kept, truncated)
+        // `token_budget` arrives already clamped and reduced by the caller, so the
+        // window is built directly rather than re-deriving either.
+        let policy = context_window::WindowPolicy {
+            history_budget: token_budget,
+            keep_last_turns,
+        };
+        let (window, report) = context_window::apply(&measured, policy);
+
+        if report.over_budget {
+            // The protected tail alone exceeded the budget. Reported rather than
+            // silently accepted: the prompt is larger than intended, and the user
+            // should know why their context indicator says "truncated".
+            tracing::debug!(
+                target: "assistant_trace",
+                kept = report.kept,
+                dropped = report.dropped,
+                budget = token_budget,
+                "recent turns exceeded the history budget; kept anyway"
+            );
+        }
+
+        let kept: Vec<(String, String)> = window
+            .into_iter()
+            .zip(prior.iter())
+            .map(|(m, orig)| (m.role, orig.content.clone()))
+            .collect();
+
+        (kept, report.truncated)
     }
 
     #[allow(dead_code)]
@@ -10577,11 +10772,26 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             .session_id
             .clone()
             .unwrap_or_else(|| "sess_local_001".to_string());
+        // Ask the server itself how much context it has. A locally-recorded value is
+        // only a prediction of that, and it is absent entirely when Ghostlink reused
+        // a server it did not start -- which is the case that let an 18,851-token
+        // prompt through against a real 8192 ctx.
+        let running_ctx = if matches!(inference_backend, InferenceEngine::Native) {
+            native_engine::NativeEngineClient::probe_running_ctx_size().await
+        } else {
+            0
+        };
+        let history_budget = context_window::history_budget(
+            settings.conversation_token_limit,
+            completion_reserve_tokens(settings.chat_exec_tokens),
+            running_ctx,
+        );
         let (history_turns, history_truncated) = trim_conversation_history_async(
             &native_engine_client,
             matches!(inference_backend, InferenceEngine::Native),
             req.messages.as_deref().unwrap_or(&[]),
-            settings.conversation_token_limit,
+            history_budget,
+            keep_last_turns(),
         )
         .await;
 
@@ -10684,6 +10894,11 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         let mut gen_tokens: Option<u32> = None;
         let mut gen_tps: Option<f32> = None;
         let mut gen_latency_ms: Option<f32> = None;
+        // Prefill, reported separately from decode. One averaged tok/s figure hides
+        // which half moved, and that is the number needed to judge a change.
+        let mut prompt_tokens: Option<u32> = None;
+        let mut prompt_ms: Option<f32> = None;
+        let mut prompt_tps: Option<f32> = None;
         let mut tool_results: Vec<ToolResult> = Vec::new();
         let mut pending_tool_call: Option<PendingToolCallInfo> = None;
 
@@ -11099,6 +11314,9 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                         gen_tokens = outcome.tokens;
                         gen_tps = outcome.tokens_per_sec;
                         gen_latency_ms = outcome.latency_ms;
+                        prompt_tokens = outcome.prompt_tokens;
+                        prompt_ms = outcome.prompt_ms;
+                        prompt_tps = outcome.prompt_tokens_per_sec;
                         tool_results = outcome.tool_results;
                         (
                             outcome.text,
@@ -11297,6 +11515,15 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                         });
                         gen_tps = gen.tokens_per_sec;
                         gen_latency_ms = gen.latency_ms;
+                        prompt_tokens = gen.prompt_tokens;
+                        prompt_ms = gen.prompt_ms;
+                        prompt_tps = gen.prompt_tokens_per_sec;
+                        // Record TTFT for the non-streaming path too. Previously only
+                        // the two streaming arms did, so a harness measuring
+                        // `stream: false` -- which is what an automated benchmark
+                        // wants, since it can read the timings object -- saw no TTFT
+                        // at all. Discovered by running the harness, not by reading
+                        // the code.
                         (
                             gen.text,
                             gen.real_inference,
@@ -11478,6 +11705,17 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                 "latency_ms": latency_ms,
                 "tokens": tokens_out,
                 "real_inference": real_inference,
+                // Prefill alongside decode: an averaged tok/s cannot say which half
+                // regressed.
+                "prompt_tokens": prompt_tokens,
+                "prompt_ms": prompt_ms,
+                "prompt_tokens_per_sec": prompt_tps,
+                "decode_tokens_per_sec": gen_tps,
+                // Rolling TTFT p50 from the streaming path. A buffered request
+                // cannot contribute one -- it never observes its own first token --
+                // so a non-streaming caller sees the rolling value or nothing.
+                "ttft_p50_ms": snap.ttft_p50_ms,
+                "ttft_p95_ms": snap.ttft_p95_ms,
             });
             (request_seq, session_id, metrics_json)
         };
@@ -11540,6 +11778,12 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             "ollama_url": if backend_used == "ollama" { "local" } else { "disabled" },
             "tokens_estimated": token_estimate,
             "tokens_generated": tokens_out,
+            // Prefill and decode, separated. `null` means llama.cpp did not report
+            // it -- deliberately not 0, which would read as "measured, and zero".
+            "prompt_tokens": prompt_tokens,
+            "prompt_ms": prompt_ms,
+            "prompt_tokens_per_sec": prompt_tps,
+            "decode_tokens_per_sec": gen_tps,
             "exec_tokens": exec_tokens,
             "exec_micro_batch": exec_micro_batch,
             "real_inference": real_inference,
@@ -15017,6 +15261,7 @@ mod backend_plugin;
 mod backend_registry;
 mod bootstrap;
 mod capability;
+mod context_window;
 mod grounding;
 mod host_metrics;
 mod inference_engine;
@@ -15030,6 +15275,7 @@ mod runtime;
 mod runtime_switcher;
 mod scheduler;
 mod skills;
+mod tensor_plan;
 mod title;
 mod tls;
 mod toolselect;

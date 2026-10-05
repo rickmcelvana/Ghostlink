@@ -162,6 +162,37 @@ LLAMA_ARG_BATCH=2048
 LLAMA_ARG_UBATCH=512
 ```
 
+## 0. Thread count on a hybrid CPU
+
+On a hybrid CPU, half the logical processors are efficiency cores. llama.cpp schedules
+across whatever `-t` it is given, so passing every logical processor means E-cores
+participate in the matmul loop.
+
+Measured on this project's reference host — AMD Ryzen AI 7 350 (Zen 5, Radeon 860M).
+`GetLogicalProcessorInformationEx` reports 8 processor-core records with
+`EfficiencyClass = [1,0,1,0,1,0,1,0]`, i.e. 4 performance and 4 efficiency cores,
+8 physical / 16 logical. With the 3B model at `-ngl 0` so the question is genuinely
+CPU-bound, 4 runs per config, medians:
+
+| `-t` | prefill | decode |
+|---|---|---|
+| 4 | 254.2 tok/s | 22.36 tok/s |
+| 8 (P-cores + SMT) | 254.1 tok/s | 21.55 tok/s |
+| 16 (all logical) | 246.2 tok/s | 20.18 tok/s |
+
+**1.07x decode** for P-cores-only versus all logical processors. Modest — llama.cpp's
+own thread scaling is good, so this is not a 2x lever — but it is real, free, and it was
+previously not being applied at all.
+
+`-t 8` is the right value, not `-t 4`: `performance_cores` is a *physical* count, so it
+is scaled by `logical / physical` to keep SMT threads on the performance cores.
+Limiting to the physical P-core count alone would leave half the FP throughput unused.
+
+Worth noting: this host's topology is not obvious from its name. "Ryzen AI 7 350"
+sounds uniform-core, but the OS reports a genuine 4P/4E split. Read it rather than
+assuming — which is what `SystemProfile::cpu.performance_cores` is for, and it was
+already being computed on every probe and never consulted.
+
 ## 1. Prompt processing / ingestion
 
 If you have free VRAM, increase batch sizes:
@@ -170,7 +201,29 @@ If you have free VRAM, increase batch sizes:
 -b 2048 -ub 512
 ```
 
-Typical effect on modern GPUs: prompt eval ~70 t/s → 300+ t/s.
+**Measured on this project's reference hardware, not quoted from upstream.** AMD
+Radeon 860M (Vulkan, 16.4GB), Llama-3.2-3B Q3_K_M, `-ngl 24 -fa on -ctk/-ctv q8_0`,
+3,372-token prompt where prefill dominates, 4 runs per config, medians:
+
+| config | prefill | decode |
+|---|---|---|
+| `-b 512 -ub 128` | 303.0 tok/s | 12.55 tok/s |
+| `-b 2048 -ub 512` | 327.2 tok/s | 12.77 tok/s |
+| `-b 2048 -ub 2048` | 321.0 tok/s | 12.71 tok/s |
+
+So **+8% prefill**, not the "~70 t/s → 300+ t/s" that upstream guidance and several
+secondary sources suggest. That figure is presumably about discrete-GPU CUDA with a
+much larger batch, and it does not reproduce here. `-ub 2048` is slightly *worse* than
+`-ub 512`, so there is no benefit to raising it further.
+
+Note the prompt size matters for how this looks. At 893 prompt tokens the same
+`-b 2048 -ub 512` change measured as a *regression* (0.62x prefill, 3.04x slower
+decode), because at that size wall time is dominated by decode and the larger batch
+just holds more VRAM. Report prefill and decode separately or this lever looks like
+noise in both directions.
+
+Reproduce with `python scripts/llama_knob_ab.py`, which A/Bs these and the KV-cache
+and Flash Attention settings on one node with one variable at a time.
 
 ## 2. Flash Attention
 
@@ -205,7 +258,28 @@ Configure draft knobs via environment variables:
 - `GHOSTLINK_DRAFT_MAX`: Number of tokens to draft per step (e.g. `16`).
 - `GHOSTLINK_DRAFT_P_MIN`: Minimum probability threshold for accepting draft tokens (e.g. `0.2`).
 
-When `GHOSTLINK_DRAFT_MODEL` is set and points to a valid file, Ghostlink passes `--model-draft <path>`, `--draft-max`, and `--draft-p-min` to `llama-server`.
+When `GHOSTLINK_DRAFT_MODEL` is set and points to a valid file, Ghostlink passes
+`--spec-draft-model <path>`, `--spec-draft-n-max`, and `--spec-draft-p-min` to
+`llama-server`.
+
+Two corrections to this section as it previously stood:
+
+- **Nothing read `GHOSTLINK_DRAFT_MODEL` at all.** The variables were documented here
+  with a specific promise about which flags were passed, and no code in the repository
+  consumed any of them. Setting them did nothing.
+- **`--draft-max` no longer exists.** This build's `llama-server --help` reports:
+
+  ```text
+  --draft, --draft-n, --draft-max N   the argument has been removed.
+                                     use --spec-draft-n-max or ...
+  ```
+
+  Passing the documented `--draft-max` would make `llama-server` exit on an unknown
+  argument. The names above are the ones this build parses; re-check against
+  `llama-server --help` after any llama.cpp bump.
+
+Not enabled by default and not benchmarked here. A draft model close in size to the
+target costs more than it saves, and the right pairing is model-specific.
 
 ### RPC Tensor Pinning & "RPC Only If It Does Not Fit"
 - **Fit-Local Rule**: RPC distribution is automatically bypassed if the model plus KV cache fits completely within local VRAM. Same-host or unnecessary Ethernet RPC is a performance regression. Set `GHOSTLINK_REQUIRE_CLUSTER_OFFLOAD=1` if you want to force RPC offloading regardless.

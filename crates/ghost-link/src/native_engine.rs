@@ -39,6 +39,17 @@ pub struct NativeGeneration {
     pub tokens_per_sec: Option<f32>,
     /// End-to-end generation latency in ms when known.
     pub latency_ms: Option<f32>,
+    /// Prompt tokens evaluated (prefill work).
+    ///
+    /// Kept separate from `tokens_generated` because the two costs are unrelated:
+    /// prefill is compute-bound and batches well, decode is bandwidth-bound and does
+    /// not. One number for both is how a 300 tok/s prefill and a 2 tok/s decode end
+    /// up looking like a single fast model.
+    pub prompt_tokens: Option<u32>,
+    /// Prompt evaluation wall time in ms, from llama.cpp's own timings.
+    pub prompt_ms: Option<f32>,
+    /// Prefill throughput tok/s, derived from the two above.
+    pub prompt_tokens_per_sec: Option<f32>,
 }
 
 impl NativeGeneration {
@@ -49,6 +60,9 @@ impl NativeGeneration {
             tokens_generated: None,
             tokens_per_sec: None,
             latency_ms: None,
+            prompt_tokens: None,
+            prompt_ms: None,
+            prompt_tokens_per_sec: None,
         }
     }
 }
@@ -73,6 +87,34 @@ static LLAMA_SERVER_PROCESS: OnceLock<Arc<Mutex<Option<Child>>>> = OnceLock::new
 // `None` means the binary is missing or `--version` failed/was unparsable —
 // see `NativeEngineClient::get_llama_build_id`.
 static LLAMA_BUILD_ID: OnceLock<Option<String>> = OnceLock::new();
+
+/// Context size the running llama-server was launched with.
+static RUNNING_CTX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// P-core-only thread count for `-t`, or `None` when the CPU is not hybrid.
+///
+/// Returns `None` rather than a guess when detection is unavailable or reports no
+/// split, so the caller falls back to `available_parallelism` unchanged. Silently
+/// halving threads on a uniform-core CPU would be a large, invisible regression.
+fn hybrid_performance_threads(logical: usize) -> Option<usize> {
+    let profile = ghostlink_core::system_profile::SystemProfile::detect_fast();
+    let performance = profile.cpu.performance_cores?;
+    if performance == 0 {
+        return None;
+    }
+    // `performance` is a physical P-core count while `logical` is every logical
+    // processor. Scaling keeps SMT threads on the performance cores; limiting to
+    // physical P-cores alone would leave half the FP throughput unused.
+    let physical = profile.cpu.physical_cores.max(performance);
+    let scaled = if physical > 0 {
+        (performance as f64 * logical as f64 / physical as f64).round() as usize
+    } else {
+        performance
+    };
+    // Never exceed the logical count, and never fall below half of it: if the reported
+    // numbers are inconsistent, a smaller pool is still better than an unusable one.
+    Some(scaled.clamp(logical / 2, logical))
+}
 
 impl NativeEngineClient {
     pub fn new() -> Self {
@@ -378,7 +420,124 @@ impl NativeEngineClient {
     /// Found the hard way: a 13.6GB model + 16384 ctx (this function's old
     /// unconditional-16384-if-VRAM=8 behavior) left a 27.6GB host with under
     /// 1GB free — one more allocation away from OOM, not a hypothetical.
-    fn get_ctx_size(model_size_gb: f32) -> u32 {
+    ///
+    /// Public so the chat path can clamp `conversation_token_limit` against the
+    /// context the model is actually running with. The two can disagree -- the
+    /// setting is a user preference while this is derived from VRAM and model size
+    /// -- and when they do, budgeting against the setting produces prompts the model
+    /// cannot accept at all. See `history_budget_tokens`.
+    /// The context size the currently-running llama-server was launched with, or 0
+    /// when unknown (no server started yet, or it was started by something else).
+    ///
+    /// 0 rather than a guessed default: a caller that clamps against an invented
+    /// number would silently under- or over-budget, and there is already a ceiling
+    /// (`GHOSTLINK_CTX_SIZE`) that makes the real value discoverable.
+    pub(crate) fn running_ctx_size() -> u32 {
+        RUNNING_CTX.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn record_running_ctx(ctx: u32) {
+        RUNNING_CTX.store(ctx, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The context size the **running** llama-server reports, from `/props`.
+    ///
+    /// Preferred over the value derived from VRAM and model size because it is the
+    /// server's own answer rather than our prediction of it. It also covers the case
+    /// that made the derived value useless: a server Ghostlink did not launch. If the
+    /// user has one already running on the configured port, `load_model` reuses it and
+    /// never calls `get_ctx_size`, so the recorded value stayed 0 and the history
+    /// budget fell back to `conversation_token_limit` -- which is why the live 80-turn
+    /// request was still trimmed to 18,851 tokens against a real 8192 ctx.
+    ///
+    /// Best effort: any failure returns 0, and callers treat 0 as "unknown" and keep
+    /// the previous ceiling rather than guessing.
+    /// Whether the configured `llama-server` binary was built with RPC support.
+    ///
+    /// Verified rather than assumed, because a binary built without `GGML_RPC` rejects
+    /// `--rpc` outright. Measured against this repo's vendored build:
+    ///
+    /// ```text
+    /// $ llama-server --version
+    /// version 0.5.0-dev (build 1, commit 4b1a27f)
+    /// $ llama-server ... --rpc 127.0.0.1:59999
+    /// error: invalid argument: --rpc
+    /// $ grep GGML_RPC build/CMakeCache.txt
+    /// GGML_RPC:BOOL=OFF
+    /// ```
+    ///
+    /// So `--rpc` and `-ts` were being handed to a process that exits 1 on them. One
+    /// probe at launch, cached: cheap, and it turns a silent load failure into a
+    /// specific, actionable message.
+    pub(crate) fn binary_supports_rpc() -> bool {
+        use std::sync::OnceLock;
+        static SUPPORTS: OnceLock<bool> = OnceLock::new();
+        *SUPPORTS.get_or_init(|| {
+            let bin = Self::get_llama_server_bin();
+            if bin == "llama-server" || bin == "llama-server.exe" || !Path::new(&bin).exists() {
+                return false;
+            }
+            match std::process::Command::new(&bin).arg("--help").output() {
+                Ok(out) => {
+                    let text = format!(
+                        "{}{}",
+                        String::from_utf8_lossy(&out.stdout),
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                    // `--rpc` appears in the flag parser's output only when GGML_RPC is on.
+                    text.contains("--rpc")
+                }
+                Err(_) => false,
+            }
+        })
+    }
+
+    pub(crate) async fn probe_running_ctx_size() -> u32 {
+        let base = Self::get_llama_base_url();
+        let url = format!("{}/props", base.trim_end_matches('/'));
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return 0,
+        };
+        let resp = match client.get(&url).send().await {
+            Ok(r) => r,
+            Err(_) => return 0,
+        };
+        let body: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(_) => return 0,
+        };
+        // `n_ctx` is the TOTAL across all slots, not the per-request allowance. With
+        // `-np 2` llama-server serves 8192 total as two 4096 contexts, and a request
+        // that budgets against 8192 is rejected at ~4096. Measured: a prompt trimmed
+        // to a 7168 budget came back as
+        // "request (10589 tokens) exceeds the available context size".
+        let n_ctx = body
+            .get("default_generation_settings")
+            .and_then(|s| s.get("n_ctx"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        // total_slots defaults to 1 when absent; never let a bad value divide to zero.
+        let slots = body
+            .get("total_slots")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1)
+            .max(1);
+        if n_ctx == 0 {
+            return 0;
+        }
+        let n = (n_ctx / slots) as u32;
+        if n == 0 {
+            return 0;
+        }
+        Self::record_running_ctx(n);
+        n
+    }
+
+    pub(crate) fn get_ctx_size(model_size_gb: f32) -> u32 {
         if let Ok(val) = std::env::var("GHOSTLINK_CTX_SIZE") {
             if let Ok(n) = val.trim().parse::<u32>() {
                 return n.clamp(512, 131072);
@@ -485,6 +644,68 @@ impl NativeEngineClient {
     }
 
     /// VRAM-aware batch defaults for prompt eval + Flash Attention + compact KV.
+    /// Speculative-decoding flags, empty when it is not configured.
+    ///
+    /// `GHOSTLINK_DRAFT_MODEL` is documented in `docs/LOCAL_INFERENCE_TUNING.md` with a
+    /// specific promise -- "Ghostlink passes `--model-draft <path>`, `--draft-max`, and
+    /// `--draft-p-min` to `llama-server`" -- and no code anywhere in this repository read
+    /// that variable. Setting it did nothing at all.
+    ///
+    /// The documented flag names are also stale for this build. Verified against the
+    /// vendored `llama-server --help`:
+    ///
+    /// ```text
+    /// --draft, --draft-n, --draft-max N   the argument has been removed.
+    ///                                   use --spec-draft-n-max or ...
+    /// ```
+    ///
+    /// So `--draft-max` as documented would be rejected by the binary outright. These are
+    /// the names this build parses.
+    ///
+    /// Off by default: a draft model close in size to the target costs more than it
+    /// saves, and there is no reliable way to pick the pairing at runtime.
+    fn draft_model_args() -> Vec<String> {
+        let mut args = Vec::new();
+        let Ok(path) = std::env::var("GHOSTLINK_DRAFT_MODEL") else {
+            return args;
+        };
+        let path = path.trim().to_string();
+        if path.is_empty() {
+            return args;
+        }
+        if !Path::new(&path).exists() {
+            // Logged rather than fatal: the primary model is fine and this was only an
+            // optimization. Failing the load over a draft path would be strictly worse.
+            eprintln!(
+                "[spec-decode] GHOSTLINK_DRAFT_MODEL={path:?} does not exist; speculative \
+                 decoding disabled for this load"
+            );
+            return args;
+        }
+        args.push("--spec-draft-model".to_string());
+        args.push(path.clone());
+        // Tokens the draft model proposes per step. Caller-set, because the right value
+        // depends on the model pair and there is no defensible default.
+        if let Some(n) = std::env::var("GHOSTLINK_DRAFT_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+        {
+            args.push("--spec-draft-n-max".to_string());
+            args.push(n.to_string());
+        }
+        if let Some(p) = std::env::var("GHOSTLINK_DRAFT_P_MIN")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+        {
+            args.push("--spec-draft-p-min".to_string());
+            args.push(format!("{p}"));
+        }
+        eprintln!("[spec-decode] draft model {path} enabled");
+        args
+    }
+
     fn default_perf_args() -> Vec<String> {
         let (batch, ubatch) = Self::get_batch_ubatch();
         let flash_attention = Self::get_flash_attention();
@@ -518,6 +739,7 @@ impl NativeEngineClient {
                 "n/a (Flash Attention off)"
             }
         );
+        args.extend(Self::draft_model_args());
         args
     }
 
@@ -698,10 +920,31 @@ impl NativeEngineClient {
                 return n.max(1);
             }
         }
-        std::thread::available_parallelism()
+        let logical = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
-            .max(1)
+            .max(1);
+        // On a hybrid CPU, half the logical processors are efficiency cores. llama.cpp
+        // schedules matmuls across whatever threads it is given, so handing it all 16
+        // means E-cores participate in the decode loop and the "hybrid CPUs should use
+        // P-cores only" advice in the tuning doc is not being followed -- the detector
+        // existed, `performance_cores` was measured on every probe, and `get_threads`
+        // never read it.
+        //
+        // Detection is Windows-only and returns None when there is no real P/E split,
+        // so this is a no-op on uniform-core CPUs (including this host's Ryzen AI 7 350,
+        // which is Zen 5 and has none). Verified, not assumed: `detect_hybrid_core_counts`
+        // returns None unless every core reports the same EfficiencyClass as the rest.
+        //
+        // `performance_cores` is the physical P-core count. Scaling it by the logical:core
+        // ratio preserves SMT threads on the performance cores, which is what the flag
+        // means in practice -- limiting to physical P-cores alone would leave half the
+        // FP throughput unused.
+        let threads = match hybrid_performance_threads(logical) {
+            Some(p) => p,
+            None => logical,
+        };
+        threads.max(1)
     }
 
     /// Number of parallel inference slots to give llama-server (`-np`).
@@ -1026,6 +1269,7 @@ impl NativeEngineClient {
         model_path: &str,
         rpc_servers: Option<&str>,
         tensor_split: Option<&str>,
+        tensor_override: Option<&str>,
     ) -> Result<(), String> {
         let resolved = Self::resolve_model_path(model_path)?;
         let normalized_path = resolved.to_string_lossy().replace('\\', "/");
@@ -1047,11 +1291,30 @@ impl NativeEngineClient {
         let ngl = Self::get_ngl(model_size_gb);
         let threads = Self::get_threads();
         let ctx = Self::get_ctx_size(model_size_gb);
+        // Remember what this process was actually launched with. The chat path needs
+        // it to clamp `conversation_token_limit`: the setting is a user preference and
+        // this is derived from VRAM and model size, and they disagree often enough
+        // that budgeting against the setting alone produces requests llama-server
+        // rejects outright.
+        Self::record_running_ctx(ctx);
         let parallel_slots = Self::get_parallel_slots();
         let mlock = Self::get_mlock();
         let no_mmap = Self::get_no_mmap();
         let mut extra_args = Self::get_llama_server_args();
         if let Some(servers) = rpc_servers.filter(|s| !s.is_empty()) {
+            // Refuse with the reason, rather than handing llama-server a flag it exits
+            // on. Otherwise the failure is a bare "invalid argument: --rpc", which reads
+            // like a malformed command line rather than a build configured without
+            // distributed-inference support.
+            if !Self::binary_supports_rpc() {
+                return Err(format!(
+                    "distributed inference requested (--rpc {servers}) but the configured \
+                     llama-server binary does not support it. This build was made without \
+                     GGML_RPC; rebuild llama.cpp with -DGGML_RPC=ON (and build \
+                     ggml-rpc-server) to enable cross-machine tensor split, or clear \
+                     GHOSTLINK_REQUIRE_CLUSTER_OFFLOAD to stay single-node."
+                ));
+            }
             eprintln!("[model-load] Distributed inference enabled: --rpc {servers}");
             extra_args.push("--rpc".to_string());
             extra_args.push(servers.to_string());
@@ -1059,6 +1322,16 @@ impl NativeEngineClient {
                 eprintln!("[model-load] Tensor split: -ts {split}");
                 extra_args.push("-ts".to_string());
                 extra_args.push(split.to_string());
+            }
+            // Route by tensor class, not by equal layer share. `-ts` says how much
+            // goes where; it does not say *which tensors*, so llama-server spreads whole
+            // layers -- attention, KV, lm_head included -- across the link. `-ot` is the
+            // flag that names them, and it was documented in a unit test but never
+            // passed here, so the intent had no path to the process at all.
+            if let Some(ot) = tensor_override.filter(|s| !s.is_empty()) {
+                eprintln!("[model-load] Tensor class override: -ot {ot}");
+                extra_args.push("-ot".to_string());
+                extra_args.push(ot.to_string());
             }
         }
         let alias = resolved
@@ -1439,6 +1712,13 @@ impl NativeEngineClient {
                     tokens_generated: Some(tokens_generated),
                     tokens_per_sec: Some(tokens_generated as f32 / (latency_ms / 1000.0)),
                     latency_ms: Some(latency_ms),
+                    // No llama.cpp timings on this path: it is the computed-token
+                    // fallback, not a measured generation. Leaving the prompt fields
+                    // absent keeps it out of a benchmark as *unmeasured* rather than
+                    // reporting a throughput it never observed.
+                    prompt_tokens: None,
+                    prompt_ms: None,
+                    prompt_tokens_per_sec: None,
                 })
             }
             _ => self.generate_simulated(model, cleaned_prompt, max_tokens),
@@ -1977,13 +2257,70 @@ fn generation_from_llama_json(parsed: &serde_json::Value) -> Option<NativeGenera
 
     let text = text?;
     let (tokens_generated, tokens_per_sec, latency_ms) = parse_llama_timings(parsed, &text);
+    let prompt = parse_prompt_timings(parsed);
     Some(NativeGeneration {
         text,
         real_inference: true,
         tokens_generated,
         tokens_per_sec,
         latency_ms,
+        prompt_tokens: prompt.prompt_tokens,
+        prompt_ms: prompt.prompt_ms,
+        prompt_tokens_per_sec: prompt.prompt_tokens_per_sec,
     })
+}
+
+/// A measured prefill/decode split.
+///
+/// The two are kept apart deliberately. Prefill batches and is compute-bound;
+/// decode is memory-bandwidth-bound and does not batch. A single tok/s figure over
+/// a whole request averages two unrelated costs and moves for reasons that have
+/// nothing to do with each other.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PromptTimings {
+    pub prompt_tokens: Option<u32>,
+    pub prompt_ms: Option<f32>,
+    pub prompt_tokens_per_sec: Option<f32>,
+}
+
+/// Reads llama.cpp's prompt-side timings from the response `timings` object.
+///
+/// These were never read before. The server returns `prompt_n` and `prompt_ms`
+/// alongside `predicted_n`/`predicted_ms` in the same object, and only the
+/// predicted half was parsed -- so prefill throughput, the number that decides
+/// whether a long history is affordable, was unmeasurable. Any local-vs-RPC
+/// comparison had to fall back on end-to-end latency, which conflates the two.
+///
+/// No fallback is invented for an absent field. A missing timing means this build
+/// did not report it; deriving one from a whitespace count would put a fabricated
+/// number into a benchmark, which is worse than an honest gap.
+fn parse_prompt_timings(parsed: &serde_json::Value) -> PromptTimings {
+    let timings = parsed.get("timings");
+    let prompt_n = timings
+        .and_then(|t| t.get("prompt_n"))
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32);
+    let prompt_ms = timings
+        .and_then(|t| t.get("prompt_ms"))
+        .and_then(|v| v.as_f64())
+        .map(|ms| ms as f32);
+    // Prefer llama.cpp's own rate; derive only when both inputs are real. A zero or
+    // absent denominator yields None, never 0.0 -- "not measured" and "measured as
+    // zero" must not look alike in a report.
+    let prompt_tokens_per_sec = timings
+        .and_then(|t| t.get("prompt_per_second"))
+        .and_then(|v| v.as_f64())
+        .filter(|v| *v > 0.0)
+        .map(|v| v as f32)
+        .or_else(|| match (prompt_n, prompt_ms) {
+            (Some(n), Some(ms)) if n > 0 && ms > 0.0 => Some(n as f32 / (ms / 1000.0)),
+            _ => None,
+        });
+    PromptTimings {
+        prompt_tokens: prompt_n,
+        prompt_ms,
+        prompt_tokens_per_sec,
+    }
 }
 
 fn parse_llama_timings(
@@ -2093,7 +2430,7 @@ fn extract_generation_text(stdout: &str, stderr: &str, prompt: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{NativeChatEvent, NativeEngineClient};
+    use super::{parse_prompt_timings, NativeChatEvent, NativeEngineClient, PromptTimings};
     use std::sync::{Mutex, OnceLock};
 
     fn env_lock() -> &'static Mutex<()> {
@@ -3049,5 +3386,206 @@ mod tests {
         assert!(NativeEngineClient::should_warn_about_memory(11.0, 16.2));
         // Exactly at the line is not a warning (the test is strictly-less-than).
         assert!(!NativeEngineClient::should_warn_about_memory(16.2, 16.2));
+    }
+
+    #[test]
+    fn prompt_timings_are_read_from_the_timings_object() {
+        // Exactly what llama-server returns. Before this, only the `predicted_*`
+        // half was parsed and prefill throughput was unmeasurable.
+        let body = serde_json::json!({
+            "timings": {
+                "prompt_n": 1204,
+                "prompt_ms": 812.5,
+                "prompt_per_second": 1481.9,
+                "predicted_n": 96,
+                "predicted_ms": 24576.0,
+                "predicted_per_second": 3.91
+            }
+        });
+        let t = parse_prompt_timings(&body);
+        assert_eq!(t.prompt_tokens, Some(1204));
+        assert_eq!(t.prompt_ms, Some(812.5));
+        assert!((t.prompt_tokens_per_sec.unwrap() - 1481.9).abs() < 0.01);
+    }
+
+    #[test]
+    fn prompt_rate_is_derived_when_only_counts_and_time_are_present() {
+        let body = serde_json::json!({ "timings": { "prompt_n": 100, "prompt_ms": 200.0 } });
+        let t = parse_prompt_timings(&body);
+        assert_eq!(t.prompt_tokens_per_sec, Some(500.0));
+    }
+
+    #[test]
+    fn absent_prompt_timings_stay_absent_rather_than_becoming_zero() {
+        // "Not measured" and "measured as zero" must not look alike in a report.
+        let body = serde_json::json!({ "timings": { "predicted_n": 10 } });
+        let t = parse_prompt_timings(&body);
+        assert_eq!(t.prompt_tokens, None);
+        assert_eq!(t.prompt_ms, None);
+        assert_eq!(
+            t.prompt_tokens_per_sec, None,
+            "a missing prefill rate must be None, not Some(0.0)"
+        );
+    }
+
+    #[test]
+    fn a_zero_denominator_yields_none_not_infinity_or_zero() {
+        let body = serde_json::json!({ "timings": { "prompt_n": 50, "prompt_ms": 0.0 } });
+        let t = parse_prompt_timings(&body);
+        assert_eq!(t.prompt_tokens, Some(50));
+        assert_eq!(t.prompt_tokens_per_sec, None);
+    }
+
+    #[test]
+    fn a_zero_reported_rate_falls_back_to_the_derived_one() {
+        let body = serde_json::json!({
+            "timings": { "prompt_n": 40, "prompt_ms": 100.0, "prompt_per_second": 0.0 }
+        });
+        let t = parse_prompt_timings(&body);
+        assert_eq!(t.prompt_tokens_per_sec, Some(400.0));
+    }
+
+    #[test]
+    fn no_timings_object_at_all_is_handled() {
+        let t = parse_prompt_timings(&serde_json::json!({ "content": "hi" }));
+        assert_eq!(
+            t,
+            PromptTimings {
+                prompt_tokens: None,
+                prompt_ms: None,
+                prompt_tokens_per_sec: None
+            }
+        );
+    }
+
+    #[test]
+    fn draft_decoding_is_off_when_no_model_is_configured() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        std::env::remove_var("GHOSTLINK_DRAFT_MODEL");
+        assert!(
+            NativeEngineClient::draft_model_args().is_empty(),
+            "speculative decoding must be opt-in"
+        );
+    }
+
+    #[test]
+    fn a_missing_draft_path_disables_decoding_instead_of_failing_the_load() {
+        // The primary model is fine; a bad draft path is an optimization that did not
+        // happen, not a reason to refuse to serve.
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        std::env::set_var(
+            "GHOSTLINK_DRAFT_MODEL",
+            r"C:\definitely\not\here\draft.gguf",
+        );
+        assert!(NativeEngineClient::draft_model_args().is_empty());
+        std::env::remove_var("GHOSTLINK_DRAFT_MODEL");
+    }
+
+    #[test]
+    fn draft_knobs_use_flag_names_this_build_actually_parses() {
+        // `--draft-max` was REMOVED upstream; this build wants `--spec-draft-n-max`.
+        // Emitting the documented name would make llama-server exit on an unknown
+        // argument, which is a worse outcome than not enabling the feature at all.
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let me = std::env::current_exe().expect("test exe path");
+        std::env::set_var("GHOSTLINK_DRAFT_MODEL", &me);
+        std::env::set_var("GHOSTLINK_DRAFT_MAX", "8");
+        std::env::set_var("GHOSTLINK_DRAFT_P_MIN", "0.2");
+        let args = NativeEngineClient::draft_model_args();
+        assert_eq!(args[0], "--spec-draft-model");
+        assert_eq!(args[1], me);
+        assert!(
+            args.contains(&"--spec-draft-n-max".to_string()),
+            "args: {args:?}"
+        );
+        assert!(
+            !args.contains(&"--draft-max".to_string()),
+            "removed flag emitted: {args:?}"
+        );
+        assert!(
+            args.contains(&"--spec-draft-p-min".to_string()),
+            "args: {args:?}"
+        );
+        std::env::remove_var("GHOSTLINK_DRAFT_MODEL");
+        std::env::remove_var("GHOSTLINK_DRAFT_MAX");
+        std::env::remove_var("GHOSTLINK_DRAFT_P_MIN");
+    }
+
+    #[test]
+    fn a_zero_or_unparseable_draft_max_is_omitted_not_passed() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let me = std::env::current_exe().expect("test exe path");
+        std::env::set_var("GHOSTLINK_DRAFT_MODEL", &me);
+        std::env::set_var("GHOSTLINK_DRAFT_MAX", "0");
+        std::env::set_var("GHOSTLINK_DRAFT_P_MIN", "not-a-number");
+        let args = NativeEngineClient::draft_model_args();
+        assert_eq!(
+            args.len(),
+            2,
+            "only the model flag should survive: {args:?}"
+        );
+        std::env::remove_var("GHOSTLINK_DRAFT_MODEL");
+        std::env::remove_var("GHOSTLINK_DRAFT_MAX");
+        std::env::remove_var("GHOSTLINK_DRAFT_P_MIN");
+    }
+
+    #[test]
+    fn hybrid_thread_detection_is_bounded_and_scaled_correctly() {
+        // This host is genuinely hybrid, which the tuning doc did not say. Read
+        // directly from GetLogicalProcessorInformationEx(RelationProcessorCore):
+        //
+        //     8 processor-core records, EfficiencyClass = [1,0,1,0,1,0,1,0]
+        //     => 4 performance cores, 4 efficiency cores, 8 physical, 16 logical
+        //
+        // So `performance_cores` is 4, and scaling it by logical/physical
+        // (4 * 16 / 8) gives 8 threads -- the P-cores with SMT, which is what `-t`
+        // should be. It is not the physical P-core count (4) and not the logical
+        // count (16).
+        match super::hybrid_performance_threads(16) {
+            Some(n) => {
+                assert!(n >= 1, "thread pool collapsed to {n}");
+                assert!(n <= 16, "thread pool {n} exceeds the logical core count");
+                assert!(
+                    n >= 8,
+                    "expected the P-core pool scaled by SMT (~8), got {n}"
+                );
+            }
+            None => {
+                // Acceptable only on a CPU with no real P/E split, where falling back
+                // to available_parallelism is correct. Recorded rather than asserted
+                // so a failure here names the host instead of a magic number.
+                eprintln!(
+                    "note: no hybrid split detected; -t would fall back to all logical cores"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hybrid_detection_never_returns_more_threads_than_are_logical() {
+        // The failure mode that matters: handing llama.cpp a thread count above the
+        // logical core count. Oversubscription on a matmul loop is a large slowdown,
+        // not a small one.
+        for logical in [1usize, 2, 4, 8, 16, 32, 64] {
+            if let Some(n) = super::hybrid_performance_threads(logical) {
+                assert!(n >= 1, "logical={logical} produced {n}");
+                assert!(n <= logical, "logical={logical} produced {n}");
+            }
+        }
+    }
+
+    #[test]
+    fn get_threads_is_never_zero() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        std::env::remove_var("GHOSTLINK_LLAMA_THREADS");
+        assert!(NativeEngineClient::get_threads() >= 1);
+    }
+
+    #[test]
+    fn an_explicit_thread_override_still_wins() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        std::env::set_var("GHOSTLINK_LLAMA_THREADS", "3");
+        assert_eq!(NativeEngineClient::get_threads(), 3);
+        std::env::remove_var("GHOSTLINK_LLAMA_THREADS");
     }
 }
