@@ -116,6 +116,114 @@ fn hybrid_performance_threads(logical: usize) -> Option<usize> {
     Some(scaled.clamp(logical / 2, logical))
 }
 
+/// A non-default tuning value present in `settings.json` while its `*_auto` flag is true.
+///
+/// Returns a note, or `None` when there is nothing to report. Reads the settings file
+/// rather than taking it as an argument, so the diagnostic cannot be handed a stale copy
+/// of what the user configured.
+fn auto_ignored_setting(label: &str) -> Option<String> {
+    auto_ignored_setting_in(label, std::path::Path::new("settings.json"))
+}
+
+/// `auto_ignored_setting` against an explicit settings path.
+///
+/// Split out so tests can point at a fixture. Reading a fixed relative path instead
+/// would mean `std::env::set_current_dir`, which is process-global and breaks every
+/// other test in this binary that reads a relative path.
+fn auto_ignored_setting_in(label: &str, settings_path: &std::path::Path) -> Option<String> {
+    let (field, auto_field, default) = match label {
+        "ctx_size" => ("ctx_size", "ctx_size_auto", 8192i64),
+        "ngl" => ("ngl", "ngl_auto", -1i64),
+        _ => ("threads", "threads_auto", 4i64),
+    };
+    let Ok(text) = std::fs::read_to_string(settings_path) else {
+        return None;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return None;
+    };
+    // An absent `*_auto` deserializes as true, which is exactly the case that matters.
+    let auto = v.get(auto_field).and_then(|b| b.as_bool()).unwrap_or(true);
+    if !auto {
+        return None;
+    }
+    let requested = v.get(field).and_then(|n| n.as_i64())?;
+    if requested == default {
+        return None;
+    }
+    Some(format!("{field}={requested}"))
+}
+
+/// The tuning actually applied to a model load, and anything the policy overrode.
+///
+/// Added because configured values were being discarded in silence. Measured on this
+/// machine: `settings.json` carries `ctx_size: 131072` and `ngl: 100`, both with
+/// `*_auto: true`, and `llama-server` was launched:
+///
+/// ```text
+/// -m models/Qwen3.8-27B-UD-IQ3_S.gguf -c 4096 -np 1 -ngl 0 -t 15
+/// ```
+///
+/// The overrides are defensible -- a 12 GB model CPU-bound beats a partial offload that
+/// OOMs, which is measured -- but *silently* is not the same as *correctly*, and a user
+/// reading `settings.json` had no way to tell.
+///
+/// Two failure modes are reported separately because the fixes differ:
+///
+/// * **OVERRIDDEN** -- the value reached the environment and something else won.
+/// * **IGNORED** -- `*_auto` is true so the value never left `settings.json` at all. This
+///   is the more misleading one: the file shows a number that is not used anywhere.
+pub fn describe_tuning(model_size_gb: f32) -> String {
+    let ctx = NativeEngineClient::get_ctx_size(model_size_gb);
+    let ngl = NativeEngineClient::get_ngl(model_size_gb);
+    let threads = NativeEngineClient::get_threads();
+    let mut out = format!(
+        "[perf-tier] effective: -c {ctx} -ngl {ngl} -t {threads} (model {model_size_gb:.2} GB)"
+    );
+
+    let mut ignored: Vec<String> = Vec::new();
+    let mut overridden: Vec<String> = Vec::new();
+    for (env, label) in [
+        ("GHOSTLINK_CTX_SIZE", "ctx_size"),
+        ("GHOSTLINK_LLAMA_NGL", "ngl"),
+        ("GHOSTLINK_LLAMA_THREADS", "threads"),
+    ] {
+        let effective = match env {
+            "GHOSTLINK_CTX_SIZE" => ctx.to_string(),
+            "GHOSTLINK_LLAMA_NGL" => ngl.to_string(),
+            _ => threads.to_string(),
+        };
+        match std::env::var(env) {
+            Ok(requested) => {
+                let requested = requested.trim().to_string();
+                if requested != effective {
+                    overridden.push(format!("{label}: requested {requested}, using {effective}"));
+                }
+            }
+            Err(_) => {
+                if let Some(field) = auto_ignored_setting(label) {
+                    ignored.push(field);
+                }
+            }
+        }
+    }
+
+    if !overridden.is_empty() {
+        out.push_str("\n[perf-tier] OVERRIDDEN by model-size/VRAM policy: ");
+        out.push_str(&overridden.join("; "));
+        out.push_str("\n[perf-tier] clear the matching *_auto flag to force the setting");
+    }
+    if !ignored.is_empty() {
+        out.push_str("\n[perf-tier] IGNORED in settings.json (*_auto is true): ");
+        out.push_str(&ignored.join("; "));
+        out.push_str(
+            "\n[perf-tier] these look configured but are never used; clear the matching \
+             *_auto flag to apply them",
+        );
+    }
+    out
+}
+
 impl NativeEngineClient {
     pub fn new() -> Self {
         Self {
@@ -1354,6 +1462,10 @@ impl NativeEngineClient {
         // that budgeting against the setting alone produces requests llama-server
         // rejects outright.
         Self::record_running_ctx(ctx);
+        // Report the tuning actually applied, and name anything the model-size policy
+        // discarded. The existing `[perf-tier]` line covered batch/FA/KV only, so a
+        // configured ctx_size or ngl that went unused left no trace at all.
+        eprintln!("{}", describe_tuning(model_size_gb));
         // Report the tuning actually applied, and name anything the model-size policy
         // overrode. Previously the only clue was the `[perf-tier]` line, which showed the
         // batch/FA/KV choices but never the ctx/ngl/threads ones -- and never said when a
@@ -3814,6 +3926,103 @@ mod tests {
     }
 
     #[test]
+    fn describe_tuning_reports_the_effective_values() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        for v in [
+            "GHOSTLINK_CTX_SIZE",
+            "GHOSTLINK_LLAMA_NGL",
+            "GHOSTLINK_LLAMA_THREADS",
+            "GHOSTLINK_VRAM_GB",
+        ] {
+            std::env::remove_var(v);
+        }
+        let line = crate::native_engine::describe_tuning(1.7);
+        assert!(
+            line.contains("-c "),
+            "must always report effective values: {line}"
+        );
+        assert!(line.contains("-ngl "), "must report ngl: {line}");
+        assert!(line.contains("-t "), "must report threads: {line}");
+    }
+
+    #[test]
+    fn describe_tuning_reports_the_policy_choice_when_nothing_was_requested() {
+        // With the env unset, the model-size policy decides. On this hardware a 12 GB
+        // model is capped at 4096 ctx and forced CPU-only, and that is what must be shown.
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        for v in [
+            "GHOSTLINK_CTX_SIZE",
+            "GHOSTLINK_LLAMA_NGL",
+            "GHOSTLINK_LLAMA_THREADS",
+            "GHOSTLINK_VRAM_GB",
+        ] {
+            std::env::remove_var(v);
+        }
+        let line = crate::native_engine::describe_tuning(12.0);
+        assert!(
+            line.contains("-c 4096"),
+            "a 12 GB model caps ctx at 4096: {line}"
+        );
+        assert!(
+            line.contains("-ngl 0"),
+            "a 12 GB model is CPU-only here: {line}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_env_value_is_honoured_and_not_called_an_override() {
+        // The getters read the env first, so a requested value wins and there is nothing
+        // to report. This is the case that must stay quiet -- honouring a request is not
+        // an override.
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        for v in [
+            "GHOSTLINK_CTX_SIZE",
+            "GHOSTLINK_LLAMA_NGL",
+            "GHOSTLINK_LLAMA_THREADS",
+            "GHOSTLINK_VRAM_GB",
+        ] {
+            std::env::remove_var(v);
+        }
+        std::env::set_var("GHOSTLINK_LLAMA_NGL", "24");
+        let line = crate::native_engine::describe_tuning(12.0);
+        assert!(
+            line.contains("-ngl 24"),
+            "an explicit request must be honoured even for a large model: {line}"
+        );
+        assert!(
+            !line.contains("OVERRIDDEN"),
+            "an honoured request must not be reported as an override: {line}"
+        );
+        std::env::remove_var("GHOSTLINK_LLAMA_NGL");
+    }
+
+    #[test]
+    fn describe_tuning_does_not_report_an_override_when_the_env_wins() {
+        // The explicit case is the one that must stay quiet: honouring a request is not
+        // an override.
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        for v in [
+            "GHOSTLINK_CTX_SIZE",
+            "GHOSTLINK_LLAMA_NGL",
+            "GHOSTLINK_LLAMA_THREADS",
+            "GHOSTLINK_VRAM_GB",
+        ] {
+            std::env::remove_var(v);
+        }
+        std::env::set_var("GHOSTLINK_CTX_SIZE", "131072");
+        let line = crate::native_engine::describe_tuning(12.0);
+        assert!(
+            line.contains("-c 131072"),
+            "an explicit request is honoured: {line}"
+        );
+        assert!(
+            !line.contains("OVERRIDDEN"),
+            "an honoured request must not be called an override: {line}"
+        );
+        std::env::remove_var("GHOSTLINK_CTX_SIZE");
+    }
+
+    #[test]
     fn describe_tuning_agrees_with_the_functions_it_describes() {
         // The report must not drift from reality: it calls the same getters.
         let _guard = env_lock().lock().expect("env lock poisoned");
@@ -3826,7 +4035,7 @@ mod tests {
             std::env::remove_var(v);
         }
         for size in [0.7f32, 1.7, 4.85, 12.0, 14.7] {
-            let line = NativeEngineClient::describe_tuning(size);
+            let line = crate::native_engine::describe_tuning(size);
             assert!(
                 line.contains(&format!("-c {}", NativeEngineClient::get_ctx_size(size))),
                 "ctx mismatch at {size} GB: {line}"
@@ -3836,5 +4045,68 @@ mod tests {
                 "ngl mismatch at {size} GB: {line}"
             );
         }
+    }
+
+    #[test]
+    fn auto_ignored_setting_names_a_non_default_value_left_dormant_by_auto() {
+        // The more misleading failure mode: settings.json shows a number that is never
+        // used, because `*_auto` is true so nothing exports it.
+        let dir = std::env::temp_dir().join("ghostlink-tuning-diag-test");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"ctx_size":131072,"ctx_size_auto":true,"ngl":100,"ngl_auto":true,
+                "threads":4,"threads_auto":true}"#,
+        )
+        .expect("write");
+
+        assert_eq!(
+            crate::native_engine::auto_ignored_setting_in("ctx_size", &path).as_deref(),
+            Some("ctx_size=131072")
+        );
+        assert_eq!(
+            crate::native_engine::auto_ignored_setting_in("ngl", &path).as_deref(),
+            Some("ngl=100")
+        );
+        // threads=4 is the default, so it must NOT be reported: listing defaults would
+        // bury the real finding in noise.
+        assert_eq!(
+            crate::native_engine::auto_ignored_setting_in("threads", &path),
+            None,
+            "a default value is not an ignored override"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn auto_ignored_setting_is_silent_when_auto_is_false() {
+        // With auto=false the value IS applied, so there is nothing to report.
+        let dir = std::env::temp_dir().join("ghostlink-tuning-diag-explicit");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, r#"{"ctx_size":131072,"ctx_size_auto":false}"#).expect("write");
+        assert_eq!(
+            crate::native_engine::auto_ignored_setting_in("ctx_size", &path),
+            None
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn auto_ignored_setting_tolerates_a_missing_or_malformed_file() {
+        let missing = std::env::temp_dir().join("ghostlink-tuning-diag-absent.json");
+        std::fs::remove_file(&missing).ok();
+        assert_eq!(
+            crate::native_engine::auto_ignored_setting_in("ngl", &missing),
+            None
+        );
+        let bad = std::env::temp_dir().join("ghostlink-tuning-diag-bad.json");
+        std::fs::write(&bad, "{not json").expect("write");
+        assert_eq!(
+            crate::native_engine::auto_ignored_setting_in("ngl", &bad),
+            None
+        );
+        std::fs::remove_file(&bad).ok();
     }
 }
