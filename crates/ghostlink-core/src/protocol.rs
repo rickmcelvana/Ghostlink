@@ -408,7 +408,7 @@ impl NodeResources {
             let port = u16::from_le_bytes(
                 payload[cursor..cursor + 2]
                     .try_into()
-                    .map_err(|_| "rpc_port parsing failed".to_string())?,
+                    .map_err(|_| "rpc_port parsing failed")?,
             );
             cursor += 2;
             if port == 0 {
@@ -531,6 +531,8 @@ impl DiscoveryFrame {
             return Err(format!("unsupported protocol version {}", header.version));
         }
 
+        let kind = FrameKind::try_from(header.kind)?;
+
         // Fast CRC check
         let payload = &bytes[FrameHeader::HEADER_SIZE..];
         let computed_crc = crc32(payload);
@@ -545,10 +547,7 @@ impl DiscoveryFrame {
         // Decode node resources from payload
         let node = NodeResources::decode_payload(payload)?;
 
-        Ok(Self {
-            kind: FrameKind::try_from(header.kind)?,
-            node,
-        })
+        Ok(Self { kind, node })
     }
 }
 
