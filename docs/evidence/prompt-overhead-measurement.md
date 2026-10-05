@@ -8,8 +8,8 @@ proxy on 8099 forwarding to 8080) so the bodies are visible *and* timings stay r
 Request: `{"message":"Reply with exactly: OK","max_tokens":4}`
 
     POST /v1/chat/completions
-      system   313 chars
-      user    17149 chars      <-- for a five-word question
+      role=system   313 chars
+      role=user     17149 chars      <-- for a five-word question
 
     POST /completion
       prompt  17482 chars
@@ -20,22 +20,18 @@ A five-word question costs 3,814 prompt tokens.
 
 ## Where they go
 
-`main.rs:3188` (and the same shape in `native_tool_loop_core`):
+`main.rs` assembles the prompt as:
 
-```rust
-let prompt = format!("{tool_instructions}Question: {user_message}\n{scratchpad}");
-```
+    let prompt = format!("{tool_instructions}Question: {user_message}\n{scratchpad}");
 
 `tool_instructions` is `grounding::capability_statement(...)` plus
-`mcp::toolcall::build_tool_instructions(tools)`, which inlines every enabled tool's
+`mcp::toolcall::build_tool_instructions(tools)`, which inlined every enabled tool's
 **full JSON input schema as text**:
 
-```rust
-block.push_str(&format!(
-    "- {} - {}\n  input schema: {}\n",
-    tool.name, description, tool.input_schema
-));
-```
+    block.push_str(&format!(
+        "- {} - {}\n  input schema: {}\n",
+        tool.name, description, tool.input_schema
+    ));
 
 With the `filesystem` MCP server enabled that is 14 tools. The measured delta between
 a tool-enabled turn and a `tools: []` turn was **zero**, which is the trap here: the
@@ -62,6 +58,13 @@ for a five-word question, before the model has read the question.
 
 ## Why this was not found earlier
 
-Every measurement in this branch used a long synthetic prompt where 3,800 tokens of
+Every measurement in this series used a long synthetic prompt where 3,800 tokens of
 fixed overhead is noise against 5,000 tokens of user text. The overhead only becomes
-visible when the user text is short -- which is the common case in a GUI chat.
+visible when the user text is short — which is the common case in a GUI chat.
+
+The prefill *ratios* were all correct and none of them were wrong. They were measuring a
+ratio when the defect was in a constant.
+
+`scripts/inference_bench.py --overhead-only` now measures a fixed five-word prompt for
+exactly this reason, and was verified to report 3,814 tokens against the unfixed build
+and 1,047 against the fixed one.

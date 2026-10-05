@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import signal
 import subprocess
@@ -65,13 +66,48 @@ def _post(path: str, payload: dict, timeout: float = 10.0, auth: bool = True) ->
 
 
 def _wait_ready(max_wait_s: int = 45) -> None:
+    """Waits for the API to answer /health at all.
+
+    Readiness here means "the HTTP server is up". This test starts the backend with no
+    model, and `status` is `degraded` in that state rather than the unconditional
+    `"healthy"` it used to report -- that literal checked nothing, which is why a chat
+    request could fail for 20 seconds while /health claimed all was well.
+
+    The contract is asserted below rather than in the wait: what matters is that the two
+    fields agree, not that a model happens to be loaded.
+    """
     deadline = time.time() + max_wait_s
     while time.time() < deadline:
         try:
-            data = _get("/health", timeout=1.5, auth=False)
-            if data.get("status") == "healthy":
+            # 5s, not 1.5s: a direct connection to a closed local port measures ~2,048 ms
+            # on this host, reproduced from plain Python with no server involved, so the
+            # old budget was unmeetable even when the endpoint answered instantly.
+            data = _get("/health", timeout=5.0, auth=False)
+            if data.get("status") in ("healthy", "degraded"):
+                # A health endpoint that says "healthy" while the backend is unreachable
+                # is exactly the defect that was fixed; fail if it ever returns.
+                _assert_keys(data, ["backend_reachable"], "/health response")
+                if (data.get("status") == "healthy") != bool(data.get("backend_reachable")):
+                    raise RuntimeError(
+                        "/health status and backend_reachable disagree: "
+                        f"{data.get('status')!r} vs {data.get('backend_reachable')!r}"
+                    )
                 return
-        except (URLError, HTTPError, TimeoutError, OSError, ValueError):
+        except RuntimeError:
+            raise
+        except (
+            URLError,
+            HTTPError,
+            TimeoutError,
+            OSError,
+            ValueError,
+            http.client.BadStatusLine,
+            http.client.HTTPException,
+            ConnectionError,
+        ):
+            # `BadStatusLine` and the broader `HTTPException` were missing here, so a
+            # truncated or mid-handshake response killed the readiness loop with an
+            # unhandled exception instead of being retried.
             time.sleep(0.5)
     raise RuntimeError("backend failed to become healthy")
 

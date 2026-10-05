@@ -1640,8 +1640,13 @@ impl NativeEngineClient {
             "stream": false,
         })
         .to_string();
+        // 2s, not the 10s default. Measured: a health probe against a backend that is
+        // not listening took ~2.0s per call, which is slow enough to be a real cost on a
+        // health endpoint that a GUI polls. A refused *local* port is instant; the wait
+        // is the client's own timeout expiring on a routeless address, so the bound has
+        // to be short enough to be harmless.
         let Ok(client) = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(2))
             .build()
         else {
             return false;
