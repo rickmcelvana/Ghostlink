@@ -427,6 +427,46 @@ impl NativeEngineClient {
     ///
     /// Best effort: any failure returns 0, and callers treat 0 as "unknown" and keep
     /// the previous ceiling rather than guessing.
+    /// Whether the configured `llama-server` binary was built with RPC support.
+    ///
+    /// Verified rather than assumed, because a binary built without `GGML_RPC` rejects
+    /// `--rpc` outright. Measured against this repo's vendored build:
+    ///
+    /// ```text
+    /// $ llama-server --version
+    /// version 0.5.0-dev (build 1, commit 4b1a27f)
+    /// $ llama-server ... --rpc 127.0.0.1:59999
+    /// error: invalid argument: --rpc
+    /// $ grep GGML_RPC build/CMakeCache.txt
+    /// GGML_RPC:BOOL=OFF
+    /// ```
+    ///
+    /// So `--rpc` and `-ts` were being handed to a process that exits 1 on them. One
+    /// probe at launch, cached: cheap, and it turns a silent load failure into a
+    /// specific, actionable message.
+    pub(crate) fn binary_supports_rpc() -> bool {
+        use std::sync::OnceLock;
+        static SUPPORTS: OnceLock<bool> = OnceLock::new();
+        *SUPPORTS.get_or_init(|| {
+            let bin = Self::get_llama_server_bin();
+            if bin == "llama-server" || bin == "llama-server.exe" || !Path::new(&bin).exists() {
+                return false;
+            }
+            match std::process::Command::new(&bin).arg("--help").output() {
+                Ok(out) => {
+                    let text = format!(
+                        "{}{}",
+                        String::from_utf8_lossy(&out.stdout),
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                    // `--rpc` appears in the flag parser's output only when GGML_RPC is on.
+                    text.contains("--rpc")
+                }
+                Err(_) => false,
+            }
+        })
+    }
+
     pub(crate) async fn probe_running_ctx_size() -> u32 {
         let base = Self::get_llama_base_url();
         let url = format!("{}/props", base.trim_end_matches('/'));
@@ -1120,6 +1160,7 @@ impl NativeEngineClient {
         model_path: &str,
         rpc_servers: Option<&str>,
         tensor_split: Option<&str>,
+        tensor_override: Option<&str>,
     ) -> Result<(), String> {
         let resolved = Self::resolve_model_path(model_path)?;
         let normalized_path = resolved.to_string_lossy().replace('\\', "/");
@@ -1152,6 +1193,19 @@ impl NativeEngineClient {
         let no_mmap = Self::get_no_mmap();
         let mut extra_args = Self::get_llama_server_args();
         if let Some(servers) = rpc_servers.filter(|s| !s.is_empty()) {
+            // Refuse with the reason, rather than handing llama-server a flag it exits
+            // on. Otherwise the failure is a bare "invalid argument: --rpc", which reads
+            // like a malformed command line rather than a build configured without
+            // distributed-inference support.
+            if !Self::binary_supports_rpc() {
+                return Err(format!(
+                    "distributed inference requested (--rpc {servers}) but the configured \
+                     llama-server binary does not support it. This build was made without \
+                     GGML_RPC; rebuild llama.cpp with -DGGML_RPC=ON (and build \
+                     ggml-rpc-server) to enable cross-machine tensor split, or clear \
+                     GHOSTLINK_REQUIRE_CLUSTER_OFFLOAD to stay single-node."
+                ));
+            }
             eprintln!("[model-load] Distributed inference enabled: --rpc {servers}");
             extra_args.push("--rpc".to_string());
             extra_args.push(servers.to_string());
@@ -1159,6 +1213,16 @@ impl NativeEngineClient {
                 eprintln!("[model-load] Tensor split: -ts {split}");
                 extra_args.push("-ts".to_string());
                 extra_args.push(split.to_string());
+            }
+            // Route by tensor class, not by equal layer share. `-ts` says how much
+            // goes where; it does not say *which tensors*, so llama-server spreads whole
+            // layers -- attention, KV, lm_head included -- across the link. `-ot` is the
+            // flag that names them, and it was documented in a unit test but never
+            // passed here, so the intent had no path to the process at all.
+            if let Some(ot) = tensor_override.filter(|s| !s.is_empty()) {
+                eprintln!("[model-load] Tensor class override: -ot {ot}");
+                extra_args.push("-ot".to_string());
+                extra_args.push(ot.to_string());
             }
         }
         let alias = resolved

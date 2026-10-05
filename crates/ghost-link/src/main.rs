@@ -7206,7 +7206,7 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         // qualifying peers, or (once `rpc_shared_secret` is set) every peer
         // fails the handshake — all of which reproduce single-node
         // behavior exactly.
-        let (rpc_servers, tensor_split, dist_warning, require_offload) = async {
+        let (rpc_servers, tensor_split, tensor_override, dist_warning, require_offload) = async {
             let (
                 peers,
                 local_vram,
@@ -7260,17 +7260,30 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                 }
             }; // <-- short-lived discovery lock dropped here, before any .await
 
-            let model_size_gb = native_engine::NativeEngineClient::resolve_model_path(&selected_model)
-                .ok()
-                .and_then(|p| fs::metadata(p).ok())
-                .map(|m| m.len() as f32 / (1024.0 * 1024.0 * 1024.0))
-                .unwrap_or(0.0);
+            let model_size_gb =
+                native_engine::NativeEngineClient::resolve_model_path(&selected_model)
+                    .ok()
+                    .and_then(|p| fs::metadata(p).ok())
+                    .map(|m| m.len() as f32 / (1024.0 * 1024.0 * 1024.0))
+                    .unwrap_or(0.0);
 
             let mut peers = peers;
-            if !peers.is_empty() && local_vram > 0.0 && (model_size_gb + 1.0) <= local_vram && !require_offload {
+            // Weights + KV + headroom, not weights alone. The old test was
+            // `model_size + 1.0 <= vram`, which passes for a model whose weights fit but
+            // whose KV cache does not -- and that is a failed model load, not a slow one.
+            let fits_locally = rpc_cluster::model_fits_locally(
+                model_size_gb,
+                local_vram,
+                native_engine::NativeEngineClient::running_ctx_size(),
+            );
+            if !peers.is_empty() && fits_locally && !require_offload {
                 tracing::warn!(
-                    "rpc_cluster: model ({:.2} GB) fits locally in VRAM ({:.2} GB) \u{2014} auto-disabling distributed inference to avoid unnecessary Ethernet RPC. Set GHOSTLINK_REQUIRE_CLUSTER_OFFLOAD=1 to force.",
-                    model_size_gb, local_vram
+                    "rpc_cluster: model ({:.2} GB) plus KV cache fits locally in VRAM \
+                     ({:.2} GB) \u{2014} auto-disabling distributed inference to avoid \
+                     unnecessary Ethernet RPC. Set GHOSTLINK_REQUIRE_CLUSTER_OFFLOAD=1 to \
+                     force.",
+                    model_size_gb,
+                    local_vram
                 );
                 peers.clear();
             }
@@ -7309,20 +7322,57 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             };
 
             if peers.is_empty() {
-                (None, None, None, require_offload)
+                (None, None, None, None, require_offload)
             } else {
                 let split =
                     rpc_cluster::compute_tensor_split(local_vram, local_system_memory, &peers);
                 match rpc_cluster::validate_distributed_offload(effective_ngl, &split) {
-                    Ok(()) => (
-                        Some(rpc_cluster::rpc_flag_value(&peers)),
-                        Some(rpc_cluster::tensor_split_flag_value(&split)),
-                        None,
-                        require_offload,
-                    ),
+                    Ok(()) => {
+                        // Which tensors go remote, decided by class rather than by an
+                        // equal layer share. A `-ts` ratio alone puts attention, the KV
+                        // cache and lm_head behind a network round trip per token.
+                        let peer_vram = peers.iter().map(|p| p.vram_gb).sum::<f32>();
+                        let plan = tensor_plan::plan_tensor_classes(
+                            local_vram,
+                            model_size_gb,
+                            peer_vram,
+                            tensor_plan::LatencyProfile {
+                                peer_rtt_ms: rpc_peer_rtt_ms(),
+                                local_cpu_penalty_ms: local_cpu_offload_penalty_ms(),
+                            },
+                        );
+                        // `-ot` resolves buffer types against *registered* devices, and
+                        // ggml-rpc names a remote device `RPC0[endpoint]` (ggml-rpc.cpp:1092).
+                        // The bare word "RPC" is rejected by llama-server, so the peer
+                        // address has to go in the value.
+                        let buffer_type = tensor_plan::rpc_buffer_type(&peers[0].addr.to_string());
+                        let override_value = tensor_plan::override_flag_value(&plan, &buffer_type);
+                        if override_value.is_empty() {
+                            tracing::info!(
+                                "rpc_cluster: no tensor class is worth placing remotely \
+                                 (local_vram={:.2} GB, model={:.2} GB, peer_vram={:.2} GB, \
+                                 rtt={} ms) -- keeping the whole model local",
+                                local_vram,
+                                model_size_gb,
+                                peer_vram,
+                                rpc_peer_rtt_ms()
+                            );
+                        } else {
+                            tracing::info!(
+                                "rpc_cluster: routing tensor classes remotely: {override_value}"
+                            );
+                        }
+                        (
+                            Some(rpc_cluster::rpc_flag_value(&peers)),
+                            Some(rpc_cluster::tensor_split_flag_value(&split)),
+                            Some(override_value).filter(|s| !s.is_empty()),
+                            None,
+                            require_offload,
+                        )
+                    }
                     Err(warn_msg) => {
                         tracing::warn!("Distributed offload no-op: {warn_msg}");
-                        (None, None, Some(warn_msg), require_offload)
+                        (None, None, None, Some(warn_msg), require_offload)
                     }
                 }
             }
@@ -7452,6 +7502,7 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                         &path,
                         rpc_servers.as_deref(),
                         tensor_split.as_deref(),
+                        tensor_override.as_deref(),
                     )
                 }
             })
@@ -7477,6 +7528,7 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                             &path,
                             rpc_servers.as_deref(),
                             tensor_split.as_deref(),
+                            tensor_override.as_deref(),
                         )
                     }
                 })
@@ -10220,6 +10272,32 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
     /// This is the knob the inference audit named and could not find anywhere in the
     /// codebase. It did not exist, so every turn re-evaluated the whole history against
     /// the token ceiling and could resend all of it.
+    /// Round trip to an RPC peer, in milliseconds.
+    ///
+    /// Measured or configured. `GHOSTLINK_RPC_RTT_MS` overrides; the default is a fast
+    /// LAN. Used by the tensor-class planner to refuse placing work on a peer whose latency
+    /// exceeds the local CPU-offload penalty.
+    fn rpc_peer_rtt_ms() -> f32 {
+        std::env::var("GHOSTLINK_RPC_RTT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(tensor_plan::LatencyProfile::default().peer_rtt_ms)
+    }
+
+    /// Penalty for offloading a layer to the local CPU instead of VRAM, in milliseconds.
+    ///
+    /// A layer placed remotely pays `GHOSTLINK_RPC_RTT_MS` every token. A layer placed on
+    /// the local CPU pays bandwidth, not latency. Comparing the two is what decides whether
+    /// a peer is worth using at all.
+    fn local_cpu_offload_penalty_ms() -> f32 {
+        std::env::var("GHOSTLINK_CPU_OFFLOAD_PENALTY_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(tensor_plan::LatencyProfile::default().local_cpu_penalty_ms)
+    }
+
     fn keep_last_turns() -> usize {
         std::env::var("GHOSTLINK_KEEP_LAST_TURNS")
             .ok()
@@ -15197,6 +15275,7 @@ mod runtime;
 mod runtime_switcher;
 mod scheduler;
 mod skills;
+mod tensor_plan;
 mod title;
 mod tls;
 mod toolselect;

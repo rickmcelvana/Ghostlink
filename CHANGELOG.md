@@ -7,6 +7,40 @@ All notable changes to Ghostlink Studio are documented here.
 ## [Unreleased]
 
 ### Added
+- **Tensor-class planning for distributed offload** (`crates/ghost-link/src/tensor_plan.rs`): `-ts` says *how much* goes to each device; it does not say *which tensors*. llama-server therefore spreads whole layers -- attention, KV cache and `lm_head` included -- across the link, paying a network round trip per token for tensors that are tiny or reused constantly. The new planner routes FFN and MoE experts remotely and pins embeddings, attention, KV and `lm_head` locally, with a latency term that refuses a peer whose RPC RTT exceeds the local CPU-offload penalty.
+
+  `GHOSTLINK_RPC_RTT_MS` and `GHOSTLINK_CPU_OFFLOAD_PENALTY_MS` configure the comparison.
+
+- **`-ot` now actually reaches `llama-server`.** `GHOSTLINK_LLAMA_OVERRIDE_TENSOR` already named the right split (`ffn=RPC,exps=RPC`) but existed only as a string literal inside a unit test -- there was no code path from it to the process. The plan is now computed at peer discovery and passed through `load_model_into_slot`.
+
+### Fixed
+- **Distributed inference no longer hands `llama-server` flags it rejects.** This repo's vendored `llama.cpp` was built with `GGML_RPC:BOOL=OFF`, verified three ways:
+  ```
+  $ llama-server ... --rpc 127.0.0.1:59999
+  error: invalid argument: --rpc          (exit 1)
+  $ grep GGML_RPC build/CMakeCache.txt
+  GGML_RPC:BOOL=OFF
+  $ grep -- --rpc <(llama-server --help)  -> no match
+  ```
+  A load with `distributed_inference` on was being passed `--rpc` and `-ts` and failed with a bare `invalid argument: --rpc`, which reads like a malformed command line rather than a build without distributed-inference support. `native_engine::binary_supports_rpc` now probes the configured binary once and returns a specific, actionable error naming `GGML_RPC=ON`.
+
+  This was never caught because the RPC path has never been exercised on this machine. It is a fix to the failure mode, not a claim that distributed inference now works -- it cannot, until llama.cpp is rebuilt with RPC enabled.
+
+- **`-ot` buffer types are addressed the way llama.cpp resolves them.** `arg.cpp:272` resolves every `-ot` value against the buffer types of *registered* devices and throws `unknown buffer type` otherwise; `ggml-rpc.cpp:1092` builds a remote device's name as `RPC0[endpoint]`. The bare word `RPC` was tested against the real binary and rejected:
+  ```
+  $ llama-server -m model.gguf -ot ffn=RPC
+  error while handling argument "-ot": unknown buffer type
+  ```
+  The emitted value is now `RPC0[<endpoint>]`, built from the same peer address passed to `--rpc`.
+
+- **"Fits locally" now accounts for the KV cache** (`rpc_cluster::model_fits_locally`). The check was `model_size + 1.0 <= vram`, which passes for a model whose *weights* fit but whose KV cache does not -- and that is a failed model load, not a slow one. Now weights + KV (scaled by context length) + 1 GB headroom.
+
+- **`TCP_NODELAY` on both legs of the RPC allowlist proxy.** `ggml-rpc` moves small, latency-critical frames -- one per matmul, one result per token. Nagle's algorithm can hold a small write for up to the delayed-ACK timeout (~40ms) in each direction, and forwarding through a userspace proxy built on default sockets silently reintroduced it after llama.cpp had set it on its own. Best-effort: a socket that cannot be configured still works, just slower, and this is never a reason to drop a legitimate peer. Security checks are unchanged.
+
+  Scoped honestly: the proxy only runs when `rpc_allowed_peers` or `rpc_shared_secret` is configured. With both empty, `ggml-rpc-server` binds the public address directly and there is no data path to slow down.
+
+
+### Added
 - **Sliding window for chat history** (`crates/ghost-link/src/context_window.rs`): the audit's item 5 said sliding window / compact policies were "documented and not implemented on the chat path". `GHOSTLINK_KEEP_LAST_TURNS` did not exist anywhere in the codebase. Now there is a window with a completion reserve and a bounded keep-last floor, plus `GHOSTLINK_KEEP_LAST_TURNS` (default 4) and `GHOSTLINK_COMPLETION_RESERVE_TOKENS`.
 
   Every turn re-evaluated the whole history against the token ceiling. With prefill measured at 245 tok/s, a long conversation paid a ~21.7s prefill on *every* turn, so TTFT grew without bound until the ceiling finally bit.

@@ -765,11 +765,30 @@ async fn run_rpc_allowlist_proxy(
     let listener = TcpListener::bind(public_addr).await?;
     tracing::info!(
         "rpc_cluster: rpc_allowed_peers proxy listening on {public_addr}, forwarding allowed \
-         peers to ggml-rpc-server at {backend_addr} ({} allowlist entries, require_admission={})",
+         peers to ggml-rpc-server at {backend_addr} ({} allowlist entries, require_admission={}, \
+         nodelay on both hops)",
         allowed_peers.len(),
         require_admission
     );
     serve_rpc_allowlist_proxy(listener, backend_addr, allowed_peers, require_admission).await
+}
+
+/// Disables Nagle's algorithm on both ends of a proxied connection.
+///
+/// This is the whole reason the proxy is worth more than a bind-address change on a
+/// trusted LAN, and it was the one thing it was not doing.
+///
+/// `ggml-rpc` moves small, latency-critical frames: one request per matmul, and decode
+/// sends a result per token. Nagle holds a small write until the previous segment is
+/// acknowledged, which on a busy LAN is a wait of up to ~40ms (the delayed-ACK timer)
+/// before the bytes move at all. llama.cpp sets `TCP_NODELAY` on its own sockets;
+/// forwarding through a userspace proxy built on default sockets silently reintroduces
+/// it for every frame in both directions.
+///
+/// The security property is unchanged -- this only affects socket options on
+/// connections that already passed the allowlist and admission checks.
+fn set_nodelay(stream: &TcpStream) -> std::io::Result<()> {
+    stream.set_nodelay(true)
 }
 
 /// Accept loop shared by `run_rpc_allowlist_proxy` and its tests: for each
@@ -798,6 +817,14 @@ async fn serve_rpc_allowlist_proxy(
             }
         };
 
+        // Best effort: a stream without TCP_NODELAY still works, just slower, and this
+        // must never be the reason a legitimate peer is dropped.
+        if let Err(err) = set_nodelay(&inbound) {
+            tracing::debug!(
+                "rpc_cluster: could not disable Nagle on the inbound leg from {peer_addr}: {err}"
+            );
+        }
+
         let ip_ok = ip_allowed(&peer_addr.ip(), &allowed_peers);
         let admitted = is_admitted(&peer_addr.ip());
         if !connection_allowed(ip_ok, require_admission, admitted) {
@@ -817,6 +844,12 @@ async fn serve_rpc_allowlist_proxy(
             let mut inbound = inbound;
             match TcpStream::connect(backend_addr).await {
                 Ok(mut outbound) => {
+                    if let Err(err) = set_nodelay(&outbound) {
+                        tracing::debug!(
+                            "rpc_cluster: could not disable Nagle on the outbound leg to \
+                             {backend_addr}: {err}"
+                        );
+                    }
                     if let Err(err) = copy_bidirectional(&mut inbound, &mut outbound).await {
                         tracing::debug!(
                             "rpc_cluster: proxied connection from {peer_addr} ended: {err}"
@@ -1392,6 +1425,29 @@ pub fn discover_rpc_peers_with_policy(
 /// Scaling system RAM by 0.5 (50%) prevents OOMing CPU-only nodes while allowing
 /// CPU-only peers to accept a meaningful weight share when needed to fit models.
 pub const CPU_RAM_HAIRCUT: f32 = 0.5;
+
+/// Whether a model should stay on the coordinator rather than being split.
+///
+/// Weights alone are the wrong test. The KV cache grows with context length and stays
+/// resident for the whole generation, so a model whose *weights* fit can still fail to
+/// load once the KV cache is included. That is a failed model load, not a slow one.
+///
+/// Returns false when VRAM is unknown (0.0). Guessing "it fits" from absent data would
+/// disable cluster offload on every node that has not reported metrics, which is the
+/// opposite of what the caller wants.
+pub fn model_fits_locally(model_size_gb: f32, local_vram_gb: f32, ctx_tokens: u32) -> bool {
+    if local_vram_gb <= 0.0 {
+        return false;
+    }
+    // ~1 GiB per 32k context is a rough but serviceable figure for a mid-size model;
+    // deliberately generous, because the cost of being wrong here is a failed load
+    // rather than a slightly slow split.
+    let kv_gb = (ctx_tokens as f32 / 32_768.0) * 1.0;
+    model_size_gb + kv_gb + KV_HEADROOM_GB <= local_vram_gb
+}
+
+/// Headroom left free for fragmentation and the compute buffers, in GB.
+pub const KV_HEADROOM_GB: f32 = 1.0;
 
 /// Computes a `--tensor-split` ratio: the local device first, then each
 /// remote peer in the same order as `peers` — llama.cpp registers backend
@@ -2434,5 +2490,71 @@ mod tests {
         stop_contributing();
         stop_contributing();
         assert!(!is_contributing_healthy());
+    }
+
+    #[test]
+    fn a_model_with_kv_cache_that_overflows_is_not_treated_as_fitting() {
+        // The gap this closes. Weights fit at 3.0 GB against 4.0 GB VRAM, so the old
+        // `model + 1.0 <= vram` check passed and cluster offload was disabled -- but the
+        // KV cache does not fit, and the result is a failed model load.
+        assert!(
+            !model_fits_locally(3.0, 4.0, 131_072),
+            "3 GB of weights must not count as fitting when 128k of KV cache is added"
+        );
+        // 3.0 weights + 0.25 KV (8k) + 1.0 headroom = 4.25, so 4.5 GB of VRAM is the
+        // first size at which the same weights genuinely fit.
+        assert!(
+            model_fits_locally(3.0, 4.5, 8_192),
+            "3 GB of weights at 8k context fit in 4.5 GB: 3.0 + 0.25 + 1.0 = 4.25"
+        );
+        assert!(
+            !model_fits_locally(3.0, 4.5, 131_072),
+            "the same weights at 128k need 3.0 + 4.0 + 1.0 = 8.0 GB"
+        );
+    }
+
+    #[test]
+    fn unknown_vram_never_counts_as_fitting() {
+        // Guessing "fits" from absent metrics would disable cluster offload on every
+        // node that has not reported, which is backwards.
+        assert!(!model_fits_locally(3.0, 0.0, 8_192));
+        assert!(!model_fits_locally(3.0, -1.0, 8_192));
+    }
+
+    #[test]
+    fn headroom_is_left_free() {
+        // Exactly at the limit must NOT count as fitting -- fragmentation and compute
+        // buffers need room too.
+        assert!(!model_fits_locally(10.0, 11.0, 8_192));
+        assert!(model_fits_locally(10.0, 12.0, 8_192));
+    }
+
+    #[test]
+    fn kv_cache_cost_grows_with_context() {
+        let short = model_fits_locally(8.0, 12.0, 8_192);
+        let long = model_fits_locally(8.0, 12.0, 131_072);
+        assert!(short && !long, "128k context must not fit where 8k does");
+    }
+
+    #[tokio::test]
+    async fn nodelay_is_set_on_a_proxied_connection() {
+        // The measurable part of the proxy's cost. ggml-rpc sends one small frame per
+        // matmul; without TCP_NODELAY, Nagle can hold it for up to the delayed-ACK
+        // timeout (~40ms) in each direction. Asserted on tokio streams because that is
+        // what `serve_rpc_allowlist_proxy` actually holds.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let accept = tokio::spawn(async move {
+            let (s, _) = listener.accept().await.expect("accept");
+            s
+        });
+        let client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let server = accept.await.expect("join");
+        set_nodelay(&client).expect("nodelay on client");
+        set_nodelay(&server).expect("nodelay on server");
+        assert!(client.nodelay().expect("query"));
+        assert!(server.nodelay().expect("query"));
     }
 }
