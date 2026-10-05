@@ -5,9 +5,12 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
+import ssl
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -16,10 +19,38 @@ from urllib.request import Request, urlopen
 ROOT = Path(__file__).resolve().parent.parent
 HOST = "127.0.0.1"
 PORT = 18014
-BASE_URL = f"http://{HOST}:{PORT}"
+# The server reads `enable_tls` from settings.json, so a developer machine can have it
+# on while CI (no settings.json) has it off. Default to plaintext and let the caller
+# override, rather than silently failing against a TLS listener with BadStatusLine.
+def _detect_scheme() -> str:
+    """http unless something says otherwise.
+
+    The server decides from `settings.json`'s `enable_tls`, so a harness that assumes
+    plaintext fails with `BadStatusLine` on any developer machine with TLS on -- and a
+    harness that assumes TLS fails in CI, which has no settings.json. Read the same file
+    the server reads, and let the env var override for a deliberate test.
+    """
+    override = os.environ.get("GHOSTLINK_TEST_SCHEME")
+    if override:
+        return override
+    try:
+        settings = json.loads((ROOT / "settings.json").read_text(encoding="utf-8"))
+        return "https" if settings.get("enable_tls") else "http"
+    except (OSError, ValueError):
+        return "http"
 
 
-API_KEY_PATH = ROOT / "api_key.txt"
+SCHEME = _detect_scheme()
+BASE_URL = f"{SCHEME}://{HOST}:{PORT}"
+
+
+# Same temp path the smoke test writes; never the repository's real api_key.txt.
+API_KEY_PATH = Path(tempfile.gettempdir()) / "ghostlink-ci-smoke-key.txt"
+# Same value ci_gui_backend_smoke.py uses; both harnesses must agree or
+# one will 401 while the other passes.
+API_KEY_VALUE = "ghostlink-ci-smoke-key"
+# The hashed key store, which is what actually authenticates once it exists.
+API_KEYS_STORE_PATH = Path(tempfile.gettempdir()) / "ghostlink-ci-smoke-keys.json"
 
 
 def _wait_for_api_key(max_wait_s: int = 20) -> str:
@@ -40,13 +71,46 @@ def _wait_for_api_key(max_wait_s: int = 20) -> str:
 
 
 def _auth_headers() -> dict:
-    return {"Authorization": f"Bearer {_wait_for_api_key()}"}
+    return {"Authorization": f"Bearer {_current_api_key()}"}
+
+
+# `enable_tls` makes the server serve HTTPS with the local self-signed cert, which
+# urlopen rejects by default -- and this is a test harness talking to localhost, so
+# verification buys nothing here. Only used when SCHEME is https.
+_TLS_CTX = ssl._create_unverified_context() if SCHEME == "https" else None
+
+
+def _open(req: Request, timeout: float):
+    if _TLS_CTX is None:
+        return urlopen(req, timeout=timeout)
+    return urlopen(req, timeout=timeout, context=_TLS_CTX)
+
+
+def _current_api_key() -> str:
+    """The key the server actually persisted.
+
+    The server generates its own key at startup and overwrites whatever was at the path,
+    so the pre-seeded value is only a placeholder that lets the file exist early. Reading
+    it back is the only way to learn the real value -- assuming the seed survives is how
+    this ends in a 401 that looks like an auth bug.
+    """
+    deadline = time.time() + 20
+    last = ""
+    while time.time() < deadline:
+        try:
+            last = API_KEY_PATH.read_text(encoding="utf-8").strip()
+            if last and last != API_KEY_VALUE:
+                return last
+        except FileNotFoundError:
+            pass
+        time.sleep(0.2)
+    return last or API_KEY_VALUE
 
 
 def _get(path: str, timeout: float = 5.0, auth: bool = True) -> dict:
     headers = _auth_headers() if auth else {}
     req = Request(f"{BASE_URL}{path}", method="GET", headers=headers)
-    with urlopen(req, timeout=timeout) as resp:
+    with _open(req, timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -61,7 +125,7 @@ def _post(path: str, payload: dict, timeout: float = 10.0, auth: bool = True) ->
         headers=headers,
         method="POST",
     )
-    with urlopen(req, timeout=timeout) as resp:
+    with _open(req, timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -119,9 +183,36 @@ def _assert_keys(obj: dict, keys: list[str], context: str) -> None:
 
 
 def main() -> int:
+    # The server writes its API key to `GHOSTLINK_API_KEY_PATH`, and defaults to the
+    # repository's own `api_key.txt` when that is unset. Point it at the same temp file
+    # this script polls, and pre-seed it so the very first authenticated request has a
+    # key even if startup has not finished persisting.
+    #
+    # Previously it was left unset, so the server wrote the key to the repo and this
+    # script polled a temp path that never appeared -- CI failed with "API key file never
+    # appeared". It also means the server had a real, developer-owned key path in play,
+    # which is what dd38bea was fixing for the smoke test.
+    API_KEY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # Redirect BOTH files, not just the raw key.
+    #
+    # `load_api_keys()` returns the existing `api_keys.json` store when it parses and is
+    # non-empty, and only falls back to seeding from `api_key.txt` otherwise. On a machine
+    # that already has a store (any real install) `GHOSTLINK_API_KEY_PATH` alone is simply
+    # never read, so the server authenticates against the developer's real keys and this
+    # harness cannot possibly succeed. Redirecting the store too makes the run hermetic
+    # whether or not a store exists.
+    API_KEYS_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    for stale in (API_KEY_PATH, API_KEYS_STORE_PATH):
+        stale.unlink(missing_ok=True)
+
     proc = subprocess.Popen(
         ["cargo", "run", "-p", "ghost-link", "--", "serve", HOST, str(PORT)],
         cwd=str(ROOT),
+        env={
+            **os.environ,
+            "GHOSTLINK_API_KEY_PATH": str(API_KEY_PATH),
+            "GHOSTLINK_API_KEYS_PATH": str(API_KEYS_STORE_PATH),
+        },
         stdout=subprocess.DEVNULL,
         stderr=subprocess.STDOUT,
     )

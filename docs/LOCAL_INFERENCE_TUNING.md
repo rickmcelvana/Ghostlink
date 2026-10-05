@@ -193,6 +193,67 @@ sounds uniform-core, but the OS reports a genuine 4P/4E split. Read it rather th
 assuming — which is what `SystemProfile::cpu.performance_cores` is for, and it was
 already being computed on every probe and never consulted.
 
+## 1b. The context ceiling dominates long conversations
+
+`get_ctx_size` caps context by model size, independently of the VRAM tier:
+
+| model size | ctx granted | turns of ~500 tokens |
+|---|---|---|
+| under 5 GB | 8192 | ~16 |
+| 5-10 GB | 8192 | ~16 |
+| 10 GB and over | **4096** | **~8** |
+
+Measured on this project's reference hardware, where the configured model is 12 GB and
+therefore gets 4096. That is barely more than the 4 turns the sliding window protects as a
+floor, so long conversations start losing turns quickly **even though the window is
+working correctly** -- the window is bounded by a ceiling it cannot see.
+
+This is separate from model choice. A faster model does not help if the context is capped,
+and a larger context does not help if the model cannot be loaded at all (see
+`scripts/model_survey.py`, which records that both models over 10 GB currently fail to
+start on this device).
+
+Unlike `get_ngl`, the `model_cap` table carries no measurement or comment explaining where
+4096 came from. It is a plausible-looking constant. `GHOSTLINK_CTX_SIZE` overrides it, but
+only when `ctx_size_auto` is false -- and a non-default value with `ctx_size_auto: true`
+looks configured while doing nothing, which is what the `[perf-tier] IGNORED` line at model
+load now reports.
+
+### Measured: the 4096 cap is stricter than the hardware requires
+
+`scripts/ctx_sweep.py` sweeps context size against the real model on the reference
+hardware (Qwen3.8-27B-UD-IQ3_S, 12.04 GB, `-ngl 0`, 16.4 GB Vulkan, threads=8):
+
+| ctx | outcome |
+|---|---|
+| 4096 | usable -- 124s load, 17.2 prefill, 1.95 decode |
+| 8192 | usable -- 122s load, 17.1 prefill, 1.95 decode (1.00x decode) |
+| 9216 | usable -- 122s load, 17.0 prefill, 1.97 decode |
+| 10240 | usable -- 120s load, 17.3 prefill, 1.97 decode |
+| 12288 | never serves |
+| 14336 | never serves |
+| 16332 | serves requests, then fails in `decode()` when the KV cache fills |
+
+Doubling 4096 to 8192 costs **nothing measurable** -- same load time, 1.00x decode, 0.99x
+prefill. On this hardware the cap discards context that fits.
+
+### But the boundary is not clean, and that is the more useful result
+
+Repeat sweeps disagreed at the same size:
+
+```text
+    ctx  8192    1 of 2 trials usable
+    ctx 10240    1 of 2 trials usable
+```
+
+Failures are `vk::Device::allocateMemory: ErrorOutOfDeviceMemory` on a 16.4 GB iGPU
+shared with the OS, the GUI and llama.cpp itself. The same context size gives different
+outcomes on different runs, so **a single sweep cannot establish a safe maximum.**
+
+That is why 4096 may still be the right conservative default even though 8192 fits. What
+the sweep establishes is narrower and more useful: 4096 is not a *hardware* limit, it is a
+policy constant that had never been checked against one.
+
 ## 1. Prompt processing / ingestion
 
 If you have free VRAM, increase batch sizes:
