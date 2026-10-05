@@ -10772,6 +10772,72 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             .session_id
             .clone()
             .unwrap_or_else(|| "sess_local_001".to_string());
+        // Load the model if no server can actually serve a request.
+        //
+        // Neither chat handler did this. `load_model_into_slot` was only ever called
+        // from `POST /api/models/load`, so a chat request arriving with no llama-server
+        // running spent ~20s in transport retries and then returned HTTP 200 containing
+        //
+        //     Native error: llama_server request failed: error sending request for url
+        //     (http://127.0.0.1:8080/completion)
+        //
+        // while `/health` reported `status: healthy` throughout. Measured directly.
+        //
+        // Skipped when the backend is not native: Ollama and vLLM manage their own model
+        // lifecycle and launching a llama-server for them would be wrong.
+        if matches!(inference_backend, InferenceEngine::Native)
+            && !native_engine_client.backend_can_generate().await
+        {
+            // `settings.model_path` is the resolved on-disk GGUF, written by the load
+            // route. Preferred over re-resolving the name: it is what was actually loaded
+            // last, so it cannot drift from `current_model` the way a re-resolution can.
+            let model_path = {
+                let backend = lock_state(&state);
+                let configured = backend.settings.model_path.trim().to_string();
+                if !configured.is_empty() && std::path::Path::new(&configured).exists() {
+                    Some(configured)
+                } else {
+                    // Fall back to a same-named file under models_dir before giving up.
+                    let dir = backend.settings.models_dir.clone();
+                    let name = backend.current_model.clone();
+                    let candidate = std::path::Path::new(&dir).join(&name);
+                    if candidate.exists() {
+                        Some(candidate.to_string_lossy().to_string())
+                    } else {
+                        None
+                    }
+                }
+            };
+            if let Some(path) = model_path {
+                // Detached: a cold load is minutes on a large model, and this request is
+                // already going to be slow. Spawned so it cannot hold the state lock.
+                let engine = native_engine_client.clone();
+                let path_for_load = path.clone();
+                let st = state.clone();
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking({
+                        let engine = engine.clone();
+                        let path = path_for_load.clone();
+                        move || engine.load_model_into_slot(&path, None, None, None)
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(())) => {
+                            tracing::info!("ensure_model_loaded: loaded {path_for_load}")
+                        }
+                        Ok(Err(e)) => tracing::warn!("ensure_model_loaded: {e}"),
+                        Err(e) => tracing::warn!("ensure_model_loaded: join error: {e}"),
+                    }
+                    let _ = &st;
+                });
+            } else {
+                tracing::warn!(
+                    "ensure_model_loaded: no local model file for {:?}",
+                    lock_state(&state).current_model
+                );
+            }
+        }
+
         // Ask the server itself how much context it has. A locally-recorded value is
         // only a prediction of that, and it is absent entirely when Ghostlink reused
         // a server it did not start -- which is the case that let an 18,851-token
@@ -12497,24 +12563,51 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
     async fn handle_health(
         State(state): State<Arc<Mutex<BackendState>>>,
     ) -> Json<serde_json::value::Value> {
-        let backend = lock_state(&state);
-        let uptime_s = backend.started_at.elapsed().as_secs();
+        // `status` was a hardcoded "healthy" literal that checked nothing. With no
+        // llama-server running at all it still reported healthy, which is how a chat
+        // request could burn ~20s in transport retries and return a degraded 200 while
+        // this endpoint said everything was fine. Measured directly.
+        //
+        // Everything is read inside a block so the `MutexGuard` is dropped before the
+        // await below: this codebase never holds a std Mutex guard across an .await,
+        // and doing so also makes the handler future non-`Send`, which axum rejects.
+        let (
+            engine_client,
+            backend_url,
+            current_model,
+            inference_backend,
+            native_engine,
+            uptime_s,
+            gpu_available,
+            gpu_name,
+            vram_gb,
+        ) = {
+            let backend = lock_state(&state);
+            let profile = detect_runtime_profile("health-check");
+            (
+                backend.native_engine_client.clone(),
+                backend.backend_url.clone(),
+                backend.current_model.clone(),
+                backend.inference_backend.as_str().to_string(),
+                backend.settings.native_engine.clone(),
+                backend.started_at.elapsed().as_secs(),
+                profile.acceleration_mode == ghostlink_core::host::AccelerationMode::Gpu,
+                profile.node_resources.gpu_name.clone(),
+                profile.node_resources.vram_gb,
+            )
+        };
 
-        // Detect GPU availability via runtime profile (uses fast cache)
-        let profile = detect_runtime_profile("health-check");
-        let gpu_available =
-            profile.acceleration_mode == ghostlink_core::host::AccelerationMode::Gpu;
-        let gpu_name = profile.node_resources.gpu_name.clone();
-        let vram_gb = profile.node_resources.vram_gb;
+        let backend_reachable = engine_client.backend_can_generate().await;
 
         Json(serde_json::json!({
-            "status": "healthy",
+            "status": if backend_reachable { "healthy" } else { "degraded" },
+            "backend_reachable": backend_reachable,
             "version": "0.1.0-alpha.0",
-            "backend_url": backend.backend_url,
+            "backend_url": backend_url,
             "uptime_s": uptime_s,
-            "current_model": backend.current_model,
-            "inference_backend": backend.inference_backend.as_str(),
-            "native_engine": backend.settings.native_engine,
+            "current_model": current_model,
+            "inference_backend": inference_backend,
+            "native_engine": native_engine,
             "gpu_available": gpu_available,
             "gpu_name": gpu_name,
             "vram_gb": vram_gb,
