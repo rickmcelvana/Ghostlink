@@ -8,6 +8,7 @@ import json
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -19,7 +20,8 @@ PORT = 18014
 BASE_URL = f"http://{HOST}:{PORT}"
 
 
-API_KEY_PATH = ROOT / "api_key.txt"
+# Same temp path the smoke test writes; never the repository's real api_key.txt.
+API_KEY_PATH = Path(tempfile.gettempdir()) / "ghostlink-ci-smoke-key.txt"
 
 
 def _wait_for_api_key(max_wait_s: int = 20) -> str:

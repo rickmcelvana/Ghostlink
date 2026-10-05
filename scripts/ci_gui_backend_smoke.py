@@ -9,6 +9,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -23,7 +24,16 @@ BINARY_PATH = Path(os.environ.get("CARGO_TARGET_DIR") or ROOT / "target") / "deb
 )
 
 
-API_KEY_PATH = ROOT / "api_key.txt"
+# The throwaway key file lives in TEMP, never in the repository.
+#
+# This used to be `ROOT / "api_key.txt"` with an unconditional overwrite, which destroyed
+# the developer's real bootstrap key on every run: `api_keys.json` keeps a SHA-256 of
+# the original, so after a smoke run the key on disk no longer authenticated and there
+# was no way back -- the plaintext is not recoverable from a one-way hash. The `finally`
+# block killed the server but never restored the file.
+#
+# A test must not be able to destroy the thing it is testing.
+API_KEY_PATH = Path(tempfile.gettempdir()) / "ghostlink-ci-smoke-key.txt"
 API_KEY_VALUE = "ghostlink-ci-smoke-key"
 
 
@@ -164,6 +174,11 @@ def main() -> int:
                 proc.wait(timeout=8)
             except subprocess.TimeoutExpired:
                 proc.kill()
+        # Remove the throwaway key so it cannot be mistaken for a real one later.
+        try:
+            API_KEY_PATH.unlink()
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":
