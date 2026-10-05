@@ -170,7 +170,29 @@ If you have free VRAM, increase batch sizes:
 -b 2048 -ub 512
 ```
 
-Typical effect on modern GPUs: prompt eval ~70 t/s → 300+ t/s.
+**Measured on this project's reference hardware, not quoted from upstream.** AMD
+Radeon 860M (Vulkan, 16.4GB), Llama-3.2-3B Q3_K_M, `-ngl 24 -fa on -ctk/-ctv q8_0`,
+3,372-token prompt where prefill dominates, 4 runs per config, medians:
+
+| config | prefill | decode |
+|---|---|---|
+| `-b 512 -ub 128` | 303.0 tok/s | 12.55 tok/s |
+| `-b 2048 -ub 512` | 327.2 tok/s | 12.77 tok/s |
+| `-b 2048 -ub 2048` | 321.0 tok/s | 12.71 tok/s |
+
+So **+8% prefill**, not the "~70 t/s → 300+ t/s" that upstream guidance and several
+secondary sources suggest. That figure is presumably about discrete-GPU CUDA with a
+much larger batch, and it does not reproduce here. `-ub 2048` is slightly *worse* than
+`-ub 512`, so there is no benefit to raising it further.
+
+Note the prompt size matters for how this looks. At 893 prompt tokens the same
+`-b 2048 -ub 512` change measured as a *regression* (0.62x prefill, 3.04x slower
+decode), because at that size wall time is dominated by decode and the larger batch
+just holds more VRAM. Report prefill and decode separately or this lever looks like
+noise in both directions.
+
+Reproduce with `python scripts/llama_knob_ab.py`, which A/Bs these and the KV-cache
+and Flash Attention settings on one node with one variable at a time.
 
 ## 2. Flash Attention
 

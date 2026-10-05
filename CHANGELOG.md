@@ -7,6 +7,27 @@ All notable changes to Ghostlink Studio are documented here.
 ## [Unreleased]
 
 ### Added
+- **Single-node knob A/B harness** (`scripts/llama_knob_ab.py`): A/Bs batch size, Flash Attention and KV-cache precision against the vendored `llama-server`, one variable at a time, on a single node. Prefill and decode are reported separately and a `-` is printed for anything llama.cpp did not report.
+
+  Item 4 of the inference audit is a list of knobs with upstream numbers attached. This makes each one checkable instead of assumed.
+
+  Waits for `/completion` to answer rather than for the port to bind. llama-server binds while the model is still loading and returns HTTP 503 until it is done, so a socket check reports "ready" immediately and the first measured request dies -- which is exactly what the first version of this script did.
+
+### Changed
+- **`docs/LOCAL_INFERENCE_TUNING.md` no longer claims `-b 2048 -ub 512` is the difference between ~70 and 300+ prompt tok/s.** Measured on this project's reference hardware (Radeon 860M / Vulkan / 16.4GB, Llama-3.2-3B Q3_K_M, 3,372-token prompt where prefill dominates, 4 runs, medians):
+
+  | config | prefill | decode |
+  |---|---|---|
+  | `-b 512 -ub 128` | 303.0 tok/s | 12.55 tok/s |
+  | `-b 2048 -ub 512` | 327.2 tok/s | 12.77 tok/s |
+  | `-b 2048 -ub 2048` | 321.0 tok/s | 12.71 tok/s |
+
+  **+8% prefill**, not 4x. That figure is presumably about discrete-GPU CUDA with a much larger batch; it does not reproduce here. `-ub 2048` is slightly worse than `-ub 512`, so raising it further buys nothing.
+
+  Prompt size changes the sign of the result. At 893 prompt tokens the same change measured as a *regression* (0.62x prefill, 3.04x slower decode) because wall time there is decode-dominated and the larger batch just holds more VRAM. Neither number is wrong; averaging them is.
+
+
+### Added
 - **Tensor-class planning for distributed offload** (`crates/ghost-link/src/tensor_plan.rs`): `-ts` says *how much* goes to each device; it does not say *which tensors*. llama-server therefore spreads whole layers -- attention, KV cache and `lm_head` included -- across the link, paying a network round trip per token for tensors that are tiny or reused constantly. The new planner routes FFN and MoE experts remotely and pins embeddings, attention, KV and `lm_head` locally, with a latency term that refuses a peer whose RPC RTT exceeds the local CPU-offload penalty.
 
   `GHOSTLINK_RPC_RTT_MS` and `GHOSTLINK_CPU_OFFLOAD_PENALTY_MS` configure the comparison.
