@@ -10785,9 +10785,23 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         //
         // Skipped when the backend is not native: Ollama and vLLM manage their own model
         // lifecycle and launching a llama-server for them would be wrong.
-        if matches!(inference_backend, InferenceEngine::Native)
-            && !native_engine_client.backend_can_generate().await
-        {
+        // A live server we own counts as "already handled", even while it is still
+        // loading. Probing `/completion` alone caused a reload loop on a model with a
+        // long load: llama-server answers 503 `Loading model` for ~30-40s, the probe
+        // read that as "no backend", and the load it then started killed the loading
+        // server and began another -- so each request reset the clock and the backend
+        // never finished coming up.
+        //
+        // `has_running_llama_server` asks the child process instead of the HTTP port, so
+        // it distinguishes "loading" from "dead". The HTTP probe is still done, because
+        // a server we did not start (someone else's, or a leftover) only speaks HTTP.
+        let native_backend_ready = if matches!(inference_backend, InferenceEngine::Native) {
+            native_engine_client.has_running_llama_server()
+                || native_engine_client.backend_can_generate().await
+        } else {
+            true
+        };
+        if matches!(inference_backend, InferenceEngine::Native) && !native_backend_ready {
             // `settings.model_path` is the resolved on-disk GGUF, written by the load
             // route. Preferred over re-resolving the name: it is what was actually loaded
             // last, so it cannot drift from `current_model` the way a re-resolution can.
@@ -10809,27 +10823,41 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                 }
             };
             if let Some(path) = model_path {
-                // Detached: a cold load is minutes on a large model, and this request is
-                // already going to be slow. Spawned so it cannot hold the state lock.
-                let engine = native_engine_client.clone();
-                let path_for_load = path.clone();
-                let st = state.clone();
-                tokio::spawn(async move {
-                    let result = tokio::task::spawn_blocking({
-                        let engine = engine.clone();
-                        let path = path_for_load.clone();
-                        move || engine.load_model_into_slot(&path, None, None, None)
-                    })
-                    .await;
-                    match result {
-                        Ok(Ok(())) => {
-                            tracing::info!("ensure_model_loaded: loaded {path_for_load}")
+                // Claim the single-flight slot. `swap` is the whole point: it is atomic,
+                // so of N simultaneous requests exactly one sees `false` and starts a
+                // load. The rest fall through and simply get a slow first response,
+                // which is what they would have got anyway while loading.
+                if AUTO_LOAD_IN_FLIGHT.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    tracing::debug!(
+                        target: "assistant_trace",
+                        "model load already in flight; not starting another"
+                    );
+                } else {
+                    // Detached: a cold load is minutes on a large model, and this request is
+                    // already going to be slow. Spawned so it cannot hold the state lock.
+                    let engine = native_engine_client.clone();
+                    let path_for_load = path.clone();
+                    let st = state.clone();
+                    tokio::spawn(async move {
+                        let result = tokio::task::spawn_blocking({
+                            let engine = engine.clone();
+                            let path = path_for_load.clone();
+                            move || engine.load_model_into_slot(&path, None, None, None)
+                        })
+                        .await;
+                        // Release on every outcome, including failure, so a failed load can
+                        // be retried by a later request instead of wedging auto-load off.
+                        AUTO_LOAD_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+                        match result {
+                            Ok(Ok(())) => {
+                                tracing::info!("ensure_model_loaded: loaded {path_for_load}")
+                            }
+                            Ok(Err(e)) => tracing::warn!("ensure_model_loaded: {e}"),
+                            Err(e) => tracing::warn!("ensure_model_loaded: join error: {e}"),
                         }
-                        Ok(Err(e)) => tracing::warn!("ensure_model_loaded: {e}"),
-                        Err(e) => tracing::warn!("ensure_model_loaded: join error: {e}"),
-                    }
-                    let _ = &st;
-                });
+                        let _ = &st;
+                    });
+                }
             } else {
                 tracing::warn!(
                     "ensure_model_loaded: no local model file for {:?}",
@@ -10921,14 +10949,21 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         // `firstUser.content.slice(0, 32)`, which cut mid-word and named every
         // thread after its opening tokens.
         let first_turn_of_session = req.messages.as_deref().unwrap_or(&[]).is_empty();
+        // The title request is deliberately NOT spawned here. It used to be, which meant
+        // the title generation competed for the single llama-server slot (`-np 1`) with
+        // the answer the user is actually waiting for. Measured on the 9B: the title
+        // request takes 4.3s for its 32 tokens, and the answer could not start until it
+        // finished -- about 8s added to the first turn of every session, on top of the
+        // answer's own prefill.
+        //
+        // The handle is kept so the title can still be started once the answer is done,
+        // further down, where the answer's generation completes.
         let title_task = if first_turn_of_session && !req.message.trim().is_empty() {
-            let title_state = Arc::clone(&state);
-            let title_session = chat_session_id.clone();
-            let first_exchange: Vec<(String, String)> =
-                vec![("user".to_string(), req.message.clone())];
-            Some(tokio::spawn(async move {
-                generate_session_title(title_state, title_session, first_exchange).await
-            }))
+            Some((
+                Arc::clone(&state),
+                chat_session_id.clone(),
+                vec![("user".to_string(), req.message.clone())],
+            ))
         } else {
             None
         };
@@ -11789,14 +11824,23 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         // Collect the title if this turn spawned one. Bounded: the generation is
         // capped at 32 tokens, and a hung title task must not delay the response,
         // so a short wait and then give up on it.
-        let generated_title = match title_task {
-            Some(handle) => tokio::time::timeout(Duration::from_secs(5), handle)
-                .await
-                .ok()
-                .and_then(|r| r.ok())
-                .flatten(),
-            None => None,
-        };
+        // The title request is started here, AFTER the answer has been generated, and is
+        // deliberately not awaited. Previously it was spawned before generation, which
+        // made it compete for the single llama-server slot (`-np 1`) with the reply the
+        // user was waiting for: measured 4.3s of title decoding queued ahead of the
+        // answer on every session's first turn.
+        //
+        // Not awaiting it is a behaviour change worth naming: the first response of a
+        // session no longer carries `session_title`. The title is still generated and
+        // persisted, and the GUI already reads it from `GET /api/sessions` or a later
+        // turn's response. Awaiting it here would restore the field but reintroduce the
+        // same 4.3s, just after the answer instead of before it.
+        if let Some((title_state, title_session, first_exchange)) = title_task {
+            tokio::spawn(async move {
+                generate_session_title(title_state, title_session, first_exchange).await;
+            });
+        }
+        let generated_title: Option<String> = None;
 
         // Ground the reply against what actually ran.
         //
@@ -15396,6 +15440,19 @@ fn active_approvals() -> Arc<approvals::ApprovalStore> {
 
 static ACTIVE_BACKEND_REGISTRY: OnceLock<Arc<backend_registry::BackendRegistry>> = OnceLock::new();
 static ACTIVE_RUNTIME_SWITCHER: OnceLock<runtime_switcher::RuntimeSwitcher> = OnceLock::new();
+/// Single-flight guard for the chat path's implicit model load.
+///
+/// Without it, every request arriving while a load is in flight starts its *own*
+/// load. Measured live: eight concurrent-ish chat requests against a cold backend left
+/// eight `llama-server` processes alive, ~4.6 GB working set each, which exhausted a
+/// 31 GB machine and took it down. `backend_can_generate` correctly reports false while
+/// llama-server is still loading (it answers 503 `Loading model`), so the guard below
+/// has to be about *our own* in-flight load, not about the backend's state.
+///
+/// Held only around the check-and-set, never across the load itself: the spawned task
+/// clears it when it finishes, so a later request can retry a load that failed.
+static AUTO_LOAD_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 pub(crate) fn active_backend_registry() -> Arc<backend_registry::BackendRegistry> {
     ACTIVE_BACKEND_REGISTRY
@@ -15433,8 +15490,42 @@ mod tests {
             .into_iter()
     }
 
+    /// Regression: the chat path's implicit model load must not restart a llama-server
+    /// that is still loading.
+    ///
+    /// It used to decide "is there a backend?" from `POST /completion` alone. llama-server
+    /// answers 503 `Loading model` while it loads, which on the 9B (a ~35s load) meant
+    /// every chat request during that window started *another* load, which killed the
+    /// loading server and began a new one -- a loop that never converged. Observed as 5
+    /// loads across 10 requests, with the first succeeding and the rest returning
+    /// `real_inference: false`. Eight concurrent requests also left eight `llama-server`
+    /// processes (~4.6 GB each) and exhausted a 31 GB machine.
+    ///
+    /// The fix treats an owned live process as "a load is already under way", which is
+    /// what `has_running_llama_server` answers and `backend_can_generate` cannot.
+    #[test]
+    fn auto_load_is_single_flight() {
+        use std::sync::atomic::Ordering;
+        // Claim it as another request already in progress would.
+        AUTO_LOAD_IN_FLIGHT.store(true, Ordering::SeqCst);
+        let already_held = AUTO_LOAD_IN_FLIGHT.swap(true, Ordering::SeqCst);
+        assert!(
+            already_held,
+            "swap must observe an existing claim, so the second caller skips the load"
+        );
+        AUTO_LOAD_IN_FLIGHT.store(false, Ordering::SeqCst);
+        // Released: the next caller may load, including after a failure.
+        let fresh = AUTO_LOAD_IN_FLIGHT.swap(true, Ordering::SeqCst);
+        assert!(
+            !fresh,
+            "the flag must be clearable so a failed load can be retried"
+        );
+        AUTO_LOAD_IN_FLIGHT.store(false, Ordering::SeqCst);
+    }
+
     fn env_lock() -> &'static Mutex<()> {
         static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
         ENV_LOCK.get_or_init(|| Mutex::new(()))
     }
 

@@ -153,7 +153,25 @@ def trial(label: str, model_path: str, ctx: int, runs: int = 2) -> dict:
             proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
             proc.kill()
+            proc.wait(timeout=30)
         log.close()
+        # Confirm the port is actually free. Four orphaned llama-servers from repeated
+        # sweeps once held ~8 GB of working set and took the machine down; nothing in the
+        # terminate path reported that, because the process we spawned had already gone.
+        for _ in range(20):
+            probe = socket.socket()
+            if probe.connect_ex(("127.0.0.1", port)) != 0:
+                probe.close()
+                break
+            probe.close()
+            time.sleep(0.5)
+        else:
+            print(
+                f"  WARNING: port {port} still answering after terminating "
+                f"{tag}; a llama-server may have leaked. Check for orphans before "
+                "running more trials -- leaked model processes exhaust RAM.",
+                file=sys.stderr,
+            )
 
 
 def main() -> int:
@@ -177,9 +195,18 @@ def main() -> int:
         return 2
 
     gb = os.path.getsize(path) / 1e9
+    # Mirror get_ctx_size's own policy instead of hardcoding a number: the >=10 GB cap is
+    # 4096, the 5-10 GB cap is 8192, and under 5 GB there is no cap at all. An earlier
+    # version printed "would cap at 4096" for every model, which is wrong for exactly the
+    # model this branch cares about.
+    cap = 4096 if gb >= 10.0 else (8192 if gb >= 5.0 else None)
     print(f"model: {name}  ({gb:.2f} GB)")
     print(f"context sizes under test: {ctxs}")
-    print("get_ctx_size would cap this model at 4096.\n")
+    print(
+        f"get_ctx_size model_cap: {'none (uncapped)' if cap is None else cap}"
+        f"   [vram tier not applied here; this sweeps the hardware limit]"
+    )
+    print()
     print(f"{'ctx':>7} {'loaded':>7} {'load s':>7} {'prefill':>9} {'decode':>8}  note")
     print("-" * 74)
     rows = []
@@ -213,10 +240,13 @@ def main() -> int:
         print()
         top = max(r["ctx"] for r in ok)
         print(f"  highest context that served this run: {top}")
-        print(f"  get_ctx_size allows:                  4096")
+        cap_txt = "none (uncapped)" if cap is None else str(cap)
+        print(f"  get_ctx_size model_cap:               {cap_txt}")
         if FLAKY_NOTE:
             print("  => NOT a safe maximum: repeats disagreed. Treat this run as one sample.")
-        elif top > 4096:
+        elif cap is None:
+            print("  => this model is not capped by size, so nothing is being withheld")
+        elif top > cap:
             print("  => the cap is costing context on this hardware, at no measured cost")
         else:
             print("  => the cap is protective on this hardware")
