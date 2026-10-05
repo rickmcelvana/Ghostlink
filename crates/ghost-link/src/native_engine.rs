@@ -39,6 +39,17 @@ pub struct NativeGeneration {
     pub tokens_per_sec: Option<f32>,
     /// End-to-end generation latency in ms when known.
     pub latency_ms: Option<f32>,
+    /// Prompt tokens evaluated (prefill work).
+    ///
+    /// Kept separate from `tokens_generated` because the two costs are unrelated:
+    /// prefill is compute-bound and batches well, decode is bandwidth-bound and does
+    /// not. One number for both is how a 300 tok/s prefill and a 2 tok/s decode end
+    /// up looking like a single fast model.
+    pub prompt_tokens: Option<u32>,
+    /// Prompt evaluation wall time in ms, from llama.cpp's own timings.
+    pub prompt_ms: Option<f32>,
+    /// Prefill throughput tok/s, derived from the two above.
+    pub prompt_tokens_per_sec: Option<f32>,
 }
 
 impl NativeGeneration {
@@ -49,6 +60,9 @@ impl NativeGeneration {
             tokens_generated: None,
             tokens_per_sec: None,
             latency_ms: None,
+            prompt_tokens: None,
+            prompt_ms: None,
+            prompt_tokens_per_sec: None,
         }
     }
 }
@@ -1439,6 +1453,13 @@ impl NativeEngineClient {
                     tokens_generated: Some(tokens_generated),
                     tokens_per_sec: Some(tokens_generated as f32 / (latency_ms / 1000.0)),
                     latency_ms: Some(latency_ms),
+                    // No llama.cpp timings on this path: it is the computed-token
+                    // fallback, not a measured generation. Leaving the prompt fields
+                    // absent keeps it out of a benchmark as *unmeasured* rather than
+                    // reporting a throughput it never observed.
+                    prompt_tokens: None,
+                    prompt_ms: None,
+                    prompt_tokens_per_sec: None,
                 })
             }
             _ => self.generate_simulated(model, cleaned_prompt, max_tokens),
@@ -1977,13 +1998,70 @@ fn generation_from_llama_json(parsed: &serde_json::Value) -> Option<NativeGenera
 
     let text = text?;
     let (tokens_generated, tokens_per_sec, latency_ms) = parse_llama_timings(parsed, &text);
+    let prompt = parse_prompt_timings(parsed);
     Some(NativeGeneration {
         text,
         real_inference: true,
         tokens_generated,
         tokens_per_sec,
         latency_ms,
+        prompt_tokens: prompt.prompt_tokens,
+        prompt_ms: prompt.prompt_ms,
+        prompt_tokens_per_sec: prompt.prompt_tokens_per_sec,
     })
+}
+
+/// A measured prefill/decode split.
+///
+/// The two are kept apart deliberately. Prefill batches and is compute-bound;
+/// decode is memory-bandwidth-bound and does not batch. A single tok/s figure over
+/// a whole request averages two unrelated costs and moves for reasons that have
+/// nothing to do with each other.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PromptTimings {
+    pub prompt_tokens: Option<u32>,
+    pub prompt_ms: Option<f32>,
+    pub prompt_tokens_per_sec: Option<f32>,
+}
+
+/// Reads llama.cpp's prompt-side timings from the response `timings` object.
+///
+/// These were never read before. The server returns `prompt_n` and `prompt_ms`
+/// alongside `predicted_n`/`predicted_ms` in the same object, and only the
+/// predicted half was parsed -- so prefill throughput, the number that decides
+/// whether a long history is affordable, was unmeasurable. Any local-vs-RPC
+/// comparison had to fall back on end-to-end latency, which conflates the two.
+///
+/// No fallback is invented for an absent field. A missing timing means this build
+/// did not report it; deriving one from a whitespace count would put a fabricated
+/// number into a benchmark, which is worse than an honest gap.
+fn parse_prompt_timings(parsed: &serde_json::Value) -> PromptTimings {
+    let timings = parsed.get("timings");
+    let prompt_n = timings
+        .and_then(|t| t.get("prompt_n"))
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32);
+    let prompt_ms = timings
+        .and_then(|t| t.get("prompt_ms"))
+        .and_then(|v| v.as_f64())
+        .map(|ms| ms as f32);
+    // Prefer llama.cpp's own rate; derive only when both inputs are real. A zero or
+    // absent denominator yields None, never 0.0 -- "not measured" and "measured as
+    // zero" must not look alike in a report.
+    let prompt_tokens_per_sec = timings
+        .and_then(|t| t.get("prompt_per_second"))
+        .and_then(|v| v.as_f64())
+        .filter(|v| *v > 0.0)
+        .map(|v| v as f32)
+        .or_else(|| match (prompt_n, prompt_ms) {
+            (Some(n), Some(ms)) if n > 0 && ms > 0.0 => Some(n as f32 / (ms / 1000.0)),
+            _ => None,
+        });
+    PromptTimings {
+        prompt_tokens: prompt_n,
+        prompt_ms,
+        prompt_tokens_per_sec,
+    }
 }
 
 fn parse_llama_timings(
@@ -2093,7 +2171,7 @@ fn extract_generation_text(stdout: &str, stderr: &str, prompt: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{NativeChatEvent, NativeEngineClient};
+    use super::{parse_prompt_timings, NativeChatEvent, NativeEngineClient, PromptTimings};
     use std::sync::{Mutex, OnceLock};
 
     fn env_lock() -> &'static Mutex<()> {
@@ -3049,5 +3127,75 @@ mod tests {
         assert!(NativeEngineClient::should_warn_about_memory(11.0, 16.2));
         // Exactly at the line is not a warning (the test is strictly-less-than).
         assert!(!NativeEngineClient::should_warn_about_memory(16.2, 16.2));
+    }
+
+    #[test]
+    fn prompt_timings_are_read_from_the_timings_object() {
+        // Exactly what llama-server returns. Before this, only the `predicted_*`
+        // half was parsed and prefill throughput was unmeasurable.
+        let body = serde_json::json!({
+            "timings": {
+                "prompt_n": 1204,
+                "prompt_ms": 812.5,
+                "prompt_per_second": 1481.9,
+                "predicted_n": 96,
+                "predicted_ms": 24576.0,
+                "predicted_per_second": 3.91
+            }
+        });
+        let t = parse_prompt_timings(&body);
+        assert_eq!(t.prompt_tokens, Some(1204));
+        assert_eq!(t.prompt_ms, Some(812.5));
+        assert!((t.prompt_tokens_per_sec.unwrap() - 1481.9).abs() < 0.01);
+    }
+
+    #[test]
+    fn prompt_rate_is_derived_when_only_counts_and_time_are_present() {
+        let body = serde_json::json!({ "timings": { "prompt_n": 100, "prompt_ms": 200.0 } });
+        let t = parse_prompt_timings(&body);
+        assert_eq!(t.prompt_tokens_per_sec, Some(500.0));
+    }
+
+    #[test]
+    fn absent_prompt_timings_stay_absent_rather_than_becoming_zero() {
+        // "Not measured" and "measured as zero" must not look alike in a report.
+        let body = serde_json::json!({ "timings": { "predicted_n": 10 } });
+        let t = parse_prompt_timings(&body);
+        assert_eq!(t.prompt_tokens, None);
+        assert_eq!(t.prompt_ms, None);
+        assert_eq!(
+            t.prompt_tokens_per_sec, None,
+            "a missing prefill rate must be None, not Some(0.0)"
+        );
+    }
+
+    #[test]
+    fn a_zero_denominator_yields_none_not_infinity_or_zero() {
+        let body = serde_json::json!({ "timings": { "prompt_n": 50, "prompt_ms": 0.0 } });
+        let t = parse_prompt_timings(&body);
+        assert_eq!(t.prompt_tokens, Some(50));
+        assert_eq!(t.prompt_tokens_per_sec, None);
+    }
+
+    #[test]
+    fn a_zero_reported_rate_falls_back_to_the_derived_one() {
+        let body = serde_json::json!({
+            "timings": { "prompt_n": 40, "prompt_ms": 100.0, "prompt_per_second": 0.0 }
+        });
+        let t = parse_prompt_timings(&body);
+        assert_eq!(t.prompt_tokens_per_sec, Some(400.0));
+    }
+
+    #[test]
+    fn no_timings_object_at_all_is_handled() {
+        let t = parse_prompt_timings(&serde_json::json!({ "content": "hi" }));
+        assert_eq!(
+            t,
+            PromptTimings {
+                prompt_tokens: None,
+                prompt_ms: None,
+                prompt_tokens_per_sec: None
+            }
+        );
     }
 }

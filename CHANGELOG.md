@@ -7,6 +7,32 @@ All notable changes to Ghostlink Studio are documented here.
 ## [Unreleased]
 
 ### Added
+- **Inference measurement harness** (`scripts/inference_bench.py`, `crates/ghost-link/src/native_engine.rs`):
+  reports **prefill and decode separately**, because a single tok/s figure over a chat request averages two unrelated costs. Prefill is compute-bound and batches; decode is bandwidth-bound and does not. Averaged together they move for reasons that have nothing to do with each other, which makes them useless for deciding whether a change helped.
+
+  The server was already returning llama.cpp's `prompt_n`, `prompt_ms` and `prompt_per_second` in the same `timings` object as the decode fields — and never read them. Only `predicted_*` was parsed, so prefill throughput, the number that decides whether a long history is affordable, was unmeasurable and every local-vs-RPC comparison had to fall back on end-to-end latency.
+
+  `NativeGeneration` and the chat response now carry `prompt_tokens`, `prompt_ms`, `prompt_tokens_per_sec` and `decode_tokens_per_sec`; the tool-loop path carries the same fields so both paths report the same split. `null` means llama.cpp did not report it — deliberately not `0`, which would read as "measured, and zero".
+
+  The harness refuses to guess. A missing measurement prints as `-`; `--compare` reports `INCONCLUSIVE` rather than picking a winner; a degraded backend returning error text instead of a generation is recorded as a failure rather than counted from its word count. It also flags the case it exists to catch: when a distributed configuration decodes measurably slower than a local one on a model that fits in a single device.
+
+  Measured on this machine (Llama-3.2-3B, ~5,300-token prompt, 3 runs):
+
+  ```text
+  prompt 245 tok/s   decode 13.3 tok/s   ttft 28,790 ms
+  ```
+
+  A 16x gap between the two halves, invisible before. The TTFT is consistent with the prefill figure (5324 / 245 ≈ 21.7s plus queueing), which is the cross-check that makes both believable.
+
+  6 new tests cover the timings parser, including that an absent field stays absent rather than becoming `Some(0.0)` — "not measured" and "measured as zero" must not look alike in a report.
+
+### Fixed
+- **TTFT is no longer recorded only on the streaming path.** Both `record_ttft` call sites were inside the SSE finalizers, so a buffered request — what an automated benchmark wants, since it can read the `timings` object — recorded no TTFT at all. The buffered path now cannot produce one (it never observes its own first token), so instead of a proxy the harness measures TTFT on the streaming path and the response exposes the rolling `ttft_p50_ms`/`ttft_p95_ms` as context.
+
+  Found by running the harness, not by reading the code: the first run reported `-` for TTFT on a path that had always claimed to measure it.
+
+
+### Added
 
 - **The chat shows why it answered the way it did** (`ghostlink_gui_modern/src/components/ChatTab.tsx`, `store.ts`):
   the server was already reporting four explanatory fields and the GUI read **none** of them — `recalled_memories`, `recalled_documents`, `action_claim_corrected` and `tools_run` were all sent on every response and all discarded. Every fact needed to answer "why did it say that" was on the wire and thrown away.

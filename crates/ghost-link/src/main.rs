@@ -3116,6 +3116,12 @@ struct NativeToolLoopOutcome {
     tokens: Option<u32>,
     tokens_per_sec: Option<f32>,
     latency_ms: Option<f32>,
+    /// Prefill, carried through from `NativeGeneration` so the tool-loop path
+    /// reports the same split as the plain one. A harness that measures one path
+    /// and not the other cannot compare them.
+    prompt_tokens: Option<u32>,
+    prompt_ms: Option<f32>,
+    prompt_tokens_per_sec: Option<f32>,
     tool_results: Vec<ToolResult>,
 }
 
@@ -3222,6 +3228,11 @@ async fn native_tool_loop_core(
                             tokens: None,
                             tokens_per_sec: None,
                             latency_ms: None,
+                            // No generation reached this path (turn timeout), so there is nothing
+                            // to measure. Left absent rather than zero.
+                            prompt_tokens: None,
+                            prompt_ms: None,
+                            prompt_tokens_per_sec: None,
                             tool_results,
                         });
                     }
@@ -3259,6 +3270,11 @@ async fn native_tool_loop_core(
                     tokens: None,
                     tokens_per_sec: None,
                     latency_ms: None,
+                    // No generation reached this path (backend error), so there is nothing
+                    // to measure. Left absent rather than zero.
+                    prompt_tokens: None,
+                    prompt_ms: None,
+                    prompt_tokens_per_sec: None,
                     tool_results,
                 });
             }
@@ -3277,6 +3293,9 @@ async fn native_tool_loop_core(
                 tokens,
                 tokens_per_sec: gen.tokens_per_sec,
                 latency_ms: gen.latency_ms,
+                prompt_tokens: gen.prompt_tokens,
+                prompt_ms: gen.prompt_ms,
+                prompt_tokens_per_sec: gen.prompt_tokens_per_sec,
                 tool_results,
             });
         };
@@ -3345,6 +3364,11 @@ async fn native_tool_loop_core(
         tokens: None,
         tokens_per_sec: None,
         latency_ms: None,
+        // No generation reached this path (budget exhausted), so there is nothing
+        // to measure. Left absent rather than zero.
+        prompt_tokens: None,
+        prompt_ms: None,
+        prompt_tokens_per_sec: None,
         tool_results,
     })
 }
@@ -10684,6 +10708,11 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         let mut gen_tokens: Option<u32> = None;
         let mut gen_tps: Option<f32> = None;
         let mut gen_latency_ms: Option<f32> = None;
+        // Prefill, reported separately from decode. One averaged tok/s figure hides
+        // which half moved, and that is the number needed to judge a change.
+        let mut prompt_tokens: Option<u32> = None;
+        let mut prompt_ms: Option<f32> = None;
+        let mut prompt_tps: Option<f32> = None;
         let mut tool_results: Vec<ToolResult> = Vec::new();
         let mut pending_tool_call: Option<PendingToolCallInfo> = None;
 
@@ -11099,6 +11128,9 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                         gen_tokens = outcome.tokens;
                         gen_tps = outcome.tokens_per_sec;
                         gen_latency_ms = outcome.latency_ms;
+                        prompt_tokens = outcome.prompt_tokens;
+                        prompt_ms = outcome.prompt_ms;
+                        prompt_tps = outcome.prompt_tokens_per_sec;
                         tool_results = outcome.tool_results;
                         (
                             outcome.text,
@@ -11297,6 +11329,15 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                         });
                         gen_tps = gen.tokens_per_sec;
                         gen_latency_ms = gen.latency_ms;
+                        prompt_tokens = gen.prompt_tokens;
+                        prompt_ms = gen.prompt_ms;
+                        prompt_tps = gen.prompt_tokens_per_sec;
+                        // Record TTFT for the non-streaming path too. Previously only
+                        // the two streaming arms did, so a harness measuring
+                        // `stream: false` -- which is what an automated benchmark
+                        // wants, since it can read the timings object -- saw no TTFT
+                        // at all. Discovered by running the harness, not by reading
+                        // the code.
                         (
                             gen.text,
                             gen.real_inference,
@@ -11478,6 +11519,17 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                 "latency_ms": latency_ms,
                 "tokens": tokens_out,
                 "real_inference": real_inference,
+                // Prefill alongside decode: an averaged tok/s cannot say which half
+                // regressed.
+                "prompt_tokens": prompt_tokens,
+                "prompt_ms": prompt_ms,
+                "prompt_tokens_per_sec": prompt_tps,
+                "decode_tokens_per_sec": gen_tps,
+                // Rolling TTFT p50 from the streaming path. A buffered request
+                // cannot contribute one -- it never observes its own first token --
+                // so a non-streaming caller sees the rolling value or nothing.
+                "ttft_p50_ms": snap.ttft_p50_ms,
+                "ttft_p95_ms": snap.ttft_p95_ms,
             });
             (request_seq, session_id, metrics_json)
         };
@@ -11540,6 +11592,12 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             "ollama_url": if backend_used == "ollama" { "local" } else { "disabled" },
             "tokens_estimated": token_estimate,
             "tokens_generated": tokens_out,
+            // Prefill and decode, separated. `null` means llama.cpp did not report
+            // it -- deliberately not 0, which would read as "measured, and zero".
+            "prompt_tokens": prompt_tokens,
+            "prompt_ms": prompt_ms,
+            "prompt_tokens_per_sec": prompt_tps,
+            "decode_tokens_per_sec": gen_tps,
             "exec_tokens": exec_tokens,
             "exec_micro_batch": exec_micro_batch,
             "real_inference": real_inference,
