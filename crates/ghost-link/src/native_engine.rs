@@ -91,6 +91,31 @@ static LLAMA_BUILD_ID: OnceLock<Option<String>> = OnceLock::new();
 /// Context size the running llama-server was launched with.
 static RUNNING_CTX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// P-core-only thread count for `-t`, or `None` when the CPU is not hybrid.
+///
+/// Returns `None` rather than a guess when detection is unavailable or reports no
+/// split, so the caller falls back to `available_parallelism` unchanged. Silently
+/// halving threads on a uniform-core CPU would be a large, invisible regression.
+fn hybrid_performance_threads(logical: usize) -> Option<usize> {
+    let profile = ghostlink_core::system_profile::SystemProfile::detect_fast();
+    let performance = profile.cpu.performance_cores?;
+    if performance == 0 {
+        return None;
+    }
+    // `performance` is a physical P-core count while `logical` is every logical
+    // processor. Scaling keeps SMT threads on the performance cores; limiting to
+    // physical P-cores alone would leave half the FP throughput unused.
+    let physical = profile.cpu.physical_cores.max(performance);
+    let scaled = if physical > 0 {
+        (performance as f64 * logical as f64 / physical as f64).round() as usize
+    } else {
+        performance
+    };
+    // Never exceed the logical count, and never fall below half of it: if the reported
+    // numbers are inconsistent, a smaller pool is still better than an unusable one.
+    Some(scaled.clamp(logical / 2, logical))
+}
+
 impl NativeEngineClient {
     pub fn new() -> Self {
         Self {
@@ -619,6 +644,68 @@ impl NativeEngineClient {
     }
 
     /// VRAM-aware batch defaults for prompt eval + Flash Attention + compact KV.
+    /// Speculative-decoding flags, empty when it is not configured.
+    ///
+    /// `GHOSTLINK_DRAFT_MODEL` is documented in `docs/LOCAL_INFERENCE_TUNING.md` with a
+    /// specific promise -- "Ghostlink passes `--model-draft <path>`, `--draft-max`, and
+    /// `--draft-p-min` to `llama-server`" -- and no code anywhere in this repository read
+    /// that variable. Setting it did nothing at all.
+    ///
+    /// The documented flag names are also stale for this build. Verified against the
+    /// vendored `llama-server --help`:
+    ///
+    /// ```text
+    /// --draft, --draft-n, --draft-max N   the argument has been removed.
+    ///                                   use --spec-draft-n-max or ...
+    /// ```
+    ///
+    /// So `--draft-max` as documented would be rejected by the binary outright. These are
+    /// the names this build parses.
+    ///
+    /// Off by default: a draft model close in size to the target costs more than it
+    /// saves, and there is no reliable way to pick the pairing at runtime.
+    fn draft_model_args() -> Vec<String> {
+        let mut args = Vec::new();
+        let Ok(path) = std::env::var("GHOSTLINK_DRAFT_MODEL") else {
+            return args;
+        };
+        let path = path.trim().to_string();
+        if path.is_empty() {
+            return args;
+        }
+        if !Path::new(&path).exists() {
+            // Logged rather than fatal: the primary model is fine and this was only an
+            // optimization. Failing the load over a draft path would be strictly worse.
+            eprintln!(
+                "[spec-decode] GHOSTLINK_DRAFT_MODEL={path:?} does not exist; speculative \
+                 decoding disabled for this load"
+            );
+            return args;
+        }
+        args.push("--spec-draft-model".to_string());
+        args.push(path.clone());
+        // Tokens the draft model proposes per step. Caller-set, because the right value
+        // depends on the model pair and there is no defensible default.
+        if let Some(n) = std::env::var("GHOSTLINK_DRAFT_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+        {
+            args.push("--spec-draft-n-max".to_string());
+            args.push(n.to_string());
+        }
+        if let Some(p) = std::env::var("GHOSTLINK_DRAFT_P_MIN")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+        {
+            args.push("--spec-draft-p-min".to_string());
+            args.push(format!("{p}"));
+        }
+        eprintln!("[spec-decode] draft model {path} enabled");
+        args
+    }
+
     fn default_perf_args() -> Vec<String> {
         let (batch, ubatch) = Self::get_batch_ubatch();
         let flash_attention = Self::get_flash_attention();
@@ -652,6 +739,7 @@ impl NativeEngineClient {
                 "n/a (Flash Attention off)"
             }
         );
+        args.extend(Self::draft_model_args());
         args
     }
 
@@ -832,10 +920,31 @@ impl NativeEngineClient {
                 return n.max(1);
             }
         }
-        std::thread::available_parallelism()
+        let logical = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
-            .max(1)
+            .max(1);
+        // On a hybrid CPU, half the logical processors are efficiency cores. llama.cpp
+        // schedules matmuls across whatever threads it is given, so handing it all 16
+        // means E-cores participate in the decode loop and the "hybrid CPUs should use
+        // P-cores only" advice in the tuning doc is not being followed -- the detector
+        // existed, `performance_cores` was measured on every probe, and `get_threads`
+        // never read it.
+        //
+        // Detection is Windows-only and returns None when there is no real P/E split,
+        // so this is a no-op on uniform-core CPUs (including this host's Ryzen AI 7 350,
+        // which is Zen 5 and has none). Verified, not assumed: `detect_hybrid_core_counts`
+        // returns None unless every core reports the same EfficiencyClass as the rest.
+        //
+        // `performance_cores` is the physical P-core count. Scaling it by the logical:core
+        // ratio preserves SMT threads on the performance cores, which is what the flag
+        // means in practice -- limiting to physical P-cores alone would leave half the
+        // FP throughput unused.
+        let threads = match hybrid_performance_threads(logical) {
+            Some(p) => p,
+            None => logical,
+        };
+        threads.max(1)
     }
 
     /// Number of parallel inference slots to give llama-server (`-np`).
@@ -3347,5 +3456,136 @@ mod tests {
                 prompt_tokens_per_sec: None
             }
         );
+    }
+
+    #[test]
+    fn draft_decoding_is_off_when_no_model_is_configured() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        std::env::remove_var("GHOSTLINK_DRAFT_MODEL");
+        assert!(
+            NativeEngineClient::draft_model_args().is_empty(),
+            "speculative decoding must be opt-in"
+        );
+    }
+
+    #[test]
+    fn a_missing_draft_path_disables_decoding_instead_of_failing_the_load() {
+        // The primary model is fine; a bad draft path is an optimization that did not
+        // happen, not a reason to refuse to serve.
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        std::env::set_var(
+            "GHOSTLINK_DRAFT_MODEL",
+            r"C:\definitely\not\here\draft.gguf",
+        );
+        assert!(NativeEngineClient::draft_model_args().is_empty());
+        std::env::remove_var("GHOSTLINK_DRAFT_MODEL");
+    }
+
+    #[test]
+    fn draft_knobs_use_flag_names_this_build_actually_parses() {
+        // `--draft-max` was REMOVED upstream; this build wants `--spec-draft-n-max`.
+        // Emitting the documented name would make llama-server exit on an unknown
+        // argument, which is a worse outcome than not enabling the feature at all.
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let me = std::env::current_exe().expect("test exe path");
+        std::env::set_var("GHOSTLINK_DRAFT_MODEL", &me);
+        std::env::set_var("GHOSTLINK_DRAFT_MAX", "8");
+        std::env::set_var("GHOSTLINK_DRAFT_P_MIN", "0.2");
+        let args = NativeEngineClient::draft_model_args();
+        assert_eq!(args[0], "--spec-draft-model");
+        assert_eq!(args[1], me);
+        assert!(
+            args.contains(&"--spec-draft-n-max".to_string()),
+            "args: {args:?}"
+        );
+        assert!(
+            !args.contains(&"--draft-max".to_string()),
+            "removed flag emitted: {args:?}"
+        );
+        assert!(
+            args.contains(&"--spec-draft-p-min".to_string()),
+            "args: {args:?}"
+        );
+        std::env::remove_var("GHOSTLINK_DRAFT_MODEL");
+        std::env::remove_var("GHOSTLINK_DRAFT_MAX");
+        std::env::remove_var("GHOSTLINK_DRAFT_P_MIN");
+    }
+
+    #[test]
+    fn a_zero_or_unparseable_draft_max_is_omitted_not_passed() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        let me = std::env::current_exe().expect("test exe path");
+        std::env::set_var("GHOSTLINK_DRAFT_MODEL", &me);
+        std::env::set_var("GHOSTLINK_DRAFT_MAX", "0");
+        std::env::set_var("GHOSTLINK_DRAFT_P_MIN", "not-a-number");
+        let args = NativeEngineClient::draft_model_args();
+        assert_eq!(
+            args.len(),
+            2,
+            "only the model flag should survive: {args:?}"
+        );
+        std::env::remove_var("GHOSTLINK_DRAFT_MODEL");
+        std::env::remove_var("GHOSTLINK_DRAFT_MAX");
+        std::env::remove_var("GHOSTLINK_DRAFT_P_MIN");
+    }
+
+    #[test]
+    fn hybrid_thread_detection_is_bounded_and_scaled_correctly() {
+        // This host is genuinely hybrid, which the tuning doc did not say. Read
+        // directly from GetLogicalProcessorInformationEx(RelationProcessorCore):
+        //
+        //     8 processor-core records, EfficiencyClass = [1,0,1,0,1,0,1,0]
+        //     => 4 performance cores, 4 efficiency cores, 8 physical, 16 logical
+        //
+        // So `performance_cores` is 4, and scaling it by logical/physical
+        // (4 * 16 / 8) gives 8 threads -- the P-cores with SMT, which is what `-t`
+        // should be. It is not the physical P-core count (4) and not the logical
+        // count (16).
+        match super::hybrid_performance_threads(16) {
+            Some(n) => {
+                assert!(n >= 1, "thread pool collapsed to {n}");
+                assert!(n <= 16, "thread pool {n} exceeds the logical core count");
+                assert!(
+                    n >= 8,
+                    "expected the P-core pool scaled by SMT (~8), got {n}"
+                );
+            }
+            None => {
+                // Acceptable only on a CPU with no real P/E split, where falling back
+                // to available_parallelism is correct. Recorded rather than asserted
+                // so a failure here names the host instead of a magic number.
+                eprintln!(
+                    "note: no hybrid split detected; -t would fall back to all logical cores"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hybrid_detection_never_returns_more_threads_than_are_logical() {
+        // The failure mode that matters: handing llama.cpp a thread count above the
+        // logical core count. Oversubscription on a matmul loop is a large slowdown,
+        // not a small one.
+        for logical in [1usize, 2, 4, 8, 16, 32, 64] {
+            if let Some(n) = super::hybrid_performance_threads(logical) {
+                assert!(n >= 1, "logical={logical} produced {n}");
+                assert!(n <= logical, "logical={logical} produced {n}");
+            }
+        }
+    }
+
+    #[test]
+    fn get_threads_is_never_zero() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        std::env::remove_var("GHOSTLINK_LLAMA_THREADS");
+        assert!(NativeEngineClient::get_threads() >= 1);
+    }
+
+    #[test]
+    fn an_explicit_thread_override_still_wins() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        std::env::set_var("GHOSTLINK_LLAMA_THREADS", "3");
+        assert_eq!(NativeEngineClient::get_threads(), 3);
+        std::env::remove_var("GHOSTLINK_LLAMA_THREADS");
     }
 }

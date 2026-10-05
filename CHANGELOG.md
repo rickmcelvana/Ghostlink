@@ -7,6 +7,32 @@ All notable changes to Ghostlink Studio are documented here.
 ## [Unreleased]
 
 ### Added
+- **Speculative decoding is now wired to `llama-server`.** `GHOSTLINK_DRAFT_MODEL`, `GHOSTLINK_DRAFT_MAX` and `GHOSTLINK_DRAFT_P_MIN` were documented in `LOCAL_INFERENCE_TUNING.md` with a specific promise about which flags they set, and **no code in the repository read any of them** -- setting them did nothing.
+
+  The documented flag names were also stale for this build. `llama-server --help`:
+  ```
+  --draft, --draft-n, --draft-max N   the argument has been removed.
+                                     use --spec-draft-n-max or ...
+  ```
+  Passing `--draft-max` as documented would make `llama-server` exit on an unknown argument. Now passes `--spec-draft-model`, `--spec-draft-n-max`, `--spec-draft-p-min`.
+
+  Off by default, and not enabled automatically: a draft model close in size to the target costs more than it saves. A `GHOSTLINK_DRAFT_MODEL` that does not exist disables the feature with a log line rather than failing the load -- the primary model is fine and this was only ever an optimization.
+
+- **`-t` now uses performance cores on a hybrid CPU.** `SystemProfile::cpu.performance_cores` was measured on every probe and never read; `get_threads` returned `available_parallelism`. Measured on this host (Ryzen AI 7 350, `-ngl 0` so the question is genuinely CPU-bound, 4 runs, medians):
+
+  | `-t` | prefill | decode |
+  |---|---|---|
+  | 4 | 254.2 tok/s | 22.36 tok/s |
+  | 8 (P-cores + SMT) | 254.1 tok/s | 21.55 tok/s |
+  | 16 (all logical) | 246.2 tok/s | 20.18 tok/s |
+
+  **1.07x decode.** Modest rather than 2x -- llama.cpp's own thread scaling is good -- but it was not being applied at all. `-t 8` rather than `-t 4`: `performance_cores` is a physical count, so it is scaled by `logical / physical` to keep SMT on the performance cores. Falls back to `available_parallelism` unchanged when there is no real P/E split, since halving threads on a uniform-core CPU would be a large invisible regression.
+
+### Changed
+- **`docs/LOCAL_INFERENCE_TUNING.md` records the draft-model flags that actually exist**, and notes that the host's CPU topology is not what its name suggests: "Ryzen AI 7 350" reads as uniform-core, but `GetLogicalProcessorInformationEx` reports 8 processor-core records with `EfficiencyClass = [1,0,1,0,1,0,1,0]` -- 4 performance, 4 efficiency. Read, not assumed.
+
+
+### Added
 - **Single-node knob A/B harness** (`scripts/llama_knob_ab.py`): A/Bs batch size, Flash Attention and KV-cache precision against the vendored `llama-server`, one variable at a time, on a single node. Prefill and decode are reported separately and a `-` is printed for anything llama.cpp did not report.
 
   Item 4 of the inference audit is a list of knobs with upstream numbers attached. This makes each one checkable instead of assumed.
