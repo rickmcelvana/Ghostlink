@@ -9,6 +9,7 @@ import os
 import signal
 import subprocess
 import sys
+import ssl
 import tempfile
 import time
 from pathlib import Path
@@ -18,7 +19,36 @@ from urllib.request import Request, urlopen
 ROOT = Path(__file__).resolve().parent.parent
 HOST = "127.0.0.1"
 PORT = 18013
-BASE_URL = f"http://{HOST}:{PORT}"
+# The server honours `enable_tls` from settings.json, so a developer machine can serve
+# HTTPS while CI (no settings.json) serves plaintext. Default to plaintext, allow an
+# override, and skip cert verification when https -- this only ever talks to localhost.
+def _detect_scheme() -> str:
+    """http unless something says otherwise.
+
+    The server decides from `settings.json`'s `enable_tls`, so a harness that assumes
+    plaintext fails with `BadStatusLine` on any developer machine with TLS on -- and a
+    harness that assumes TLS fails in CI, which has no settings.json. Read the same file
+    the server reads, and let the env var override for a deliberate test.
+    """
+    override = os.environ.get("GHOSTLINK_TEST_SCHEME")
+    if override:
+        return override
+    try:
+        settings = json.loads((ROOT / "settings.json").read_text(encoding="utf-8"))
+        return "https" if settings.get("enable_tls") else "http"
+    except (OSError, ValueError):
+        return "http"
+
+
+SCHEME = _detect_scheme()
+_TLS_CTX = ssl._create_unverified_context() if SCHEME == "https" else None
+BASE_URL = f"{SCHEME}://{HOST}:{PORT}"
+
+
+def _open(req, timeout):
+    if _TLS_CTX is None:
+        return urlopen(req, timeout=timeout)
+    return urlopen(req, timeout=timeout, context=_TLS_CTX)
 BINARY_PATH = Path(os.environ.get("CARGO_TARGET_DIR") or ROOT / "target") / "debug" / (
     "ghost-link.exe" if sys.platform == "win32" else "ghost-link"
 )
@@ -34,17 +64,43 @@ BINARY_PATH = Path(os.environ.get("CARGO_TARGET_DIR") or ROOT / "target") / "deb
 #
 # A test must not be able to destroy the thing it is testing.
 API_KEY_PATH = Path(tempfile.gettempdir()) / "ghostlink-ci-smoke-key.txt"
+# The hashed store that actually authenticates once it exists.
+API_KEYS_STORE_PATH = Path(tempfile.gettempdir()) / "ghostlink-ci-smoke-keys.json"
 API_KEY_VALUE = "ghostlink-ci-smoke-key"
 
 
+def _server_api_key(max_wait_s: float = 20.0) -> str:
+    """The key the server actually persisted, waiting for it to change.
+
+    The server generates its own key at startup and overwrites the seed we wrote, so a
+    read that happens too early returns the seed -- which then 401s and looks like an
+    auth bug rather than a race. Waiting for the value to *change* is what makes this
+    deterministic.
+    """
+    deadline = time.monotonic() + max_wait_s
+    value = ""
+    while time.monotonic() < deadline:
+        try:
+            value = API_KEY_PATH.read_text(encoding="utf-8").strip()
+        except OSError:
+            value = ""
+        if value and value != API_KEY_VALUE:
+            return value
+        time.sleep(0.2)
+    return value or API_KEY_VALUE
+
+
 def _auth_headers() -> dict:
-    return {"Authorization": f"Bearer {API_KEY_VALUE}"}
+    # The server generates its own key at startup and overwrites whatever was at the
+    # path, so the literal below is only correct while the file is still the seed we
+    # wrote. Reading it back is the only way to learn the value the server will accept.
+    return {"Authorization": f"Bearer {_server_api_key()}"}
 
 
 def _get_json(path: str, timeout: float = 5.0, auth: bool = True) -> dict:
     headers = _auth_headers() if auth else {}
     req = Request(f"{BASE_URL}{path}", method="GET", headers=headers)
-    with urlopen(req, timeout=timeout) as resp:
+    with _open(req, timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -59,7 +115,7 @@ def _post_json(path: str, payload: dict, timeout: float = 10.0, auth: bool = Tru
         headers=headers,
         method="POST",
     )
-    with urlopen(req, timeout=timeout) as resp:
+    with _open(req, timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -112,12 +168,26 @@ def _build_backend() -> None:
 
 def main() -> int:
     _build_backend()
+    # Clear BOTH before starting. A store left behind by an earlier run (or by the other
+    # harness, which uses the same filenames) is authoritative -- `load_api_keys()`
+    # returns it and never consults the raw key -- so a stale store makes this run
+    # authenticate against keys nobody in this process knows.
+    API_KEY_PATH.unlink(missing_ok=True)
+    API_KEYS_STORE_PATH.unlink(missing_ok=True)
     API_KEY_PATH.write_text(API_KEY_VALUE, encoding="utf-8")
 
     proc = subprocess.Popen(
         [str(BINARY_PATH), "serve", HOST, str(PORT)],
         cwd=str(ROOT),
-        env={**os.environ, "GHOSTLINK_API_KEY_PATH": str(API_KEY_PATH)},
+        env={
+            **os.environ,
+            # Both, not just the raw key: `load_api_keys()` returns an existing
+            # `api_keys.json` store when it parses, and only falls back to seeding from
+            # `api_key.txt` otherwise. Redirecting only the raw key means a machine with
+            # a real store authenticates against real keys and this harness cannot pass.
+            "GHOSTLINK_API_KEY_PATH": str(API_KEY_PATH),
+            "GHOSTLINK_API_KEYS_PATH": str(API_KEYS_STORE_PATH),
+        },
         stdout=None,
         stderr=None,
         preexec_fn=None,
