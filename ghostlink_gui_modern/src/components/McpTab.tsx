@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Pencil, Plug, Plus, RefreshCw, ShieldAlert, Trash2, X } from 'lucide-react';
+import { Loader, Pencil, Plug, Plus, RefreshCw, ShieldAlert, Trash2, X } from 'lucide-react';
 import { McpServer, McpServerInput, useAppStore } from '../store';
 import { GhostlinkAPI } from '../api';
 import { EmptyState } from './StatusViews';
@@ -348,13 +348,24 @@ export const McpTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
                 <button
                   onClick={() => handleToggle(server.name, !server.enabled)}
                   disabled={toggling === server.name}
+                  aria-busy={toggling === server.name}
                   role="switch"
                   aria-checked={server.enabled}
-                  aria-label={`${server.enabled ? 'Disable' : 'Enable'} ${server.name}`}
+                  aria-label={
+                    toggling === server.name
+                      ? `${server.enabled ? 'Disabling' : 'Enabling'} ${server.name}...`
+                      : `${server.enabled ? 'Disable' : 'Enable'} ${server.name}`
+                  }
                   className={`relative w-11 h-6 rounded-full transition-colors shrink-0 ${
                     server.enabled ? 'bg-blue-600' : 'bg-slate-700'
-                  } ${toggling === server.name ? 'opacity-50' : ''} focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none`}
-                  title={server.enabled ? 'Disable server' : 'Enable server'}
+                  } ${toggling === server.name ? 'opacity-50 cursor-not-allowed' : ''} focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none`}
+                  title={
+                    toggling === server.name
+                      ? `${server.enabled ? 'Disabling' : 'Enabling'} ${server.name}...`
+                      : server.enabled
+                      ? `Disable ${server.name}`
+                      : `Enable ${server.name}`
+                  }
                 >
                   <div
                     aria-hidden="true"
@@ -375,11 +386,16 @@ export const McpTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
                 <button
                   onClick={() => handleDelete(server.name)}
                   disabled={deleting === server.name}
+                  aria-busy={deleting === server.name}
                   className="p-1.5 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-red-400 transition disabled:opacity-40 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
-                  title="Remove server"
-                  aria-label={`Remove ${server.name}`}
+                  title={deleting === server.name ? `Removing ${server.name}...` : `Remove ${server.name}`}
+                  aria-label={deleting === server.name ? `Removing ${server.name}...` : `Remove ${server.name}`}
                 >
-                  <Trash2 size={16} aria-hidden="true" />
+                  {deleting === server.name ? (
+                    <Loader size={16} className="animate-spin" aria-hidden="true" />
+                  ) : (
+                    <Trash2 size={16} aria-hidden="true" />
+                  )}
                 </button>
               </div>
             ))}
@@ -406,8 +422,10 @@ export const McpTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
               <button
                 ref={editorCloseRef}
                 onClick={closeEditor}
-                className="text-slate-400 hover:text-white focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
+                disabled={saving}
+                className="text-slate-400 hover:text-white disabled:opacity-40 transition focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
                 aria-label="Close"
+                title="Close"
               >
                 <X size={20} aria-hidden="true" />
               </button>
@@ -587,15 +605,22 @@ export const McpTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
             <div className="flex justify-end gap-2 p-4 border-t border-slate-800">
               <button
                 onClick={closeEditor}
-                className="px-4 py-2 bg-slate-800 text-white rounded-lg font-medium hover:bg-slate-700 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
+                disabled={saving}
+                aria-label="Cancel editing server"
+                title="Cancel editing server"
+                className="px-4 py-2 bg-slate-800 text-white rounded-lg font-medium hover:bg-slate-700 disabled:opacity-50 transition focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
               >
                 Cancel
               </button>
               <button
                 onClick={handleSave}
                 disabled={saving}
-                className="px-4 py-2 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700 disabled:opacity-50 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
+                aria-busy={saving}
+                aria-label={saving ? 'Saving server...' : editorTarget === '' ? 'Add MCP server' : 'Save MCP server changes'}
+                title={saving ? 'Saving server...' : editorTarget === '' ? 'Add MCP server' : 'Save MCP server changes'}
+                className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700 disabled:opacity-50 transition focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
               >
+                {saving && <Loader size={16} className="animate-spin" aria-hidden="true" />}
                 {saving ? 'Saving...' : 'Save'}
               </button>
             </div>
