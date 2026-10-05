@@ -6,6 +6,29 @@ All notable changes to Ghostlink Studio are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- **Tool schemas no longer cost ~3,800 prompt tokens on every request.** `build_tool_instructions` inlined every enabled tool's complete JSON input schema into the prompt prefix, and that prefix is prepended to *every* turn (`format!("{tool_instructions}Question: {user_message}")`). Measured by proxying real request bodies: a five-word question produced a **17,149-character** user message and **3,814 prompt tokens**, of which ~3,700 were the tool catalog — about 13 seconds of prefill at the measured rate before the model read the question.
+
+  Tool entries are now compact signatures:
+
+  ```
+  - read_file(required: path; optional: content, encoding) — Read a file from disk.
+  ```
+
+  Full schemas remain reachable through `tool_schema_detail`, and a tool whose schema is not a shape we can summarise falls back to the full schema for that one tool rather than being reduced to nothing.
+
+  This was invisible to every benchmark written so far, because all of them used long synthetic prompts where 3,800 tokens of fixed overhead is noise against 5,000 tokens of user text. The overhead only shows when the user text is short, which is the normal case in a chat GUI.
+
+  Measured, same request, before and after:
+
+  | | prompt tokens | prefill | wall |
+  |---|---|---|---|
+  | before | 3,814 | 292 tok/s | ~13.1s of prefill |
+  | after | **1,047** | **~394 tok/s** | ~5.9s |
+
+  Tool calling verified working after the change: `tools_run: 1` on a real `read_file` with correct arguments, and a workspace-boundary probe correctly returned a denial rather than escaping the sandbox.
+
+
 ### Added
 - **Speculative decoding is now wired to `llama-server`.** `GHOSTLINK_DRAFT_MODEL`, `GHOSTLINK_DRAFT_MAX` and `GHOSTLINK_DRAFT_P_MIN` were documented in `LOCAL_INFERENCE_TUNING.md` with a specific promise about which flags they set, and **no code in the repository read any of them** -- setting them did nothing.
 

@@ -1601,6 +1601,68 @@ impl NativeEngineClient {
     }
 
     /// Check if a llama-server process is currently running
+    /// Whether the llama-server at the configured URL can actually serve a request.
+    ///
+    /// `has_running_llama_server` only knows about processes *this* binary launched --
+    /// it inspects a stored `Child` handle. That is correct for its purpose (don't leak
+    /// a child we own) and useless for deciding whether a request will succeed, because
+    /// the common cases are a server Ghostlink did not start and a server that died.
+    ///
+    /// Measured live, with no llama-server running at all:
+    ///
+    /// ```text
+    /// GET /health   -> {"status":"healthy", ... "uptime_s":41}
+    /// POST /api/inference/chat -> 200 after ~20s, containing
+    ///     Native error: llama_server request failed: error sending request for url
+    ///     (http://127.0.0.1:8080/completion)
+    /// ```
+    ///
+    /// Twenty seconds per request, and the health endpoint reported the whole time.
+    /// This asks the thing that actually matters instead: can the server generate?
+    ///
+    /// Best effort by design -- a probe that cannot reach the server reports `false`,
+    /// and a caller that treats that as "load the model" will simply find it already
+    /// loaded and continue.
+    pub async fn backend_can_generate(&self) -> bool {
+        self.backend_can_generate_at(&Self::get_llama_base_url())
+            .await
+    }
+
+    /// Probe against an explicit base URL. Split out so tests can point at a port that
+    /// is guaranteed closed without mutating process-global environment variables,
+    /// which would race every other env-reading test in this module.
+    pub async fn backend_can_generate_at(&self, base: &str) -> bool {
+        let url = format!("{}/completion", base.trim_end_matches('/'));
+        // The smallest generation that still exercises slot allocation and the model.
+        let body = serde_json::json!({
+            "prompt": "hi",
+            "n_predict": 1,
+            "stream": false,
+        })
+        .to_string();
+        // 2s, not the 10s default. Measured: a health probe against a backend that is
+        // not listening took ~2.0s per call, which is slow enough to be a real cost on a
+        // health endpoint that a GUI polls. A refused *local* port is instant; the wait
+        // is the client's own timeout expiring on a routeless address, so the bound has
+        // to be short enough to be harmless.
+        let Ok(client) = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+        else {
+            return false;
+        };
+        match client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
+            .await
+        {
+            Ok(resp) => resp.status().is_success(),
+            Err(_) => false,
+        }
+    }
+
     pub fn has_running_llama_server(&self) -> bool {
         let handle = Self::get_process_handle();
         let locked = handle.lock();
@@ -3587,5 +3649,35 @@ mod tests {
         std::env::set_var("GHOSTLINK_LLAMA_THREADS", "3");
         assert_eq!(NativeEngineClient::get_threads(), 3);
         std::env::remove_var("GHOSTLINK_LLAMA_THREADS");
+    }
+
+    #[tokio::test]
+    async fn backend_can_generate_is_false_when_nothing_is_listening() {
+        // The availability bug this exists for: with no llama-server running, a chat
+        // request used to spend ~20s in transport retries and then return HTTP 200
+        // containing "Native error: llama_server request failed: error sending request
+        // for url (http://127.0.0.1:8080/completion)".
+        //
+        // Port 1 is reserved and never has a listener, so this cannot pass by accident.
+        let client = NativeEngineClient::new();
+        assert!(
+            !client.backend_can_generate_at("http://127.0.0.1:1").await,
+            "a dead backend must not report itself able to generate"
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_can_generate_does_not_hang_on_a_dead_backend() {
+        // The probe sits on the request path, so it has to be fast when the answer is
+        // "no". A connect to a refused local port is immediate; the assertion is that
+        // the whole thing stays well under the 10s client timeout.
+        let client = NativeEngineClient::new();
+        let started = std::time::Instant::now();
+        let _ = client.backend_can_generate_at("http://127.0.0.1:1").await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "probe took {:?}; it is on the hot path and must fail fast",
+            started.elapsed()
+        );
     }
 }
