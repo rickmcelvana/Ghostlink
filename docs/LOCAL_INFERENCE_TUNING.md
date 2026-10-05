@@ -193,6 +193,32 @@ sounds uniform-core, but the OS reports a genuine 4P/4E split. Read it rather th
 assuming — which is what `SystemProfile::cpu.performance_cores` is for, and it was
 already being computed on every probe and never consulted.
 
+## 1b. The context ceiling dominates long conversations
+
+`get_ctx_size` caps context by model size, independently of the VRAM tier:
+
+| model size | ctx granted | turns of ~500 tokens |
+|---|---|---|
+| under 5 GB | 8192 | ~16 |
+| 5-10 GB | 8192 | ~16 |
+| 10 GB and over | **4096** | **~8** |
+
+Measured on this project's reference hardware, where the configured model is 12 GB and
+therefore gets 4096. That is barely more than the 4 turns the sliding window protects as a
+floor, so long conversations start losing turns quickly **even though the window is
+working correctly** -- the window is bounded by a ceiling it cannot see.
+
+This is separate from model choice. A faster model does not help if the context is capped,
+and a larger context does not help if the model cannot be loaded at all (see
+`scripts/model_survey.py`, which records that both models over 10 GB currently fail to
+start on this device).
+
+Unlike `get_ngl`, the `model_cap` table carries no measurement or comment explaining where
+4096 came from. It is a plausible-looking constant. `GHOSTLINK_CTX_SIZE` overrides it, but
+only when `ctx_size_auto` is false -- and a non-default value with `ctx_size_auto: true`
+looks configured while doing nothing, which is what the `[perf-tier] IGNORED` line at model
+load now reports.
+
 ## 1. Prompt processing / ingestion
 
 If you have free VRAM, increase batch sizes:
