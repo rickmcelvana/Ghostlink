@@ -924,22 +924,23 @@ impl NativeEngineClient {
             .map(|n| n.get())
             .unwrap_or(4)
             .max(1);
-        // On a hybrid CPU, half the logical processors are efficiency cores. llama.cpp
-        // schedules matmuls across whatever threads it is given, so handing it all 16
-        // means E-cores participate in the decode loop and the "hybrid CPUs should use
-        // P-cores only" advice in the tuning doc is not being followed -- the detector
-        // existed, `performance_cores` was measured on every probe, and `get_threads`
-        // never read it.
+        // On a hybrid CPU, the efficiency cores are slower at exactly the matmul work
+        // llama.cpp schedules here, so handing it every logical processor lets them
+        // participate in the decode loop. Measured on this host: -t 8 (P-cores plus SMT)
+        // decodes 21.55 tok/s against 20.18 for -t 16, a 1.07x gain.
         //
-        // Detection is Windows-only and returns None when there is no real P/E split,
-        // so this is a no-op on uniform-core CPUs (including this host's Ryzen AI 7 350,
-        // which is Zen 5 and has none). Verified, not assumed: `detect_hybrid_core_counts`
-        // returns None unless every core reports the same EfficiencyClass as the rest.
+        // Detection is Windows-only and returns None without a real P/E split, so this is
+        // a no-op on uniform-core CPUs. Worth checking rather than assuming: this host is
+        // a Ryzen AI 7 350, which reads as uniform-core, but
+        // `GetLogicalProcessorInformationEx` reports 8 processor-core records with
+        // `EfficiencyClass = [1,0,1,0,1,0,1,0]` -- 4 performance, 4 efficiency. An earlier
+        // comment here asserted the opposite, and a test written from that assumption
+        // failed against the real detector.
         //
-        // `performance_cores` is the physical P-core count. Scaling it by the logical:core
-        // ratio preserves SMT threads on the performance cores, which is what the flag
-        // means in practice -- limiting to physical P-cores alone would leave half the
-        // FP throughput unused.
+        // `performance_cores` is the physical P-core count. Scaling it by the
+        // logical:core ratio preserves SMT threads on the performance cores, which is what
+        // the flag means in practice -- limiting to physical P-cores alone would leave
+        // half the FP throughput unused.
         let threads = match hybrid_performance_threads(logical) {
             Some(p) => p,
             None => logical,
@@ -1264,6 +1265,62 @@ impl NativeEngineClient {
     /// backend (see `crate::rpc_cluster`), not this crate's synthetic
     /// pipeline-benchmark transport. `None`/empty reproduces prior
     /// single-node behavior exactly.
+    /// The tuning values actually chosen for a model load, plus any that contradict an
+    /// explicit setting.
+    ///
+    /// Added because the load path was silently discarding user configuration. Measured
+    /// on this machine: `settings.json` asked for `ctx_size: 131072` and `ngl: 100`, and
+    /// `llama-server` was launched with `-c 4096 -ngl 0`:
+    ///
+    /// ```text
+    /// -m models/Qwen3.8-27B-UD-IQ3_S.gguf -c 4096 -np 1 -ngl 0 -t 15
+    /// ```
+    ///
+    /// Three of four explicit settings were overridden by the model-size branches in
+    /// `get_ngl`/`get_ctx_size`/`get_threads`, with nothing logged. A user reading
+    /// `settings.json` would have no way to tell. The overrides themselves are
+    /// defensible -- a 12 GB model CPU-bound beats a partial offload that OOMs -- but
+    /// *silently* is not the same as *correctly*.
+    ///
+    /// `load_model_into_slot` now prints one line per overridden value at boot.
+    pub fn describe_tuning(model_size_gb: f32) -> String {
+        let ctx = Self::get_ctx_size(model_size_gb);
+        let ngl = Self::get_ngl(model_size_gb);
+        let threads = Self::get_threads();
+        let mut out = format!(
+            "[perf-tier] effective: -c {ctx} -ngl {ngl} -t {threads} (model {:.2} GB)",
+            model_size_gb
+        );
+        let mut notes: Vec<String> = Vec::new();
+        for (env, label) in [
+            ("GHOSTLINK_CTX_SIZE", "ctx_size"),
+            ("GHOSTLINK_LLAMA_NGL", "ngl"),
+            ("GHOSTLINK_LLAMA_THREADS", "threads"),
+        ] {
+            if let Ok(requested) = std::env::var(env) {
+                let requested = requested.trim().to_string();
+                let effective = match env {
+                    "GHOSTLINK_CTX_SIZE" => ctx.to_string(),
+                    "GHOSTLINK_LLAMA_NGL" => ngl.to_string(),
+                    _ => threads.to_string(),
+                };
+                if requested != effective {
+                    notes.push(format!(
+                        "{label}: settings requested {requested}, using {effective}"
+                    ));
+                }
+            }
+        }
+        if !notes.is_empty() {
+            out.push_str("\n[perf-tier] OVERRIDDEN by model-size/VRAM policy: ");
+            out.push_str(&notes.join("; "));
+            out.push_str(
+                "\n[perf-tier] set the matching *_auto flag to false to force the setting",
+            );
+        }
+        out
+    }
+
     pub fn load_model_into_slot(
         &self,
         model_path: &str,
@@ -1297,6 +1354,11 @@ impl NativeEngineClient {
         // that budgeting against the setting alone produces requests llama-server
         // rejects outright.
         Self::record_running_ctx(ctx);
+        // Report the tuning actually applied, and name anything the model-size policy
+        // overrode. Previously the only clue was the `[perf-tier]` line, which showed the
+        // batch/FA/KV choices but never the ctx/ngl/threads ones -- and never said when a
+        // configured value had been discarded.
+        eprintln!("{}", Self::describe_tuning(model_size_gb));
         let parallel_slots = Self::get_parallel_slots();
         let mlock = Self::get_mlock();
         let no_mmap = Self::get_no_mmap();
@@ -3679,5 +3741,100 @@ mod tests {
             "probe took {:?}; it is on the hot path and must fail fast",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn describe_tuning_names_a_setting_the_policy_overrode() {
+        // The defect this exists for: settings.json asked for ctx 131072 / ngl 100 and
+        // llama-server was launched with -c 4096 -ngl 0, with nothing logged.
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        for v in [
+            "GHOSTLINK_CTX_SIZE",
+            "GHOSTLINK_LLAMA_NGL",
+            "GHOSTLINK_LLAMA_THREADS",
+            "GHOSTLINK_VRAM_GB",
+        ] {
+            std::env::remove_var(v);
+        }
+        // Note the env vars are NOT set here, and that is the point.
+        //
+        // `settings.json` carries `ctx_size: 131072` and `ngl: 100` alongside
+        // `ctx_size_auto: true` / `ngl_auto: true`, so `apply_native_engine_tuning_env`
+        // never exports them and the getters fall through to the model-size policy --
+        // which is how the server was launched with `-c 4096 -ngl 0` and nothing logged.
+        //
+        // Setting the env vars directly would *win*, because the getters read them first.
+        // So the override only ever happens through the auto path, which is exactly the
+        // path that was silent.
+        let line = NativeEngineClient::describe_tuning(12.0);
+        assert!(
+            line.contains("-c 4096"),
+            "a 12 GB model must cap ctx at 4096: {line}"
+        );
+        assert!(
+            line.contains("-ngl 0"),
+            "a 12 GB model must be CPU-only here: {line}"
+        );
+
+        // Now the explicit case: with the env var set, the getter honours it and there is
+        // nothing to report. Both halves of the contract in one test.
+        std::env::set_var("GHOSTLINK_CTX_SIZE", "131072");
+        let explicit = NativeEngineClient::describe_tuning(12.0);
+        assert!(
+            explicit.contains("-c 131072"),
+            "an explicit request must be honoured: {explicit}"
+        );
+        assert!(
+            !explicit.contains("OVERRIDDEN"),
+            "an honoured request must not be reported as overridden: {explicit}"
+        );
+        std::env::remove_var("GHOSTLINK_CTX_SIZE");
+    }
+
+    #[test]
+    fn describe_tuning_is_quiet_when_nothing_is_overridden() {
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        for v in [
+            "GHOSTLINK_CTX_SIZE",
+            "GHOSTLINK_LLAMA_NGL",
+            "GHOSTLINK_LLAMA_THREADS",
+            "GHOSTLINK_VRAM_GB",
+        ] {
+            std::env::remove_var(v);
+        }
+        let line = NativeEngineClient::describe_tuning(1.7);
+        assert!(
+            line.contains("-c "),
+            "must always report effective values: {line}"
+        );
+        assert!(
+            !line.contains("OVERRIDDEN"),
+            "nothing was overridden, so it must not claim otherwise: {line}"
+        );
+    }
+
+    #[test]
+    fn describe_tuning_agrees_with_the_functions_it_describes() {
+        // The report must not drift from reality: it calls the same getters.
+        let _guard = env_lock().lock().expect("env lock poisoned");
+        for v in [
+            "GHOSTLINK_CTX_SIZE",
+            "GHOSTLINK_LLAMA_NGL",
+            "GHOSTLINK_LLAMA_THREADS",
+            "GHOSTLINK_VRAM_GB",
+        ] {
+            std::env::remove_var(v);
+        }
+        for size in [0.7f32, 1.7, 4.85, 12.0, 14.7] {
+            let line = NativeEngineClient::describe_tuning(size);
+            assert!(
+                line.contains(&format!("-c {}", NativeEngineClient::get_ctx_size(size))),
+                "ctx mismatch at {size} GB: {line}"
+            );
+            assert!(
+                line.contains(&format!("-ngl {}", NativeEngineClient::get_ngl(size))),
+                "ngl mismatch at {size} GB: {line}"
+            );
+        }
     }
 }
