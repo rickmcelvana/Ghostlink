@@ -7,6 +7,34 @@ All notable changes to Ghostlink Studio are documented here.
 ## [Unreleased]
 
 ### Added
+- **Sliding window for chat history** (`crates/ghost-link/src/context_window.rs`): the audit's item 5 said sliding window / compact policies were "documented and not implemented on the chat path". `GHOSTLINK_KEEP_LAST_TURNS` did not exist anywhere in the codebase. Now there is a window with a completion reserve and a bounded keep-last floor, plus `GHOSTLINK_KEEP_LAST_TURNS` (default 4) and `GHOSTLINK_COMPLETION_RESERVE_TOKENS`.
+
+  Every turn re-evaluated the whole history against the token ceiling. With prefill measured at 245 tok/s, a long conversation paid a ~21.7s prefill on *every* turn, so TTFT grew without bound until the ceiling finally bit.
+
+- **History budget clamped to the context the model actually runs** (`native_engine::probe_running_ctx_size`). `conversation_token_limit` is a user preference; the running context is derived from VRAM and model size. They disagreed, and budgeting against the preference alone produced requests the model rejects outright:
+  ```
+  request (18848 tokens) exceeds the available context size (8192 tokens)
+  ```
+  That is an HTTP 400, not a degraded answer. The chat path now asks the server itself (`/props`) rather than predicting. `n_ctx` is also divided by `total_slots` — llama-server splits context across slots, so `-np 2` on an 8192 ctx is two 4096 contexts, and budgeting against 8192 is rejected at ~4096.
+
+- **Summarization prompt is bounded as a whole** (`context_window::bound_turns`). It previously clipped each turn to 2000 characters and nothing else, so a trim that dropped 80 turns still assembled 80 x 2000 chars — a 21,485-token request against an 8192 context. The user saw nothing: summarization runs detached, so they got an answer and silently lost the summary.
+
+### Changed
+- **Fallback token estimate is conservative** (`context_window::conservative_token_estimate`). Whitespace counting undercounted by ~15% against the real tokenizer (420 words vs 481 tokens, measured on the running server's `/tokenize`). Undercounting is the dangerous direction — it admits prompts the server then rejects. Now words plus 15% of characters.
+
+  Worth being explicit about: the native path uses the real tokenizer, so this only affects non-native backends and tokenizer failures. The measured undercount was on real English prose, not a synthetic edge case.
+
+### Fixed
+- **A long conversation no longer fails outright.** Verified live: an 80-turn, ~60,000-token history previously returned HTTP 400 on every attempt and now answers with 6,743 prompt tokens at 195 tok/s prefill, 8.6 tok/s decode, and summarization succeeding.
+
+  This took four attempts to fix because each attempt fixed a real defect and none of them was the one causing the 400. In order: the budget ignored the completion reserve; the budget exceeded the real context; the derived context size was absent whenever Ghostlink reused a server it did not launch; and the failing request was not the chat request at all but a detached summarization with no total bound.
+
+  That last one is the actual lesson, and it is why the harness came first. Reading the chat path carefully, four times over, would not have found it — the log line `summarization failed (llama_server request failed with status 400 ... request (21485 tokens))` named a different function than the one under inspection. Grep the log, not the code you assume is running.
+
+  26 new tests. The load-bearing ones assert that a per-item cap is not a total cap (80 x 2000 chars must not assemble into 21,485 tokens), that the newest turn survives an overflowing budget, and that the fallback estimate never lands below the real tokenizer's answer.
+
+
+### Added
 - **Inference measurement harness** (`scripts/inference_bench.py`, `crates/ghost-link/src/native_engine.rs`):
   reports **prefill and decode separately**, because a single tok/s figure over a chat request averages two unrelated costs. Prefill is compute-bound and batches; decode is bandwidth-bound and does not. Averaged together they move for reasons that have nothing to do with each other, which makes them useless for deciding whether a change helped.
 

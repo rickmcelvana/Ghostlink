@@ -5707,20 +5707,54 @@ fn build_summary_prompt(running_summary: &str, new_turns: &[(String, String)]) -
         out.push_str(running_summary.trim());
         out.push_str("\n\nNewer transcript:\n");
     }
-    for (role, content) in new_turns {
+    // Bound the transcript as a whole, not just each turn.
+    //
+    // The per-turn cap alone is not a total cap. A trim that dropped 80 turns still
+    // assembled 80 x 2000 chars, which reached llama-server as a 21,485-token request
+    // against an 8192 context and was rejected:
+    //
+    //     request (21485 tokens) exceeds the available context size (8192 tokens)
+    //
+    // Silent to the user, because the summarization runs detached -- they got an
+    // answer and lost the summary. Trimming *more* history made it worse: every turn
+    // feeds this prompt.
+    let budget = context_window::history_budget(
+        SUMMARY_PROMPT_TOKEN_BUDGET,
+        SUMMARY_PROMPT_REPLY_TOKENS,
+        native_engine::NativeEngineClient::running_ctx_size(),
+    );
+    let bounded = context_window::bound_turns(new_turns, budget, |(_, content)| {
+        context_window::conservative_token_estimate(
+            &content
+                .chars()
+                .take(SUMMARY_TURN_MAX_CHARS)
+                .collect::<String>(),
+        )
+    });
+    for (role, content) in bounded {
         let label = if role.eq_ignore_ascii_case("assistant") {
             "Assistant"
         } else {
             "User"
         };
-        // Bound each turn so one huge pasted message cannot blow the
-        // summarizer's own context.
-        let trimmed: String = content.chars().take(2000).collect();
+        let trimmed: String = content.chars().take(SUMMARY_TURN_MAX_CHARS).collect();
         out.push_str(&format!("{label}: {trimmed}\n"));
     }
     out.push_str("\nSummary:");
     out
 }
+
+/// Token budget for the transcript half of a summarization prompt.
+///
+/// Half the context by default: the running summary also has to fit, and a summary is
+/// a bounded 512-token generation, so there is no reason to spend more.
+const SUMMARY_PROMPT_TOKEN_BUDGET: usize = 2048;
+
+/// Completion allowance subtracted from the summarization budget.
+const SUMMARY_PROMPT_REPLY_TOKENS: usize = 512;
+
+/// Per-turn character cap inside a summarization prompt.
+const SUMMARY_TURN_MAX_CHARS: usize = 2000;
 
 /// Stores a session's summary, evicting the least-recently-updated entries
 /// once `SUMMARY_MAX_SESSIONS` is exceeded, and trimming the text itself to
@@ -10177,11 +10211,43 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
     /// `token_estimate` computed a few lines into `handle_gui_chat`) rather
     /// than a real tokenizer - consistent, not exact, which is all a rough
     /// budget needs.
+    /// How many recent turns the sliding window protects from eviction.
+    ///
+    /// `GHOSTLINK_KEEP_LAST_TURNS`, default 4 (two full exchanges). Clamped to
+    /// `MAX_PROTECTED_TURNS`: the floor keeps the current exchange coherent, it does not
+    /// exempt an unbounded tail from the budget.
+    ///
+    /// This is the knob the inference audit named and could not find anywhere in the
+    /// codebase. It did not exist, so every turn re-evaluated the whole history against
+    /// the token ceiling and could resend all of it.
+    fn keep_last_turns() -> usize {
+        std::env::var("GHOSTLINK_KEEP_LAST_TURNS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(context_window::DEFAULT_KEEP_LAST_TURNS)
+            .min(context_window::MAX_PROTECTED_TURNS)
+    }
+
+    /// Completion headroom reserved out of the context for the reply.
+    ///
+    /// Without this the history budget can consume the whole context, leaving the answer
+    /// to be truncated against a limit produced by arithmetic rather than intent.
+    /// Defaults to the per-response allowance; `GHOSTLINK_COMPLETION_RESERVE_TOKENS`
+    /// overrides it.
+    fn completion_reserve_tokens(per_response: usize) -> usize {
+        std::env::var("GHOSTLINK_COMPLETION_RESERVE_TOKENS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(per_response)
+            .max(1)
+    }
+
     async fn trim_conversation_history_async(
         native_engine_client: &native_engine::NativeEngineClient,
         is_native: bool,
         messages: &[ChatHistoryTurn],
         token_budget: usize,
+        keep_last_turns: usize,
     ) -> (Vec<(String, String)>, bool) {
         let prior = if messages.is_empty() {
             &[][..]
@@ -10189,27 +10255,54 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             &messages[..messages.len() - 1]
         };
 
-        let mut budget = token_budget;
-        let mut kept: Vec<(String, String)> = Vec::new();
-        for turn in prior.iter().rev() {
+        // Measure every turn with the real tokenizer first, then let the sliding
+        // window decide. Tokenizing up front costs one round trip per turn, but it is
+        // the only way to know a turn's cost before deciding whether to keep it, and
+        // a budget built on estimated costs is a budget that is quietly wrong.
+        let mut measured: Vec<context_window::Turn> = Vec::with_capacity(prior.len());
+        for turn in prior {
             let cost = if is_native {
                 native_engine_client
                     .tokenize(&turn.content)
                     .await
-                    .unwrap_or_else(|| turn.content.split_whitespace().count().max(1))
+                    .unwrap_or_else(|| context_window::conservative_token_estimate(&turn.content))
             } else {
                 turn.content.split_whitespace().count().max(1)
             };
-            if cost > budget {
-                break;
-            }
-            budget -= cost;
-            kept.push((turn.role.clone(), turn.content.clone()));
+            measured.push(context_window::Turn {
+                role: turn.role.clone(),
+                tokens: cost,
+            });
         }
-        kept.reverse();
 
-        let truncated = kept.len() < prior.len();
-        (kept, truncated)
+        // `token_budget` arrives already clamped and reduced by the caller, so the
+        // window is built directly rather than re-deriving either.
+        let policy = context_window::WindowPolicy {
+            history_budget: token_budget,
+            keep_last_turns,
+        };
+        let (window, report) = context_window::apply(&measured, policy);
+
+        if report.over_budget {
+            // The protected tail alone exceeded the budget. Reported rather than
+            // silently accepted: the prompt is larger than intended, and the user
+            // should know why their context indicator says "truncated".
+            tracing::debug!(
+                target: "assistant_trace",
+                kept = report.kept,
+                dropped = report.dropped,
+                budget = token_budget,
+                "recent turns exceeded the history budget; kept anyway"
+            );
+        }
+
+        let kept: Vec<(String, String)> = window
+            .into_iter()
+            .zip(prior.iter())
+            .map(|(m, orig)| (m.role, orig.content.clone()))
+            .collect();
+
+        (kept, report.truncated)
     }
 
     #[allow(dead_code)]
@@ -10601,11 +10694,26 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             .session_id
             .clone()
             .unwrap_or_else(|| "sess_local_001".to_string());
+        // Ask the server itself how much context it has. A locally-recorded value is
+        // only a prediction of that, and it is absent entirely when Ghostlink reused
+        // a server it did not start -- which is the case that let an 18,851-token
+        // prompt through against a real 8192 ctx.
+        let running_ctx = if matches!(inference_backend, InferenceEngine::Native) {
+            native_engine::NativeEngineClient::probe_running_ctx_size().await
+        } else {
+            0
+        };
+        let history_budget = context_window::history_budget(
+            settings.conversation_token_limit,
+            completion_reserve_tokens(settings.chat_exec_tokens),
+            running_ctx,
+        );
         let (history_turns, history_truncated) = trim_conversation_history_async(
             &native_engine_client,
             matches!(inference_backend, InferenceEngine::Native),
             req.messages.as_deref().unwrap_or(&[]),
-            settings.conversation_token_limit,
+            history_budget,
+            keep_last_turns(),
         )
         .await;
 
@@ -15075,6 +15183,7 @@ mod backend_plugin;
 mod backend_registry;
 mod bootstrap;
 mod capability;
+mod context_window;
 mod grounding;
 mod host_metrics;
 mod inference_engine;

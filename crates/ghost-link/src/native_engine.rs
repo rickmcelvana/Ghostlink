@@ -88,6 +88,9 @@ static LLAMA_SERVER_PROCESS: OnceLock<Arc<Mutex<Option<Child>>>> = OnceLock::new
 // see `NativeEngineClient::get_llama_build_id`.
 static LLAMA_BUILD_ID: OnceLock<Option<String>> = OnceLock::new();
 
+/// Context size the running llama-server was launched with.
+static RUNNING_CTX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 impl NativeEngineClient {
     pub fn new() -> Self {
         Self {
@@ -392,7 +395,84 @@ impl NativeEngineClient {
     /// Found the hard way: a 13.6GB model + 16384 ctx (this function's old
     /// unconditional-16384-if-VRAM=8 behavior) left a 27.6GB host with under
     /// 1GB free — one more allocation away from OOM, not a hypothetical.
-    fn get_ctx_size(model_size_gb: f32) -> u32 {
+    ///
+    /// Public so the chat path can clamp `conversation_token_limit` against the
+    /// context the model is actually running with. The two can disagree -- the
+    /// setting is a user preference while this is derived from VRAM and model size
+    /// -- and when they do, budgeting against the setting produces prompts the model
+    /// cannot accept at all. See `history_budget_tokens`.
+    /// The context size the currently-running llama-server was launched with, or 0
+    /// when unknown (no server started yet, or it was started by something else).
+    ///
+    /// 0 rather than a guessed default: a caller that clamps against an invented
+    /// number would silently under- or over-budget, and there is already a ceiling
+    /// (`GHOSTLINK_CTX_SIZE`) that makes the real value discoverable.
+    pub(crate) fn running_ctx_size() -> u32 {
+        RUNNING_CTX.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn record_running_ctx(ctx: u32) {
+        RUNNING_CTX.store(ctx, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The context size the **running** llama-server reports, from `/props`.
+    ///
+    /// Preferred over the value derived from VRAM and model size because it is the
+    /// server's own answer rather than our prediction of it. It also covers the case
+    /// that made the derived value useless: a server Ghostlink did not launch. If the
+    /// user has one already running on the configured port, `load_model` reuses it and
+    /// never calls `get_ctx_size`, so the recorded value stayed 0 and the history
+    /// budget fell back to `conversation_token_limit` -- which is why the live 80-turn
+    /// request was still trimmed to 18,851 tokens against a real 8192 ctx.
+    ///
+    /// Best effort: any failure returns 0, and callers treat 0 as "unknown" and keep
+    /// the previous ceiling rather than guessing.
+    pub(crate) async fn probe_running_ctx_size() -> u32 {
+        let base = Self::get_llama_base_url();
+        let url = format!("{}/props", base.trim_end_matches('/'));
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return 0,
+        };
+        let resp = match client.get(&url).send().await {
+            Ok(r) => r,
+            Err(_) => return 0,
+        };
+        let body: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(_) => return 0,
+        };
+        // `n_ctx` is the TOTAL across all slots, not the per-request allowance. With
+        // `-np 2` llama-server serves 8192 total as two 4096 contexts, and a request
+        // that budgets against 8192 is rejected at ~4096. Measured: a prompt trimmed
+        // to a 7168 budget came back as
+        // "request (10589 tokens) exceeds the available context size".
+        let n_ctx = body
+            .get("default_generation_settings")
+            .and_then(|s| s.get("n_ctx"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        // total_slots defaults to 1 when absent; never let a bad value divide to zero.
+        let slots = body
+            .get("total_slots")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1)
+            .max(1);
+        if n_ctx == 0 {
+            return 0;
+        }
+        let n = (n_ctx / slots) as u32;
+        if n == 0 {
+            return 0;
+        }
+        Self::record_running_ctx(n);
+        n
+    }
+
+    pub(crate) fn get_ctx_size(model_size_gb: f32) -> u32 {
         if let Ok(val) = std::env::var("GHOSTLINK_CTX_SIZE") {
             if let Ok(n) = val.trim().parse::<u32>() {
                 return n.clamp(512, 131072);
@@ -1061,6 +1141,12 @@ impl NativeEngineClient {
         let ngl = Self::get_ngl(model_size_gb);
         let threads = Self::get_threads();
         let ctx = Self::get_ctx_size(model_size_gb);
+        // Remember what this process was actually launched with. The chat path needs
+        // it to clamp `conversation_token_limit`: the setting is a user preference and
+        // this is derived from VRAM and model size, and they disagree often enough
+        // that budgeting against the setting alone produces requests llama-server
+        // rejects outright.
+        Self::record_running_ctx(ctx);
         let parallel_slots = Self::get_parallel_slots();
         let mlock = Self::get_mlock();
         let no_mmap = Self::get_no_mmap();
