@@ -7,8 +7,8 @@
 >   - **Contributor Supervision & Drain-and-Restart**: Active process supervision (`RpcSupervisor`) revokes advertisements on worker crash; mid-request contributor loss drains non-viable topology and fails requests cleanly without output corruption.
 >   - **Version-Mismatch Rejection**: Peer discovery checks `rpc_build_id` and excludes confirmed `ggml-rpc` build mismatches to prevent silent tensor output corruption.
 >   - **Scoped Role-Based Access Control**: 4-role API key authorization (`owner`, `operator`, `inference`, `viewer`) with persisted hashed key storage (`api_keys.json`).
->   - **Task Runtime & Human-in-the-Loop Review (v2.3)**: Durable Projects, Tasks, AgentRuns, ReviewPackets, deterministic shell Judge policy, and Studio review UI shipped on  (v2.4 child fan-out in progress).
-  - **RPC Admission & Audit Rotation**: `rpc_shared_secret` HMAC challenge handshake, `rpc_allowed_peers` IP allowlisting, and bounded audit log rotation/retention (`audit_log.jsonl.N`).
+>   - **Task Runtime & Human-in-the-Loop Review (v2.3)**: Durable Projects, Tasks, AgentRuns, ReviewPackets, deterministic shell Judge policy, and Studio review UI shipped on `main` (v2.4 child fan-out in progress).
+>   - **RPC Admission & Audit Rotation**: `rpc_shared_secret` HMAC challenge handshake, `rpc_allowed_peers` IP allowlisting, and bounded audit log rotation/retention (`audit_log.jsonl.N`).
 > - **Unproven / In Progress:** High usable tokens-per-second (tok/s) throughput on network-bound split layers, live mid-generation token state migration, and transport-layer encryption for raw RPC byte streams.
 
 
