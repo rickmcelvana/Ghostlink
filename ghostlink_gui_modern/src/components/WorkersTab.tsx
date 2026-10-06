@@ -11,6 +11,7 @@ import {
   AlertTriangle,
   HelpCircle,
   Layers,
+  Loader2,
 } from 'lucide-react';
 import { ClusterTopology, ClusterTopologyNode } from '../api';
 import { useAppStore, Settings } from '../store';
@@ -32,6 +33,7 @@ export const WorkersTab: React.FC<{ api: any }> = ({ api }) => {
   const [addHost, setAddHost] = useState('');
   const [addPort, setAddPort] = useState('8003');
   const [addError, setAddError] = useState('');
+  const [isAddingWorker, setIsAddingWorker] = useState(false);
 
   // Advanced settings editable local fields
   const [editRpcPort, setEditRpcPort] = useState<number>(50052);
@@ -206,15 +208,20 @@ export const WorkersTab: React.FC<{ api: any }> = ({ api }) => {
       return;
     }
 
-    const res = await api.addWorker(addHost.trim(), port);
-    if (res.success) {
-      addToast({ type: 'success', message: `Added worker ${addHost.trim()}:${port}` });
-      setShowAddForm(false);
-      setAddHost('');
-      setAddPort('8003');
-      refreshWorkersAndTopology();
-    } else {
-      setAddError(res.error || 'Failed to add worker.');
+    setIsAddingWorker(true);
+    try {
+      const res = await api.addWorker(addHost.trim(), port);
+      if (res.success) {
+        addToast({ type: 'success', message: `Added worker ${addHost.trim()}:${port}` });
+        setShowAddForm(false);
+        setAddHost('');
+        setAddPort('8003');
+        refreshWorkersAndTopology();
+      } else {
+        setAddError(res.error || 'Failed to add worker.');
+      }
+    } finally {
+      setIsAddingWorker(false);
     }
   };
 
@@ -305,9 +312,11 @@ export const WorkersTab: React.FC<{ api: any }> = ({ api }) => {
           </h2>
           <button
             onClick={() => setShowHowToJoin(true)}
-            className="text-xs text-blue-400 hover:text-blue-300 flex items-center gap-1 font-bold"
+            className="text-xs text-blue-400 hover:text-blue-300 flex items-center gap-1 font-bold focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none rounded-lg px-2 py-1"
+            title="Open cluster setup guide"
+            aria-label="Open cluster setup guide"
           >
-            <HelpCircle size={14} />
+            <HelpCircle size={14} aria-hidden="true" />
             Setup Guide
           </button>
         </div>
@@ -831,9 +840,10 @@ export const WorkersTab: React.FC<{ api: any }> = ({ api }) => {
               <button
                 type="button"
                 onClick={() => setShowAddForm(false)}
+                disabled={isAddingWorker}
                 aria-label="Close dialog"
                 title="Close dialog"
-                className="text-slate-400 hover:text-white p-1 rounded-lg focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
+                className="text-slate-400 hover:text-white p-1 rounded-lg focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none disabled:opacity-50"
               >
                 ✕
               </button>
@@ -850,10 +860,11 @@ export const WorkersTab: React.FC<{ api: any }> = ({ api }) => {
                   id="add-host-input"
                   type="text"
                   required
+                  disabled={isAddingWorker}
                   placeholder="e.g. 192.168.1.100"
                   value={addHost}
                   onChange={(e) => setAddHost(e.target.value)}
-                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-200 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-200 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none disabled:opacity-50"
                 />
               </div>
 
@@ -865,10 +876,11 @@ export const WorkersTab: React.FC<{ api: any }> = ({ api }) => {
                   id="add-port-input"
                   type="number"
                   required
+                  disabled={isAddingWorker}
                   placeholder="8003"
                   value={addPort}
                   onChange={(e) => setAddPort(e.target.value)}
-                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-200 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-200 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none disabled:opacity-50"
                 />
               </div>
             </div>
@@ -877,15 +889,21 @@ export const WorkersTab: React.FC<{ api: any }> = ({ api }) => {
               <button
                 type="button"
                 onClick={() => setShowAddForm(false)}
-                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl text-xs font-bold transition focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
+                disabled={isAddingWorker}
+                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl text-xs font-bold transition focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none disabled:opacity-50"
               >
                 Cancel
               </button>
               <button
                 type="submit"
-                className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-xl text-xs font-bold transition focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
+                disabled={isAddingWorker || !addHost.trim()}
+                aria-busy={isAddingWorker}
+                aria-label={isAddingWorker ? 'Adding worker...' : 'Add Worker'}
+                title={isAddingWorker ? 'Adding worker...' : 'Add Worker'}
+                className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-xl text-xs font-bold transition focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none disabled:opacity-50"
               >
-                Add Worker
+                {isAddingWorker && <Loader2 size={14} className="animate-spin" aria-hidden="true" />}
+                {isAddingWorker ? 'Adding...' : 'Add Worker'}
               </button>
             </div>
           </form>
