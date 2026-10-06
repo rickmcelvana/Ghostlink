@@ -44,17 +44,19 @@ impl TcpTransport {
 
 impl Transport for TcpTransport {
     fn send_frame(&self, frame: &[u8]) -> io::Result<()> {
-        let mut s = self.stream.lock().map_err(|_| {
-            io::Error::other("lock poisoned on TcpTransport send")
-        })?;
+        let mut s = self
+            .stream
+            .lock()
+            .map_err(|_| io::Error::other("lock poisoned on TcpTransport send"))?;
         s.write_all(frame)?;
         s.flush()
     }
 
     fn recv_frame(&self, buf: &mut [u8]) -> io::Result<Option<usize>> {
-        let mut s = self.stream.lock().map_err(|_| {
-            io::Error::other("lock poisoned on TcpTransport recv")
-        })?;
+        let mut s = self
+            .stream
+            .lock()
+            .map_err(|_| io::Error::other("lock poisoned on TcpTransport recv"))?;
         match s.read(buf) {
             Ok(0) => Ok(None),
             Ok(n) => Ok(Some(n)),
@@ -98,17 +100,19 @@ impl UnixTransport {
 #[cfg(unix)]
 impl Transport for UnixTransport {
     fn send_frame(&self, frame: &[u8]) -> io::Result<()> {
-        let mut s = self.stream.lock().map_err(|_| {
-            io::Error::other("lock poisoned on UnixTransport send")
-        })?;
+        let mut s = self
+            .stream
+            .lock()
+            .map_err(|_| io::Error::other("lock poisoned on UnixTransport send"))?;
         s.write_all(frame)?;
         s.flush()
     }
 
     fn recv_frame(&self, buf: &mut [u8]) -> io::Result<Option<usize>> {
-        let mut s = self.stream.lock().map_err(|_| {
-            io::Error::other("lock poisoned on UnixTransport recv")
-        })?;
+        let mut s = self
+            .stream
+            .lock()
+            .map_err(|_| io::Error::other("lock poisoned on UnixTransport recv"))?;
         match s.read(buf) {
             Ok(0) => Ok(None),
             Ok(n) => Ok(Some(n)),
@@ -299,26 +303,24 @@ impl TransportManager {
                 metrics.set_active("tcp");
                 (None, false)
             }
-            TransportMode::Auto | TransportMode::Xdp => {
-                match XdpTransport::new(interface_name) {
-                    Ok(xdp) => {
-                        metrics.set_active("xdp");
-                        (Some(Arc::new(xdp)), true)
-                    }
-                    Err(err) => {
-                        if strict {
-                            return Err(err);
-                        } else {
-                            tracing::warn!(
+            TransportMode::Auto | TransportMode::Xdp => match XdpTransport::new(interface_name) {
+                Ok(xdp) => {
+                    metrics.set_active("xdp");
+                    (Some(Arc::new(xdp)), true)
+                }
+                Err(err) => {
+                    if strict {
+                        return Err(err);
+                    } else {
+                        tracing::warn!(
                                 "AF_XDP transport unavailable on interface '{}' ({err}); failing over to TCP",
                                 interface_name
                             );
-                            metrics.record_failover(err.to_string());
-                            (None, false)
-                        }
+                        metrics.record_failover(err.to_string());
+                        (None, false)
                     }
                 }
-            }
+            },
         };
 
         Ok(Self {
@@ -353,7 +355,10 @@ impl TransportManager {
     }
 
     pub fn handle_xdp_error(&self, reason: String) {
-        let mut err_count = self.consecutive_errors.lock().unwrap_or_else(|e| e.into_inner());
+        let mut err_count = self
+            .consecutive_errors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *err_count += 1;
 
         if *err_count >= self.max_consecutive_errors {
@@ -438,7 +443,9 @@ impl TransportManager {
                         *err_count = 0;
                     }
                     self.metrics.set_active("xdp");
-                    tracing::info!("AF_XDP probe succeeded over stable window; failing back to XDP transport");
+                    tracing::info!(
+                        "AF_XDP probe succeeded over stable window; failing back to XDP transport"
+                    );
                     return true;
                 }
             }
@@ -504,13 +511,8 @@ mod tests {
         let client_stream = TcpStream::connect(addr).unwrap();
         let (mut server_stream, _) = listener.accept().unwrap();
 
-        let mut mgr = TransportManager::new(
-            TransportMode::Tcp,
-            false,
-            "lo",
-            client_stream,
-        )
-        .unwrap();
+        let mut mgr =
+            TransportManager::new(TransportMode::Tcp, false, "lo", client_stream).unwrap();
 
         // Manually simulate primary XDP active
         if let Ok(xdp) = XdpTransport::new("lo") {
@@ -532,7 +534,8 @@ mod tests {
         }
 
         // Frames sent now go via TCP fallback
-        mgr.send_frame(frame_payload).expect("send over TCP fallback should succeed");
+        mgr.send_frame(frame_payload)
+            .expect("send over TCP fallback should succeed");
 
         let mut recv_buf = vec![0u8; 64];
         let n = server_stream.read(&mut recv_buf).unwrap();
