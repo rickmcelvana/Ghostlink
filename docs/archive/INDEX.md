@@ -6,6 +6,9 @@ Some archived files intentionally contain superseded status statements and shoul
 
 ## Archived Files
 
+- [CHANGELOG_AUDIT.md](CHANGELOG_AUDIT.md): historical changelog audit ledger.
+- [RELEASE_AUDIT_v2.0.0.md](RELEASE_AUDIT_v2.0.0.md): historical v2.0.0 release audit report.
+- [PLAN_LOCAL_ASSISTANT.md](PLAN_LOCAL_ASSISTANT.md): historical local assistant design plan.
 - [ENTERPRISE_PLAN.md](ENTERPRISE_PLAN.md): commercial trust and enterprise plan roadmap (archived out of active user docs).
 - [_archived/](../../_archived/): historical root documentation and legacy setup scripts preserved for reference.
 - [docs/archive/legacy-root-docs/GPU_CPU_SWITCHING_PLAN.md](legacy-root-docs/GPU_CPU_SWITCHING_PLAN.md)

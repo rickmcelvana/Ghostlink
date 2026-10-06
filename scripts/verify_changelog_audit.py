@@ -118,6 +118,8 @@ def main() -> int:
 
     root = Path(args.repo_root).resolve()
     audit = root / args.audit_file
+    if not audit.exists() and args.audit_file == "docs/CHANGELOG_AUDIT.md":
+        audit = root / "docs/archive/CHANGELOG_AUDIT.md"
     if not audit.exists():
         print(f"Audit file not found: {audit}", file=sys.stderr)
         return 1

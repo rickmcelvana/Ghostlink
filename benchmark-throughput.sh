@@ -10,7 +10,8 @@ echo "========================================"
 
 # Configuration
 ITERATIONS=3                    # Change this for more/less runs
-OUTPUT_CSV="throughput_results_$(date +%Y%m%d_%H%M%S).csv"
+mkdir -p benchmarks
+OUTPUT_CSV="benchmarks/throughput_results_$(date +%Y%m%d_%H%M%S).csv"
 
 # Kill any running instances
 echo "Cleaning up old processes..."
