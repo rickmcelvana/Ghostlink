@@ -23,8 +23,6 @@ third_party/mohawk_gui/certs/
 # Local runtime output and diagnostics artifacts
 tmp/
 artifacts/release/
-artifacts/*.tar.gz
-artifacts/*.json
 crates/ghostlink-gui/src-tauri/target/
 crates/ghostlink-gui/src-tauri/gen/schemas/
 
