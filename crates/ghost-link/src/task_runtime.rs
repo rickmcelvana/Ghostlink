@@ -359,56 +359,151 @@ impl Judge {
             return JudgeResult::Deny;
         }
 
-        let cmd_str = argv.join(" ");
+        let raw_prog = &argv[0];
+        let prog = Self::resolve_basename(raw_prog);
 
-        // Check explicit DENY rules first
-        if cmd_str.contains("rm -rf")
-            || cmd_str.contains("mkfs")
-            || cmd_str.contains("dd ")
-            || cmd_str.contains("format ")
-            || cmd_str.contains("git reset --hard")
-            || cmd_str.contains("git push --force")
-            || cmd_str.contains("git push -f")
-            || cmd_str.contains(".git/objects")
-            || cmd_str.contains(".env")
-            || cmd_str.contains("id_rsa")
-        {
+        // 1. Check Deny Intents across all argv elements
+        if Self::check_deny_intents(&prog, argv) {
             return JudgeResult::Deny;
         }
 
-        let first = argv[0].as_str();
-        if first == "curl"
-            || first == "wget"
-            || first == "scp"
-            || first == "ssh"
-            || first == "sudo"
-            || first == "su"
-            || first == "docker"
-            || first == "kubectl"
-        {
+        // 2. Check Hard-Deny executables/wrappers/shells
+        if Self::is_hard_denied_executable(&prog, argv) {
             return JudgeResult::Deny;
         }
 
-        // ALLOW table check
-        if Self::is_allowed(argv) {
+        // 3. Allow-list check
+        if Self::is_allowed(&prog, argv) {
             return JudgeResult::Allow;
         }
 
-        // Default to PAUSE for unrecognized commands
+        // 4. Default to PAUSE for unrecognized commands
         JudgeResult::Pause
     }
 
-    fn is_allowed(argv: &[String]) -> bool {
-        if argv.is_empty() {
-            return false;
+    fn resolve_basename(prog: &str) -> String {
+        let path = std::path::Path::new(prog);
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or(prog);
+        let name = name.strip_suffix(".exe").unwrap_or(name);
+        name.to_lowercase()
+    }
+
+    fn check_deny_intents(prog: &str, argv: &[String]) -> bool {
+        // Sensitive path access in any argument
+        for arg in argv {
+            if arg.contains(".env")
+                || arg.contains("id_rsa")
+                || arg.contains(".git/objects")
+                || arg.contains(r".git\objects")
+            {
+                return true;
+            }
         }
 
-        let prog = argv[0].as_str();
+        // Specific command deny intents
+        if prog == "dd" || prog == "mkfs" || prog.starts_with("mkfs.") {
+            return true;
+        }
+
+        // Recursive delete in any flag order for `rm`
+        if prog == "rm" {
+            for arg in &argv[1..] {
+                if arg == "--recursive" {
+                    return true;
+                }
+                if arg.starts_with('-')
+                    && !arg.starts_with("--")
+                    && (arg[1..].contains('r') || arg[1..].contains('R'))
+                {
+                    return true;
+                }
+            }
+        }
+
+        // `find` with -delete, -exec, -execdir
+        if prog == "find" {
+            for arg in &argv[1..] {
+                if arg == "-delete" || arg == "-exec" || arg == "-execdir" {
+                    return true;
+                }
+            }
+        }
+
+        // Git hard reset or force push
+        if prog == "git" {
+            let mut has_reset = false;
+            let mut has_hard = false;
+            let mut has_push = false;
+            let mut has_force = false;
+
+            for arg in &argv[1..] {
+                if arg == "reset" {
+                    has_reset = true;
+                }
+                if arg == "--hard" {
+                    has_hard = true;
+                }
+                if arg == "push" {
+                    has_push = true;
+                }
+                if arg == "-f"
+                    || arg == "--force"
+                    || arg == "--force-with-lease"
+                    || arg.starts_with("--force-with-lease=")
+                {
+                    has_force = true;
+                }
+            }
+            if has_reset && has_hard {
+                return true;
+            }
+            if has_push && has_force {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn is_hard_denied_executable(prog: &str, argv: &[String]) -> bool {
+        // Explicitly denied dangerous utilities
+        if matches!(
+            prog,
+            "curl" | "wget" | "scp" | "ssh" | "sudo" | "su" | "docker" | "kubectl"
+        ) {
+            return true;
+        }
+
+        // Wrappers
+        if matches!(prog, "env" | "xargs") {
+            return true;
+        }
+
+        // Shells and interpreters
+        if matches!(
+            prog,
+            "sh" | "bash" | "zsh" | "cmd" | "powershell" | "pwsh" | "node" | "perl" | "ruby"
+        ) {
+            return true;
+        }
+
+        // Python executables (python, python3, python3.11, etc.)
+        if prog == "python" || prog.starts_with("python") {
+            // Check if explicitly allow-listed (python -m pytest / python3 -m pytest)
+            if !Self::is_allowed(prog, argv) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn is_allowed(prog: &str, argv: &[String]) -> bool {
         match prog {
             "ls" | "rg" | "grep" => true,
             "git" => {
                 if argv.len() >= 2 {
-                    matches!(argv[1].as_str(), "status" | "diff" | "log")
+                    matches!(argv[1].as_str(), "status" | "diff" | "log" | "add")
                 } else {
                     false
                 }
@@ -425,7 +520,9 @@ impl Judge {
                     && ((argv[1] == "vitest" && argv[2] == "run")
                         || (argv[1] == "tsc" && argv[2] == "--noEmit"))
             }
-            "python" | "python3" => argv.len() >= 3 && argv[1] == "-m" && argv[2] == "pytest",
+            p if p == "python" || p.starts_with("python") => {
+                argv.len() >= 3 && argv[1] == "-m" && argv[2] == "pytest"
+            }
             _ => false,
         }
     }
@@ -2751,36 +2848,242 @@ mod tests {
 
     #[test]
     fn test_judge_policy() {
-        assert_eq!(
-            Judge::evaluate(&["ls".into(), "-la".into()]),
-            JudgeResult::Allow
-        );
-        assert_eq!(
-            Judge::evaluate(&["cargo".into(), "test".into()]),
-            JudgeResult::Allow
-        );
-        assert_eq!(
-            Judge::evaluate(&["git".into(), "status".into()]),
-            JudgeResult::Allow
-        );
+        struct TestCase {
+            argv: Vec<&'static str>,
+            expected: JudgeResult,
+            name: &'static str,
+        }
 
-        assert_eq!(
-            Judge::evaluate(&["rm".into(), "-rf".into(), "/".into()]),
-            JudgeResult::Deny
-        );
-        assert_eq!(
-            Judge::evaluate(&["curl".into(), "http://example.com".into()]),
-            JudgeResult::Deny
-        );
-        assert_eq!(
-            Judge::evaluate(&["sudo".into(), "reboot".into()]),
-            JudgeResult::Deny
-        );
+        let cases = vec![
+            // Allowed commands
+            TestCase {
+                argv: vec!["ls", "-la"],
+                expected: JudgeResult::Allow,
+                name: "ls -la",
+            },
+            TestCase {
+                argv: vec!["rg", "pattern"],
+                expected: JudgeResult::Allow,
+                name: "rg",
+            },
+            TestCase {
+                argv: vec!["grep", "foo"],
+                expected: JudgeResult::Allow,
+                name: "grep",
+            },
+            TestCase {
+                argv: vec!["git", "status"],
+                expected: JudgeResult::Allow,
+                name: "git status",
+            },
+            TestCase {
+                argv: vec!["git", "diff"],
+                expected: JudgeResult::Allow,
+                name: "git diff",
+            },
+            TestCase {
+                argv: vec!["git", "log"],
+                expected: JudgeResult::Allow,
+                name: "git log",
+            },
+            TestCase {
+                argv: vec!["git", "log", "--format=%H"],
+                expected: JudgeResult::Allow,
+                name: "git log --format=%H",
+            },
+            TestCase {
+                argv: vec!["git", "add", "."],
+                expected: JudgeResult::Allow,
+                name: "git add .",
+            },
+            TestCase {
+                argv: vec!["cargo", "test"],
+                expected: JudgeResult::Allow,
+                name: "cargo test",
+            },
+            TestCase {
+                argv: vec!["cargo", "check"],
+                expected: JudgeResult::Allow,
+                name: "cargo check",
+            },
+            TestCase {
+                argv: vec!["cargo", "clippy"],
+                expected: JudgeResult::Allow,
+                name: "cargo clippy",
+            },
+            TestCase {
+                argv: vec!["npx", "vitest", "run"],
+                expected: JudgeResult::Allow,
+                name: "npx vitest run",
+            },
+            TestCase {
+                argv: vec!["npx", "tsc", "--noEmit"],
+                expected: JudgeResult::Allow,
+                name: "npx tsc --noEmit",
+            },
+            TestCase {
+                argv: vec!["python", "-m", "pytest"],
+                expected: JudgeResult::Allow,
+                name: "python -m pytest",
+            },
+            TestCase {
+                argv: vec!["python3", "-m", "pytest"],
+                expected: JudgeResult::Allow,
+                name: "python3 -m pytest",
+            },
+            // Bypasses & Denied commands
+            TestCase {
+                argv: vec!["rm", "-rf", "/"],
+                expected: JudgeResult::Deny,
+                name: "rm -rf",
+            },
+            TestCase {
+                argv: vec!["rm", "-fr", "/"],
+                expected: JudgeResult::Deny,
+                name: "rm -fr",
+            },
+            TestCase {
+                argv: vec!["rm", "-r", "-f", "/"],
+                expected: JudgeResult::Deny,
+                name: "rm -r -f",
+            },
+            TestCase {
+                argv: vec!["rm", "--recursive", "/"],
+                expected: JudgeResult::Deny,
+                name: "rm --recursive",
+            },
+            TestCase {
+                argv: vec!["/bin/rm", "-rf", "file"],
+                expected: JudgeResult::Deny,
+                name: "full path rm",
+            },
+            TestCase {
+                argv: vec!["find", ".", "-delete"],
+                expected: JudgeResult::Deny,
+                name: "find -delete",
+            },
+            TestCase {
+                argv: vec!["find", ".", "-exec", "rm", "{}", "+"],
+                expected: JudgeResult::Deny,
+                name: "find -exec",
+            },
+            TestCase {
+                argv: vec!["sh", "-c", "whoami"],
+                expected: JudgeResult::Deny,
+                name: "sh",
+            },
+            TestCase {
+                argv: vec!["bash", "-c", "whoami"],
+                expected: JudgeResult::Deny,
+                name: "bash -c",
+            },
+            TestCase {
+                argv: vec!["zsh", "-c", "whoami"],
+                expected: JudgeResult::Deny,
+                name: "zsh",
+            },
+            TestCase {
+                argv: vec!["python", "-c", "import os"],
+                expected: JudgeResult::Deny,
+                name: "python -c",
+            },
+            TestCase {
+                argv: vec!["python3.11", "-c", "import os"],
+                expected: JudgeResult::Deny,
+                name: "python3.11 -c",
+            },
+            TestCase {
+                argv: vec!["node", "-e", "console.log(1)"],
+                expected: JudgeResult::Deny,
+                name: "node -e",
+            },
+            TestCase {
+                argv: vec!["env", "rm", "-rf", "."],
+                expected: JudgeResult::Deny,
+                name: "env rm",
+            },
+            TestCase {
+                argv: vec!["xargs", "rm"],
+                expected: JudgeResult::Deny,
+                name: "xargs rm",
+            },
+            TestCase {
+                argv: vec!["curl", "http://example.com"],
+                expected: JudgeResult::Deny,
+                name: "curl",
+            },
+            TestCase {
+                argv: vec!["wget", "http://example.com"],
+                expected: JudgeResult::Deny,
+                name: "wget",
+            },
+            TestCase {
+                argv: vec!["sudo", "reboot"],
+                expected: JudgeResult::Deny,
+                name: "sudo",
+            },
+            TestCase {
+                argv: vec!["dd", "if=/dev/zero", "of=/dev/null"],
+                expected: JudgeResult::Deny,
+                name: "dd",
+            },
+            TestCase {
+                argv: vec!["mkfs.ext4", "/dev/sda"],
+                expected: JudgeResult::Deny,
+                name: "mkfs",
+            },
+            TestCase {
+                argv: vec!["git", "reset", "--hard"],
+                expected: JudgeResult::Deny,
+                name: "git reset --hard",
+            },
+            TestCase {
+                argv: vec!["git", "push", "--force"],
+                expected: JudgeResult::Deny,
+                name: "git push --force",
+            },
+            TestCase {
+                argv: vec!["git", "push", "-f"],
+                expected: JudgeResult::Deny,
+                name: "git push -f",
+            },
+            TestCase {
+                argv: vec!["cat", ".env"],
+                expected: JudgeResult::Deny,
+                name: "cat .env",
+            },
+            TestCase {
+                argv: vec!["cat", "id_rsa"],
+                expected: JudgeResult::Deny,
+                name: "cat id_rsa",
+            },
+            TestCase {
+                argv: vec!["ls", ".git/objects"],
+                expected: JudgeResult::Deny,
+                name: "ls .git/objects",
+            },
+            // Unrecognized commands (Pause)
+            TestCase {
+                argv: vec!["custom_tool", "arg"],
+                expected: JudgeResult::Pause,
+                name: "custom_tool",
+            },
+            TestCase {
+                argv: vec!["npm", "start"],
+                expected: JudgeResult::Pause,
+                name: "npm start",
+            },
+        ];
 
-        assert_eq!(
-            Judge::evaluate(&["custom_tool".into(), "arg".into()]),
-            JudgeResult::Pause
-        );
+        for case in cases {
+            let argv_vec: Vec<String> = case.argv.into_iter().map(|s| s.to_string()).collect();
+            let result = Judge::evaluate(&argv_vec);
+            assert_eq!(
+                result, case.expected,
+                "Test case '{}' failed: expected {:?}, got {:?}",
+                case.name, case.expected, result
+            );
+        }
     }
 
     #[test]

@@ -134,6 +134,13 @@ This document summarizes current security assumptions for Ghost-Link runtime and
   keys remain in the hashed `api_keys.json` store and the OS keychain, and
   secrets are never written to the memory DB, to prompts, or to traces.
 
+- **Task Judge command policy layer** (`crates/ghost-link/src/task_runtime.rs`):
+  evaluates tool execution command arrays (`argv`) against deterministic allow-lists and hard-deny security intents.
+  The Task Judge matches on parsed `argv` (resolving executable basenames and checking flags/subcommands) to block
+  dangerous operations (e.g. recursive deletion, hard reset, force push, sensitive credential access like `.env` or `id_rsa`,
+  and unvetted shells/interpreters). **Note:** The Task Judge is a policy enforcement layer designed to block accidental
+  or unsafe command invocations; it is **not an OS-level isolation sandbox**.
+
 - **Non-blocking approval queue for gated tool calls** (since 2.4.0, `crates/ghost-link/src/approvals.rs`):
   `write` and `exec` calls are recorded as pending actions and surfaced to a
   review tray rather than stalling the chat turn. Three properties matter:
