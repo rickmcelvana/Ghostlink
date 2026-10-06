@@ -19,6 +19,7 @@ rust-version = "1.89.0"
 [features]
 default = []
 rocm = []
+af-xdp = []
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }

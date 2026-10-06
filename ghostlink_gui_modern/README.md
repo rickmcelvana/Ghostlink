@@ -16,7 +16,7 @@ Modern, responsive web-based frontend for Ghostlink Studio, replacing the dated 
 
 ### Prerequisites
 - Node.js 18+
-- npm (default: `package-lock.json` is the single canonical lockfile used by CI)
+- npm or yarn
 
 ### Development
 

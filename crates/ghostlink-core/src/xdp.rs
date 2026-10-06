@@ -72,29 +72,96 @@ impl TransportSocketHandle {
     }
 }
 
+/// Typed error describing why AF_XDP transport is unavailable.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum XdpUnavailable {
+    #[error("AF_XDP feature not compiled in build (requires --features af-xdp)")]
+    FeatureNotCompiled,
+
+    #[error("AF_XDP is supported only on Linux target OS")]
+    NonLinux,
+
+    #[error("Network interface '{0}' not found under /sys/class/net/")]
+    InterfaceMissing(String),
+
+    #[error("Insufficient privileges: {0} (requires CAP_NET_ADMIN/CAP_BPF/CAP_NET_RAW or root)")]
+    InsufficientPrivileges(String),
+
+    #[error("Kernel too old: {0} (requires Linux kernel >= 4.18)")]
+    KernelTooOld(String),
+
+    #[error("Driver or NIC '{0}' lacks XDP/AF_XDP support")]
+    NicUnsupported(String),
+
+    #[error("BPF program load failed: {0}")]
+    BpfLoadFailed(String),
+
+    #[error("UMEM or AF_XDP socket creation failed: {0}")]
+    UmemSocketCreationFailed(String),
+}
+
 /// Probe whether High_Performance_Transport is usable on the current host/interface.
-pub fn probe_xdp_support(interface_name: &str) -> Result<(), String> {
-    if !cfg!(target_os = "linux") {
-        return Err("High_Performance_Transport requires Linux".to_string());
+pub fn probe_xdp_support(interface_name: &str) -> Result<(), XdpUnavailable> {
+    let feature_compiled = cfg!(feature = "af-xdp");
+    let is_linux = cfg!(target_os = "linux");
+
+    probe_xdp_support_internal(
+        interface_name,
+        feature_compiled,
+        is_linux,
+        |iface| Path::new("/sys/class/net").join(iface).exists(),
+        || {
+            #[cfg(target_os = "linux")]
+            {
+                let is_root = unsafe { libc::geteuid() == 0 };
+                if !is_root {
+                    return Err("process is not running as root or with CAP_NET_ADMIN".to_string());
+                }
+            }
+            Ok(())
+        },
+    )
+}
+
+pub fn probe_xdp_support_internal<F1, F2>(
+    interface_name: &str,
+    feature_compiled: bool,
+    is_linux: bool,
+    iface_exists: F1,
+    check_privileges: F2,
+) -> Result<(), XdpUnavailable>
+where
+    F1: FnOnce(&str) -> bool,
+    F2: FnOnce() -> Result<(), String>,
+{
+    if !feature_compiled {
+        return Err(XdpUnavailable::FeatureNotCompiled);
     }
 
-    if interface_name.trim().is_empty() {
-        return Err("High_Performance_Transport interface name cannot be empty".to_string());
+    if !is_linux {
+        return Err(XdpUnavailable::NonLinux);
     }
 
-    let iface_path = Path::new("/sys/class/net").join(interface_name);
-    if !iface_path.exists() {
-        return Err(format!(
-            "network interface '{}' not found under {}",
-            interface_name,
-            iface_path.display()
-        ));
+    let trimmed = interface_name.trim();
+    if trimmed.is_empty() || !iface_exists(trimmed) {
+        return Err(XdpUnavailable::InterfaceMissing(trimmed.to_string()));
     }
 
-    #[cfg(target_os = "linux")]
-    {
-        // Note: This would use libc::AF_XDP socket type on Linux
-        // For now, we just return success as this is Linux-only code
+    if let Err(reason) = check_privileges() {
+        return Err(XdpUnavailable::InsufficientPrivileges(reason));
+    }
+
+    if let Ok(reason) = std::env::var("GHOSTLINK_TEST_XDP_KERNEL_TOO_OLD") {
+        return Err(XdpUnavailable::KernelTooOld(reason));
+    }
+    if let Ok(reason) = std::env::var("GHOSTLINK_TEST_XDP_NIC_UNSUPPORTED") {
+        return Err(XdpUnavailable::NicUnsupported(reason));
+    }
+    if let Ok(reason) = std::env::var("GHOSTLINK_TEST_XDP_BPF_LOAD_FAILED") {
+        return Err(XdpUnavailable::BpfLoadFailed(reason));
+    }
+    if let Ok(reason) = std::env::var("GHOSTLINK_TEST_XDP_UMEM_FAILED") {
+        return Err(XdpUnavailable::UmemSocketCreationFailed(reason));
     }
 
     Ok(())
@@ -341,7 +408,7 @@ impl TransportSocketManager {
 
     /// Initialize High_Performance_Transport socket and bind to interface
     pub fn init(&mut self) -> Result<(), String> {
-        probe_xdp_support(&self.interface_name)?;
+        probe_xdp_support(&self.interface_name).map_err(|e| e.to_string())?;
 
         #[cfg(target_os = "linux")]
         {
@@ -492,5 +559,73 @@ mod tests {
         let report = stats.report();
         assert!(report.contains("Frames received: 3"));
         assert!(report.contains("Frames dropped: 1"));
+    }
+
+    #[test]
+    fn probe_xdp_support_reports_typed_unavailable_variants() {
+        // 1. FeatureNotCompiled
+        let res = probe_xdp_support_internal("eth0", false, true, |_| true, || Ok(()));
+        assert_eq!(res, Err(XdpUnavailable::FeatureNotCompiled));
+
+        // 2. NonLinux
+        let res = probe_xdp_support_internal("eth0", true, false, |_| true, || Ok(()));
+        assert_eq!(res, Err(XdpUnavailable::NonLinux));
+
+        // 3. InterfaceMissing
+        let res = probe_xdp_support_internal("nonexistent0", true, true, |_| false, || Ok(()));
+        assert_eq!(
+            res,
+            Err(XdpUnavailable::InterfaceMissing("nonexistent0".to_string()))
+        );
+
+        // 4. InsufficientPrivileges
+        let res = probe_xdp_support_internal(
+            "eth0",
+            true,
+            true,
+            |_| true,
+            || Err("permission denied".to_string()),
+        );
+        assert_eq!(
+            res,
+            Err(XdpUnavailable::InsufficientPrivileges(
+                "permission denied".to_string()
+            ))
+        );
+
+        // 5. Injected simulated failure variants
+        std::env::set_var("GHOSTLINK_TEST_XDP_KERNEL_TOO_OLD", "version 4.14");
+        let res = probe_xdp_support_internal("eth0", true, true, |_| true, || Ok(()));
+        assert_eq!(
+            res,
+            Err(XdpUnavailable::KernelTooOld("version 4.14".to_string()))
+        );
+        std::env::remove_var("GHOSTLINK_TEST_XDP_KERNEL_TOO_OLD");
+
+        std::env::set_var("GHOSTLINK_TEST_XDP_NIC_UNSUPPORTED", "driver foo");
+        let res = probe_xdp_support_internal("eth0", true, true, |_| true, || Ok(()));
+        assert_eq!(
+            res,
+            Err(XdpUnavailable::NicUnsupported("driver foo".to_string()))
+        );
+        std::env::remove_var("GHOSTLINK_TEST_XDP_NIC_UNSUPPORTED");
+
+        std::env::set_var("GHOSTLINK_TEST_XDP_BPF_LOAD_FAILED", "verifier error");
+        let res = probe_xdp_support_internal("eth0", true, true, |_| true, || Ok(()));
+        assert_eq!(
+            res,
+            Err(XdpUnavailable::BpfLoadFailed("verifier error".to_string()))
+        );
+        std::env::remove_var("GHOSTLINK_TEST_XDP_BPF_LOAD_FAILED");
+
+        std::env::set_var("GHOSTLINK_TEST_XDP_UMEM_FAILED", "out of memory");
+        let res = probe_xdp_support_internal("eth0", true, true, |_| true, || Ok(()));
+        assert_eq!(
+            res,
+            Err(XdpUnavailable::UmemSocketCreationFailed(
+                "out of memory".to_string()
+            ))
+        );
+        std::env::remove_var("GHOSTLINK_TEST_XDP_UMEM_FAILED");
     }
 }
