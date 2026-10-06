@@ -757,22 +757,26 @@ pub struct TransportBatch {
     pub payload: Vec<f32>,
 }
 
-fn auth_tag(
+fn transport_hmac(
     source_stage: usize,
     batch_id: usize,
     tokens_in_batch: usize,
     payload: &[f32],
     token: &str,
-) -> [u8; 32] {
-    let mut mac = Hmac::<Sha256>::new_from_slice(token.as_bytes())
-        .expect("HMAC key setup for transport auth failed");
+) -> io::Result<Hmac<Sha256>> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(token.as_bytes()).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("HMAC key setup for transport auth failed: {e}"),
+        )
+    })?;
     mac.update(&(source_stage as u32).to_le_bytes());
     mac.update(&(batch_id as u64).to_le_bytes());
     mac.update(&(tokens_in_batch as u32).to_le_bytes());
     mac.update(&(payload.len() as u32).to_le_bytes());
     let payload_bytes = payload_as_le_bytes(payload);
     mac.update(payload_bytes.as_ref());
-    mac.finalize().into_bytes().into()
+    Ok(mac)
 }
 
 fn payload_as_le_bytes(payload: &[f32]) -> std::borrow::Cow<'_, [u8]> {
@@ -851,13 +855,14 @@ fn _write_transport_batch_inner(
         frame_buf.extend_from_slice(&gen.to_le_bytes());
     } else if let Some(t) = token {
         frame_buf.push(1); // legacy HMAC present
-        let tag = auth_tag(
+        let mac = transport_hmac(
             source_stage,
             batch.batch_id,
             batch.tokens_in_batch,
             &batch.payload,
             t,
-        );
+        )?;
+        let tag: [u8; 32] = mac.finalize().into_bytes().into();
         frame_buf.extend_from_slice(&tag);
     } else {
         frame_buf.push(0); // No auth
@@ -985,14 +990,14 @@ fn _read_transport_batch_inner(
             payload_buf.resize(payload_len, 0.0);
             _read_payload(reader, payload_buf, payload_len)?;
 
-            let expected_tag = auth_tag(
+            let mac = transport_hmac(
                 source_stage,
                 batch_id,
                 tokens_in_batch,
                 payload_buf,
                 token.unwrap(),
-            );
-            if received_tag != expected_tag {
+            )?;
+            if mac.verify_slice(&received_tag).is_err() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "transport auth tag mismatch",
@@ -2778,5 +2783,184 @@ mod tests {
             "open circuit breaker should skip connection attempts entirely, took {:?}",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn transport_hmac_tag_verification_and_bitflips() {
+        let token = "secret_transport_token";
+        let source_stage = 1usize;
+        let batch_id = 42usize;
+        let tokens_in_batch = 8usize;
+        let payload = vec![1.0f32, 2.5f32, -3.14f32, 0.0f32];
+
+        let batch = TransportBatch {
+            batch_id,
+            tokens_in_batch,
+            payload: payload.clone(),
+        };
+
+        // Serialize frame with write_transport_batch
+        let mut frame_buf = Vec::new();
+        let mut written_bytes = Vec::new();
+        write_transport_batch(
+            &mut written_bytes,
+            &batch,
+            source_stage,
+            Some(token),
+            &mut frame_buf,
+        )
+        .expect("writing batch should succeed");
+
+        // 1. Verify valid frame is read successfully
+        let mut read_payload_buf = Vec::new();
+        let mut reader = &written_bytes[..];
+        let read_batch = read_transport_batch(
+            &mut reader,
+            source_stage,
+            Some(token),
+            &mut read_payload_buf,
+        )
+        .expect("reading valid frame should succeed")
+        .expect("batch should be present");
+
+        assert_eq!(read_batch.batch_id, batch_id);
+        assert_eq!(read_batch.tokens_in_batch, tokens_in_batch);
+        assert_eq!(read_batch.payload, payload);
+
+        // Header format: source_stage(2) + batch_id(8) + tokens(4) + payload_len(4) + tag_type(1) = 19 bytes header
+        // Followed by 32 bytes tag, followed by float bytes payload.
+        let tag_offset = 19;
+        let payload_offset = 19 + 32;
+
+        // 2. Flip single bit in tag -> must be rejected
+        let mut corrupt_tag = written_bytes.clone();
+        corrupt_tag[tag_offset] ^= 0x01;
+        let mut reader = &corrupt_tag[..];
+        assert!(read_transport_batch(
+            &mut reader,
+            source_stage,
+            Some(token),
+            &mut read_payload_buf,
+        )
+        .is_err());
+
+        // 3. Flip single bit in payload -> must be rejected
+        let mut corrupt_payload = written_bytes.clone();
+        corrupt_payload[payload_offset] ^= 0x01;
+        let mut reader = &corrupt_payload[..];
+        assert!(read_transport_batch(
+            &mut reader,
+            source_stage,
+            Some(token),
+            &mut read_payload_buf,
+        )
+        .is_err());
+
+        // 4. Flip single bit in source_stage in header
+        let mut corrupt_stage = written_bytes.clone();
+        corrupt_stage[0] ^= 0x01;
+        let mut reader = &corrupt_stage[..];
+        assert!(read_transport_batch(
+            &mut reader,
+            source_stage,
+            Some(token),
+            &mut read_payload_buf,
+        )
+        .is_err());
+
+        // 5. Flip single bit in batch_id in header
+        let mut corrupt_batch_id = written_bytes.clone();
+        corrupt_batch_id[2] ^= 0x01;
+        let mut reader = &corrupt_batch_id[..];
+        assert!(read_transport_batch(
+            &mut reader,
+            source_stage,
+            Some(token),
+            &mut read_payload_buf,
+        )
+        .is_err());
+
+        // 6. Flip single bit in tokens_in_batch in header
+        let mut corrupt_tokens = written_bytes.clone();
+        corrupt_tokens[10] ^= 0x01;
+        let mut reader = &corrupt_tokens[..];
+        assert!(read_transport_batch(
+            &mut reader,
+            source_stage,
+            Some(token),
+            &mut read_payload_buf,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn transport_hmac_golden_vector_interop() {
+        let token = "golden_secret_key";
+        let source_stage = 2usize;
+        let batch_id = 100usize;
+        let tokens_in_batch = 4usize;
+        let payload = vec![1.0f32, 2.0f32];
+
+        let batch = TransportBatch {
+            batch_id,
+            tokens_in_batch,
+            payload: payload.clone(),
+        };
+
+        let mut frame_buf = Vec::new();
+        let mut written_bytes = Vec::new();
+        write_transport_batch(
+            &mut written_bytes,
+            &batch,
+            source_stage,
+            Some(token),
+            &mut frame_buf,
+        )
+        .expect("writing batch should succeed");
+
+        // Compute expected HMAC tag manually via transport_hmac
+        let mac = transport_hmac(source_stage, batch_id, tokens_in_batch, &payload, token)
+            .expect("transport_hmac setup");
+        let expected_tag: [u8; 32] = mac.finalize().into_bytes().into();
+
+        // Header check: 19 bytes total
+        // source_stage (u16 le): 2 -> [2, 0]
+        // batch_id (u64 le): 100 -> [100, 0, 0, 0, 0, 0, 0, 0]
+        // tokens_in_batch (u32 le): 4 -> [4, 0, 0, 0]
+        // payload_len (u32 le): 2 -> [2, 0, 0, 0]
+        // tag_type: 1 -> [1]
+        assert_eq!(&written_bytes[0..2], &[2, 0]);
+        assert_eq!(&written_bytes[2..10], &[100, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(&written_bytes[10..14], &[4, 0, 0, 0]);
+        assert_eq!(&written_bytes[14..18], &[2, 0, 0, 0]);
+        assert_eq!(written_bytes[18], 1);
+
+        // Tag check (bytes 19..51)
+        assert_eq!(&written_bytes[19..51], &expected_tag[..]);
+
+        // Payload check (bytes 51..59) -> 2 * 4 bytes f32 LE
+        let mut expected_payload_bytes = Vec::new();
+        expected_payload_bytes.extend_from_slice(&1.0f32.to_le_bytes());
+        expected_payload_bytes.extend_from_slice(&2.0f32.to_le_bytes());
+        assert_eq!(&written_bytes[51..59], &expected_payload_bytes[..]);
+
+        // Ensure total length is 19 + 32 + 8 = 59 bytes
+        assert_eq!(written_bytes.len(), 59);
+
+        // Verify receiver accepts this exact golden vector frame
+        let mut read_payload_buf = Vec::new();
+        let mut reader = &written_bytes[..];
+        let read_batch = read_transport_batch(
+            &mut reader,
+            source_stage,
+            Some(token),
+            &mut read_payload_buf,
+        )
+        .expect("reader accepts golden vector")
+        .expect("batch is present");
+
+        assert_eq!(read_batch.batch_id, batch_id);
+        assert_eq!(read_batch.tokens_in_batch, tokens_in_batch);
+        assert_eq!(read_batch.payload, payload);
     }
 }
