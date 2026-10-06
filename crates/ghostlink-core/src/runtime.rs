@@ -2791,7 +2791,7 @@ mod tests {
         let source_stage = 1usize;
         let batch_id = 42usize;
         let tokens_in_batch = 8usize;
-        let payload = vec![1.0f32, 2.5f32, -3.14f32, 0.0f32];
+        let payload = vec![1.0f32, 2.5f32, -3.5f32, 0.0f32];
 
         let batch = TransportBatch {
             batch_id,
