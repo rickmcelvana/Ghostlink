@@ -19,7 +19,6 @@ rust-version = "1.89.0"
 default = []
 cuda = []
 rocm = ["ghostlink-core/rocm"]
-af-xdp = ["ghostlink-core/af-xdp"]
 
 [dependencies]
 ghostlink-core = { path = "../ghostlink-core", version = "2.3.0" }
