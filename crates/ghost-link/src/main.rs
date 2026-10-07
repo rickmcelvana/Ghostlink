@@ -9761,6 +9761,11 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         }))
     }
 
+    async fn handle_inference_metrics() -> Json<serde_json::Value> {
+        let snapshot = native_engine::get_inference_metrics_snapshot();
+        Json(serde_json::to_value(&snapshot).unwrap_or_default())
+    }
+
     async fn handle_inference_engines(
         State(state): State<Arc<Mutex<BackendState>>>,
     ) -> Json<serde_json::Value> {
@@ -10842,7 +10847,30 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                         let result = tokio::task::spawn_blocking({
                             let engine = engine.clone();
                             let path = path_for_load.clone();
-                            move || engine.load_model_into_slot(&path, None, None, None)
+                            move || {
+                                let rpc = std::env::var("GHOSTLINK_RPC_SERVERS")
+                                    .ok()
+                                    .filter(|s| !s.trim().is_empty());
+                                let split = std::env::var("GHOSTLINK_TENSOR_SPLIT")
+                                    .ok()
+                                    .filter(|s| !s.trim().is_empty());
+                                let override_ot = std::env::var("GHOSTLINK_RPC_TENSOR_OVERRIDE")
+                                    .ok()
+                                    .filter(|s| !s.trim().is_empty())
+                                    .or_else(|| {
+                                        if rpc.is_some() {
+                                            Some("ffn=RPC,exps=RPC".to_string())
+                                        } else {
+                                            None
+                                        }
+                                    });
+                                engine.load_model_into_slot(
+                                    &path,
+                                    rpc.as_deref(),
+                                    split.as_deref(),
+                                    override_ot.as_deref(),
+                                )
+                            }
                         })
                         .await;
                         // Release on every outcome, including failure, so a failed load can
@@ -13251,6 +13279,7 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                 "/api/inference/approvals/:id/decide",
                 post(handle_approval_decide),
             )
+            .route("/api/inference/metrics", get(handle_inference_metrics))
             .route("/api/inference/engines", get(handle_inference_engines))
             .route(
                 "/api/mcp/servers",
