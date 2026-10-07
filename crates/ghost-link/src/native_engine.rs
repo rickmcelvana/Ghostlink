@@ -600,6 +600,26 @@ impl NativeEngineClient {
         })
     }
 
+    pub fn validate_context_admission(
+        prompt: &str,
+        max_tokens: usize,
+        per_slot_budget: u32,
+    ) -> Result<(), String> {
+        if per_slot_budget == 0 {
+            return Ok(());
+        }
+        // Roughly 1.35 tokens per word estimate
+        let words = prompt.split_whitespace().count();
+        let estimated_prompt_tokens = ((words as f32 * 1.35) as u32).max(1);
+        let estimated_total = estimated_prompt_tokens + (max_tokens as u32);
+        if estimated_total > per_slot_budget {
+            return Err(format!(
+                "Request estimated context ({estimated_total} tokens) exceeds per-slot context budget ({per_slot_budget} tokens)"
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn probe_running_ctx_size() -> u32 {
         let base = Self::get_llama_base_url();
         let url = format!("{}/props", base.trim_end_matches('/'));
@@ -1091,8 +1111,12 @@ impl NativeEngineClient {
     /// exactly. The hash is stable across processes (FNV-1a, not `DefaultHasher`,
     /// whose seed is randomized per process).
     pub(crate) fn slot_for_session(session_id: &str, parallel_slots: usize) -> Option<i64> {
-        if parallel_slots <= 1 || session_id.is_empty() {
+        if session_id.is_empty() {
             return None;
+        }
+        let slots = parallel_slots.max(1);
+        if slots == 1 {
+            return Some(0);
         }
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         for byte in session_id.as_bytes() {
@@ -2067,6 +2091,13 @@ impl NativeEngineClient {
         cache_prompt: bool,
         response_format: Option<serde_json::Value>,
     ) -> Result<NativeGeneration, String> {
+        let per_slot_budget = Self::running_ctx_size();
+        if let Err(e) =
+            Self::validate_context_admission(cleaned_prompt, max_tokens, per_slot_budget)
+        {
+            eprintln!("[admission-control] Request rejected: {e}");
+            return Err(e);
+        }
         let base_url = Self::get_llama_base_url();
 
         let timeout_secs = std::env::var("GHOSTLINK_LLAMA_SERVER_TIMEOUT_SECS")
@@ -2263,6 +2294,13 @@ impl NativeEngineClient {
     ) -> Result<NativeChatStream, String> {
         use futures::StreamExt;
 
+        let per_slot_budget = Self::running_ctx_size();
+        if let Err(e) =
+            Self::validate_context_admission(cleaned_prompt, max_tokens, per_slot_budget)
+        {
+            eprintln!("[admission-control] Request rejected: {e}");
+            return Err(e);
+        }
         let base_url = Self::get_llama_base_url();
         // Time to wait for llama-server to accept the request and start
         // responding (covers prompt prefill on a cold/uncached slot), not
@@ -2471,6 +2509,107 @@ struct LlamaStreamDelta {
     content: Option<String>,
 }
 
+pub static METRICS_CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static METRICS_CACHE_MISSES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static METRICS_PROMPT_TOKENS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static METRICS_PROMPT_TIME_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static METRICS_DECODE_TOKENS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static METRICS_DECODE_TIME_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static METRICS_TTFT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static METRICS_REQUEST_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct InferenceMetricsSnapshot {
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub cache_hit_rate: f32,
+    pub total_prompt_tokens: u64,
+    pub total_prompt_time_ms: u64,
+    pub avg_prompt_tokens_per_sec: f32,
+    pub total_decode_tokens: u64,
+    pub total_decode_time_ms: u64,
+    pub avg_decode_tokens_per_sec: f32,
+    pub avg_ttft_ms: f32,
+    pub total_requests: u64,
+}
+
+pub fn get_inference_metrics_snapshot() -> InferenceMetricsSnapshot {
+    use std::sync::atomic::Ordering;
+    let hits = METRICS_CACHE_HITS.load(Ordering::Relaxed);
+    let misses = METRICS_CACHE_MISSES.load(Ordering::Relaxed);
+    let total_reqs = METRICS_REQUEST_COUNT.load(Ordering::Relaxed);
+    let total_hits_misses = hits + misses;
+    let hit_rate = if total_hits_misses > 0 {
+        hits as f32 / total_hits_misses as f32
+    } else {
+        0.0
+    };
+    let prompt_toks = METRICS_PROMPT_TOKENS.load(Ordering::Relaxed);
+    let prompt_ms = METRICS_PROMPT_TIME_MS.load(Ordering::Relaxed);
+    let avg_prompt_tps = if prompt_ms > 0 {
+        prompt_toks as f32 / (prompt_ms as f32 / 1000.0)
+    } else {
+        0.0
+    };
+    let decode_toks = METRICS_DECODE_TOKENS.load(Ordering::Relaxed);
+    let decode_ms = METRICS_DECODE_TIME_MS.load(Ordering::Relaxed);
+    let avg_decode_tps = if decode_ms > 0 {
+        decode_toks as f32 / (decode_ms as f32 / 1000.0)
+    } else {
+        0.0
+    };
+    let ttft_ms = METRICS_TTFT_MS.load(Ordering::Relaxed);
+    let avg_ttft = if total_reqs > 0 {
+        ttft_ms as f32 / total_reqs as f32
+    } else {
+        0.0
+    };
+
+    InferenceMetricsSnapshot {
+        cache_hits: hits,
+        cache_misses: misses,
+        cache_hit_rate: hit_rate,
+        total_prompt_tokens: prompt_toks,
+        total_prompt_time_ms: prompt_ms,
+        avg_prompt_tokens_per_sec: avg_prompt_tps,
+        total_decode_tokens: decode_toks,
+        total_decode_time_ms: decode_ms,
+        avg_decode_tokens_per_sec: avg_decode_tps,
+        avg_ttft_ms: avg_ttft,
+        total_requests: total_reqs,
+    }
+}
+
+pub fn record_inference_metrics(
+    prompt_toks: u32,
+    prompt_ms: f32,
+    decode_toks: u32,
+    decode_ms: f32,
+    ttft_ms: Option<f32>,
+) {
+    use std::sync::atomic::Ordering;
+    let is_hit = prompt_toks > 0 && (prompt_ms < 15.0 || (prompt_ms / (prompt_toks as f32)) < 0.1);
+    if is_hit {
+        METRICS_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+    } else if prompt_toks > 0 {
+        METRICS_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+    }
+    METRICS_PROMPT_TOKENS.fetch_add(prompt_toks as u64, Ordering::Relaxed);
+    METRICS_PROMPT_TIME_MS.fetch_add(prompt_ms as u64, Ordering::Relaxed);
+    METRICS_DECODE_TOKENS.fetch_add(decode_toks as u64, Ordering::Relaxed);
+    METRICS_DECODE_TIME_MS.fetch_add(decode_ms as u64, Ordering::Relaxed);
+    if let Some(ttft) = ttft_ms {
+        METRICS_TTFT_MS.fetch_add(ttft as u64, Ordering::Relaxed);
+    }
+    METRICS_REQUEST_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
 fn generation_from_llama_json(parsed: &serde_json::Value) -> Option<NativeGeneration> {
     let mut text = parsed
         .get("content")
@@ -2494,6 +2633,13 @@ fn generation_from_llama_json(parsed: &serde_json::Value) -> Option<NativeGenera
     let text = text?;
     let (tokens_generated, tokens_per_sec, latency_ms) = parse_llama_timings(parsed, &text);
     let prompt = parse_prompt_timings(parsed);
+    record_inference_metrics(
+        prompt.prompt_tokens.unwrap_or(0),
+        prompt.prompt_ms.unwrap_or(0.0),
+        tokens_generated.unwrap_or(0),
+        latency_ms.unwrap_or(0.0),
+        latency_ms,
+    );
     Some(NativeGeneration {
         text,
         real_inference: true,
@@ -2711,9 +2857,23 @@ mod tests {
     /// With a single slot there is nothing to pin — must keep llama-server's
     /// own auto (`-1`) behavior exactly as before.
     #[test]
+    fn admission_control_rejects_oversized_requests() {
+        let budget = 2048u32;
+        let short_prompt = "Hello, how are you today?";
+        assert!(NativeEngineClient::validate_context_admission(short_prompt, 512, budget).is_ok());
+
+        let long_prompt = "word ".repeat(2000);
+        let result = NativeEngineClient::validate_context_admission(&long_prompt, 1024, budget);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("exceeds per-slot context budget"));
+    }
+
+    #[test]
     fn slot_for_session_is_none_with_a_single_slot() {
-        assert_eq!(NativeEngineClient::slot_for_session("sess_a", 1), None);
-        assert_eq!(NativeEngineClient::slot_for_session("sess_a", 0), None);
+        assert_eq!(NativeEngineClient::slot_for_session("sess_a", 1), Some(0));
+        assert_eq!(NativeEngineClient::slot_for_session("sess_a", 0), Some(0));
         assert_eq!(NativeEngineClient::slot_for_session("", 8), None);
     }
 
