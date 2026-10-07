@@ -262,4 +262,50 @@ describe('WorkersTab', () => {
       expect(screen.getByRole('button', { name: 'Discover LAN peers' })).not.toBeDisabled();
     });
   });
+
+  it('shows loading state, aria-busy, disabled inputs, and "Adding..." label during worker creation submit', async () => {
+    let resolveAddWorker: (val: any) => void = () => {};
+    const addWorkerPromise = new Promise((resolve) => {
+      resolveAddWorker = resolve;
+    });
+
+    const api = createMockApi({
+      addWorker: vi.fn().mockImplementation(() => addWorkerPromise),
+    });
+
+    render(<WorkersTab api={api} />);
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Add worker manually' })).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Add worker manually' }));
+
+    await waitFor(() => {
+      expect(screen.getByText('Add Worker Manually')).toBeInTheDocument();
+    });
+
+    const hostInput = screen.getByPlaceholderText('e.g. 192.168.1.100');
+    fireEvent.change(hostInput, { target: { value: '192.168.1.150' } });
+
+    const submitBtn = screen.getByRole('button', { name: 'Add Worker' });
+    expect(submitBtn).toHaveAttribute('aria-busy', 'false');
+
+    fireEvent.click(submitBtn);
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Adding worker...' })).toBeInTheDocument();
+    });
+
+    const busySubmitBtn = screen.getByRole('button', { name: 'Adding worker...' });
+    expect(busySubmitBtn).toHaveAttribute('aria-busy', 'true');
+    expect(busySubmitBtn).toBeDisabled();
+    expect(hostInput).toBeDisabled();
+
+    resolveAddWorker({ success: true });
+
+    await waitFor(() => {
+      expect(screen.queryByText('Add Worker Manually')).not.toBeInTheDocument();
+    });
+  });
 });
