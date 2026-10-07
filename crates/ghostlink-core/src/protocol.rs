@@ -349,9 +349,19 @@ impl NodeResources {
             return Err("payload truncated".into());
         }
         // Optimize: Direct slice conversion for primitive float fields without redundant bounds checks or error mapping.
-        let vram_gb = f32::from_le_bytes(payload[cursor..cursor + 4].try_into().unwrap());
-        let system_memory_gb =
-            f32::from_le_bytes(payload[cursor + 4..cursor + 8].try_into().unwrap());
+        // Optimize: Direct array indexing for primitive float fields without slice try_into or unwrap overhead.
+        let vram_gb = f32::from_le_bytes([
+            payload[cursor],
+            payload[cursor + 1],
+            payload[cursor + 2],
+            payload[cursor + 3],
+        ]);
+        let system_memory_gb = f32::from_le_bytes([
+            payload[cursor + 4],
+            payload[cursor + 5],
+            payload[cursor + 6],
+            payload[cursor + 7],
+        ]);
         cursor = vram_end;
 
         if cursor >= len {
@@ -404,12 +414,9 @@ impl NodeResources {
         // correctly decodes as "no RPC contribution advertised" rather than
         // an error.
         // Optimize: Use slice try_into for u16 decoding to trigger unaligned single-instruction loads.
+        // Optimize: Direct 2-byte array indexing for u16 decoding, eliminating try_into and map_err.
         let rpc_port = if cursor + 2 <= len {
-            let port = u16::from_le_bytes(
-                payload[cursor..cursor + 2]
-                    .try_into()
-                    .map_err(|_| "rpc_port parsing failed")?,
-            );
+            let port = u16::from_le_bytes([payload[cursor], payload[cursor + 1]]);
             cursor += 2;
             if port == 0 {
                 None
@@ -492,9 +499,9 @@ impl DiscoveryFrame {
                 version: PROTOCOL_VERSION,
                 crc,
             };
-            if let Ok(header_buf) = (&mut buf[..8]).try_into() {
-                header.encode_into(header_buf);
-            }
+            // Optimize: Direct slice conversion for fixed 8-byte header buffer without Result branch checks.
+            let header_buf: &mut [u8; 8] = (&mut buf[..8]).try_into().unwrap();
+            header.encode_into(header_buf);
 
             buf.len()
         } else {
@@ -506,9 +513,8 @@ impl DiscoveryFrame {
                 version: PROTOCOL_VERSION,
                 crc: crc32(&[]),
             };
-            if let Ok(header_buf) = (&mut buf[..8]).try_into() {
-                header.encode_into(header_buf);
-            }
+            let header_buf: &mut [u8; 8] = (&mut buf[..8]).try_into().unwrap();
+            header.encode_into(header_buf);
             buf.len()
         }
     }
