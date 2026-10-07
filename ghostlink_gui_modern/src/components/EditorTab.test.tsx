@@ -219,7 +219,9 @@ describe('EditorTab', () => {
       expect(screen.getByTestId('diff-modified')).toHaveTextContent('# Hello, fixed');
     });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Accept' }));
+    const acceptBtn = screen.getByRole('button', { name: 'Accept proposed changes for README.md' });
+    expect(acceptBtn).toHaveAttribute('title', 'Accept proposed changes for README.md');
+    fireEvent.click(acceptBtn);
 
     await waitFor(() => {
       expect(api.writeWorkspaceFile).toHaveBeenCalledWith('README.md', '# Hello, fixed');
@@ -241,7 +243,9 @@ describe('EditorTab', () => {
     fireEvent.click(screen.getByRole('button', { name: /Refactor/ }));
     await waitFor(() => expect(screen.getByTestId('mock-diff-editor')).toBeInTheDocument());
 
-    fireEvent.click(screen.getByRole('button', { name: 'Reject' }));
+    const rejectBtn = screen.getByRole('button', { name: 'Reject proposed changes for README.md' });
+    expect(rejectBtn).toHaveAttribute('title', 'Reject proposed changes for README.md');
+    fireEvent.click(rejectBtn);
 
     await waitFor(() => {
       expect(screen.queryByTestId('mock-diff-editor')).not.toBeInTheDocument();
@@ -259,7 +263,9 @@ describe('EditorTab', () => {
     await waitFor(() => expect(screen.getByText('README.md')).toBeInTheDocument());
 
     fireEvent.click(screen.getByLabelText('Select README.md for multi-file refactor'));
-    const refactorButton = await screen.findByRole('button', { name: /Refactor Selected/ });
+    const refactorButton = await screen.findByRole('button', { name: 'Refactor 1 selected file' });
+    expect(refactorButton).toHaveAttribute('title', 'Refactor 1 selected file using AI');
+    expect(refactorButton).toHaveAttribute('aria-busy', 'false');
     fireEvent.click(refactorButton);
 
     await waitFor(() => {
@@ -272,7 +278,9 @@ describe('EditorTab', () => {
       expect(screen.getByTestId('diff-modified')).toHaveTextContent('# Hello, multi-refactored');
     });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Accept' }));
+    const acceptBtn = screen.getByRole('button', { name: 'Accept proposed changes for README.md' });
+    expect(acceptBtn).toHaveAttribute('title', 'Accept proposed changes for README.md');
+    fireEvent.click(acceptBtn);
 
     await waitFor(() => {
       expect(api.writeWorkspaceFile).toHaveBeenCalledWith('README.md', '# Hello, multi-refactored');
@@ -280,16 +288,17 @@ describe('EditorTab', () => {
     });
   });
 
-  it('toggles the ghost-text autocomplete button state', async () => {
+  it('toggles the ghost-text autocomplete button state and updates ARIA labels', async () => {
     const api = createMockApi();
     render(<EditorTab api={api} />);
     await waitFor(() => expect(screen.getByText('README.md')).toBeInTheDocument());
 
-    const toggle = screen.getByRole('button', { name: 'Ghost-text autocomplete' });
+    const toggle = screen.getByRole('button', { name: 'Enable ghost-text autocomplete' });
     expect(toggle).toHaveAttribute('aria-pressed', 'false');
 
     fireEvent.click(toggle);
     expect(toggle).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('button', { name: 'Disable ghost-text autocomplete' })).toBeInTheDocument();
   });
 
   it('shows an error toast when opening a file fails', async () => {
