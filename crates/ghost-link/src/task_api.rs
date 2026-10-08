@@ -334,9 +334,9 @@ impl AgentBackend for RealAgentBackend {
                         1.1,
                         &settings.native_engine,
                         &[],
-                        Some("task_agent_session"),
                         None,
-                        true,
+                        None,
+                        false,
                         None,
                     )
                     .await
