@@ -8,10 +8,10 @@
 //! - Prefetching in hot paths for cache-friendly access
 //! - Optimal cache-line padding (128 bytes) to avoid false sharing
 
-use std::cell::UnsafeCell;
-use std::mem::MaybeUninit;
 #[cfg(loom)]
 use loom::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::UnsafeCell;
+use std::mem::MaybeUninit;
 #[cfg(not(loom))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
