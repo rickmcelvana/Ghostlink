@@ -11,7 +11,7 @@ build:
 # ─── Test ───
 test:
 	cargo test --release -p ghost-link -p ghostlink-core
-	cd ghostlink_gui_modern && npm ci --legacy-peer-deps && npm test
+	cd ghostlink_gui_modern && npm test
 	cd control-plane && go test ./...
 
 # ─── Docker ───

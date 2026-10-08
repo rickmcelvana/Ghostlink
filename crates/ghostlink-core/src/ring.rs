@@ -8,8 +8,11 @@
 //! - Prefetching in hot paths for cache-friendly access
 //! - Optimal cache-line padding (128 bytes) to avoid false sharing
 
+#[cfg(loom)]
+use loom::sync::atomic::{AtomicUsize, Ordering};
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
+#[cfg(not(loom))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Ring buffer configuration with backpressure thresholds
@@ -31,6 +34,9 @@ impl Default for RingConfig {
 }
 
 /// Fixed capacity used for DMA alignment (power of 2 for fast modulo)
+#[cfg(loom)]
+const RING_CAPACITY: usize = 16;
+#[cfg(not(loom))]
 const RING_CAPACITY: usize = 4096;
 const CACHE_LINE: usize = 128; // 128-byte cache lines on modern x86/ARM
 
@@ -156,8 +162,8 @@ impl<T> SpscRingBuffer<T> {
 
         // Write the value at tail position
         unsafe {
-            let buf = &mut *self.buffer.get();
-            buf.get_unchecked_mut(tail).write(value);
+            let buf_ptr = self.buffer.get() as *mut std::mem::MaybeUninit<T>;
+            (*buf_ptr.add(tail)).write(value);
 
             // Release store to make write visible to consumer
             self.tail.store(next_tail, Ordering::Release);
@@ -190,8 +196,8 @@ impl<T> SpscRingBuffer<T> {
 
         // Read the value at head position
         let value = unsafe {
-            let buf = &mut *self.buffer.get();
-            let val = buf.get_unchecked(head).assume_init_read();
+            let buf_ptr = self.buffer.get() as *const std::mem::MaybeUninit<T>;
+            let val = (*buf_ptr.add(head)).assume_init_read();
 
             // Release store to make read visible to producer
             self.head
@@ -362,13 +368,9 @@ impl<T> SpscRingBuffer<T> {
                 .fetch_add(slice.len() - count, Ordering::Relaxed);
         }
 
-        let buf = unsafe { &mut *self.buffer.get() };
+        let buf_ptr = self.buffer.get() as *mut T;
         let mask = Self::CAPACITY - 1;
         let start = tail & mask;
-
-        // Optimize batch write by using direct contiguous memory copying via copy_nonoverlapping
-        // instead of a per-element write loop with modulo and prefetching checks.
-        let buf_ptr = buf.as_mut_ptr() as *mut T;
         if start + count <= Self::CAPACITY {
             unsafe {
                 std::ptr::copy_nonoverlapping(slice.as_ptr(), buf_ptr.add(start), count);
@@ -413,13 +415,9 @@ impl<T> SpscRingBuffer<T> {
             return 0;
         }
 
-        let buf = unsafe { &mut *self.buffer.get() };
+        let buf_ptr = self.buffer.get() as *const T;
         let mask = Self::CAPACITY - 1;
         let start = head & mask;
-
-        // Optimize batch read by using direct contiguous memory copying via copy_nonoverlapping
-        // instead of a per-element read loop with modulo and prefetching checks.
-        let buf_ptr = buf.as_ptr() as *const T;
         let out_ptr = out.as_mut_ptr() as *mut T;
         if start + count <= Self::CAPACITY {
             unsafe {

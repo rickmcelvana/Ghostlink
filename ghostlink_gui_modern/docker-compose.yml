@@ -1,15 +1,32 @@
 version: '3.8'
 
 services:
-  # Ghostlink Backend
   ghostlink-backend:
     image: ghostlink:latest
     container_name: ghostlink-backend
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+      - /var/tmp
     ports:
       - "8003:8003"
     environment:
-      - LOG_LEVEL=info
-      - WORKERS=4
+      GHOSTLINK_SETTINGS_PATH: "/tmp/settings.json"
+      GHOSTLINK_API_KEY_PATH: "/tmp/api_key.txt"
+      GHOSTLINK_API_KEYS_PATH: "/tmp/api_keys.json"
+      GHOSTLINK_MODELS_PATH: "/tmp/models.json"
+      GHOSTLINK_SESSIONS_PATH: "/tmp/sessions.json"
+      GHOSTLINK_SESSION_SUMMARIES_PATH: "/tmp/session_summaries.json"
+      GHOSTLINK_SCHEDULES_PATH: "/tmp/schedules.json"
+      GHOSTLINK_APPROVALS_PATH: "/tmp/approvals.json"
+      GHOSTLINK_DATA_DIR: "/tmp/data"
+      GHOSTLINK_JWT_SECRET_PATH: "/tmp/jwt_secret.txt"
+      LOG_LEVEL: info
+      WORKERS: "4"
     volumes:
       - ghostlink-models:/home/ghostlink/.cache/models
       - ghostlink-data:/home/ghostlink/data
@@ -23,16 +40,33 @@ services:
       - ghostlink
     restart: unless-stopped
 
-  # Ghostlink Studio GUI
   ghostlink-gui:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: ghostlink-gui
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+      - /var/tmp
     ports:
       - "5173:5173"
     environment:
-      - GHOSTLINK_API_BASE=http://127.0.0.1:8003
+      GHOSTLINK_SETTINGS_PATH: "/tmp/settings.json"
+      GHOSTLINK_API_KEY_PATH: "/tmp/api_key.txt"
+      GHOSTLINK_API_KEYS_PATH: "/tmp/api_keys.json"
+      GHOSTLINK_MODELS_PATH: "/tmp/models.json"
+      GHOSTLINK_SESSIONS_PATH: "/tmp/sessions.json"
+      GHOSTLINK_SESSION_SUMMARIES_PATH: "/tmp/session_summaries.json"
+      GHOSTLINK_SCHEDULES_PATH: "/tmp/schedules.json"
+      GHOSTLINK_APPROVALS_PATH: "/tmp/approvals.json"
+      GHOSTLINK_DATA_DIR: "/tmp/data"
+      GHOSTLINK_JWT_SECRET_PATH: "/tmp/jwt_secret.txt"
+      GHOSTLINK_API_BASE: http://127.0.0.1:8003
     depends_on:
       ghostlink-backend:
         condition: service_healthy

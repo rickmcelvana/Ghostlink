@@ -4,9 +4,27 @@ services:
   llama-server:
     image: ghcr.io/ggml-org/llama.cpp:server
     container_name: ghostlink-llama-server
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+      - /var/tmp
     ports:
       - "8080:8080"
     environment:
+      GHOSTLINK_SETTINGS_PATH: "/tmp/settings.json"
+      GHOSTLINK_API_KEY_PATH: "/tmp/api_key.txt"
+      GHOSTLINK_API_KEYS_PATH: "/tmp/api_keys.json"
+      GHOSTLINK_MODELS_PATH: "/tmp/models.json"
+      GHOSTLINK_SESSIONS_PATH: "/tmp/sessions.json"
+      GHOSTLINK_SESSION_SUMMARIES_PATH: "/tmp/session_summaries.json"
+      GHOSTLINK_SCHEDULES_PATH: "/tmp/schedules.json"
+      GHOSTLINK_APPROVALS_PATH: "/tmp/approvals.json"
+      GHOSTLINK_DATA_DIR: "/tmp/data"
+      GHOSTLINK_JWT_SECRET_PATH: "/tmp/jwt_secret.txt"
       LLAMA_ARG_HOST: 0.0.0.0
       LLAMA_ARG_PORT: 8080
       LLAMA_ARG_NGL: ${LLAMA_ARG_NGL:--1}
@@ -30,9 +48,27 @@ services:
       context: .
       dockerfile: Dockerfile.ghostlink
     container_name: ghostlink-api
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+      - /var/tmp
     ports:
       - "8003:8003"
     environment:
+      GHOSTLINK_SETTINGS_PATH: "/tmp/settings.json"
+      GHOSTLINK_API_KEY_PATH: "/shared/api_key.txt"
+      GHOSTLINK_API_KEYS_PATH: "/shared/api_keys.json"
+      GHOSTLINK_MODELS_PATH: "/tmp/models.json"
+      GHOSTLINK_SESSIONS_PATH: "/state/sessions.json"
+      GHOSTLINK_SESSION_SUMMARIES_PATH: "/state/session_summaries.json"
+      GHOSTLINK_SCHEDULES_PATH: "/state/schedules.json"
+      GHOSTLINK_APPROVALS_PATH: "/state/approvals.json"
+      GHOSTLINK_DATA_DIR: "/tmp/data"
+      GHOSTLINK_JWT_SECRET_PATH: "/tmp/jwt_secret.txt"
       RUST_LOG: info
       GHOSTLINK_HOST: 0.0.0.0
       GHOSTLINK_PORT: 8003
@@ -41,14 +77,14 @@ services:
       GHOSTLINK_LLAMA_SERVER_URL: http://llama-server:8080/completion
     networks:
       - ghostlink-network
+    volumes:
+      - ghostlink-auth:/shared
+      - ghostlink-state:/state
     depends_on:
       llama-server:
         condition: service_healthy
     command: serve 0.0.0.0 8003
     healthcheck:
-      # -k: binding 0.0.0.0 forces ghost-link's TLS-on-non-loopback rule
-      # (crates/ghost-link/src/tls.rs's is_loopback_host / main.rs's
-      # use_tls), so this serves a self-signed HTTPS cert, not plain HTTP.
       test: ["CMD", "curl", "-fk", "https://localhost:8003/health"]
       interval: 10s
       timeout: 5s
@@ -60,9 +96,27 @@ services:
       context: ./ghostlink_gui_modern
       dockerfile: Dockerfile
     container_name: ghostlink-gui
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+      - /var/tmp
     ports:
       - "5173:5173"
     environment:
+      GHOSTLINK_SETTINGS_PATH: "/tmp/settings.json"
+      GHOSTLINK_API_KEY_PATH: "/tmp/api_key.txt"
+      GHOSTLINK_API_KEYS_PATH: "/tmp/api_keys.json"
+      GHOSTLINK_MODELS_PATH: "/tmp/models.json"
+      GHOSTLINK_SESSIONS_PATH: "/tmp/sessions.json"
+      GHOSTLINK_SESSION_SUMMARIES_PATH: "/tmp/session_summaries.json"
+      GHOSTLINK_SCHEDULES_PATH: "/tmp/schedules.json"
+      GHOSTLINK_APPROVALS_PATH: "/tmp/approvals.json"
+      GHOSTLINK_DATA_DIR: "/tmp/data"
+      GHOSTLINK_JWT_SECRET_PATH: "/tmp/jwt_secret.txt"
       GHOSTLINK_API_BASE: http://127.0.0.1:8003
     networks:
       - ghostlink-network
@@ -73,3 +127,7 @@ services:
 networks:
   ghostlink-network:
     driver: bridge
+
+volumes:
+  ghostlink-auth:
+  ghostlink-state:

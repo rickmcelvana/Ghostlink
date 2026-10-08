@@ -643,13 +643,28 @@ where
             })
         }
         "serve" => {
-            let host = args.next().unwrap_or_else(|| "127.0.0.1".to_string());
-            let port = args
-                .next()
-                .as_deref()
-                .map(parse_u16_arg)
-                .transpose()?
-                .unwrap_or(8003);
+            let mut host = "127.0.0.1".to_string();
+            let mut port = 8003;
+            while let Some(arg) = args.next() {
+                if arg == "--port" || arg == "-p" {
+                    let p = args
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("missing value for {arg}"))?;
+                    port = p
+                        .parse::<u16>()
+                        .map_err(|e| anyhow::anyhow!("invalid {arg} value '{p}': {e}"))?;
+                } else if arg == "--host" {
+                    if let Some(h) = args.next() {
+                        host = h;
+                    }
+                } else if arg.chars().all(|c| c.is_ascii_digit()) {
+                    port = arg
+                        .parse::<u16>()
+                        .map_err(|e| anyhow::anyhow!("invalid port '{arg}': {e}"))?;
+                } else if !arg.starts_with('-') {
+                    host = arg;
+                }
+            }
             Ok(CliCommand::Serve { host, port })
         }
         "help" | "--help" | "-h" => Ok(CliCommand::Help),
@@ -9761,11 +9776,6 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         }))
     }
 
-    async fn handle_inference_metrics() -> Json<serde_json::Value> {
-        let snapshot = native_engine::get_inference_metrics_snapshot();
-        Json(serde_json::to_value(&snapshot).unwrap_or_default())
-    }
-
     async fn handle_inference_engines(
         State(state): State<Arc<Mutex<BackendState>>>,
     ) -> Json<serde_json::Value> {
@@ -10847,30 +10857,7 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                         let result = tokio::task::spawn_blocking({
                             let engine = engine.clone();
                             let path = path_for_load.clone();
-                            move || {
-                                let rpc = std::env::var("GHOSTLINK_RPC_SERVERS")
-                                    .ok()
-                                    .filter(|s| !s.trim().is_empty());
-                                let split = std::env::var("GHOSTLINK_TENSOR_SPLIT")
-                                    .ok()
-                                    .filter(|s| !s.trim().is_empty());
-                                let override_ot = std::env::var("GHOSTLINK_RPC_TENSOR_OVERRIDE")
-                                    .ok()
-                                    .filter(|s| !s.trim().is_empty())
-                                    .or_else(|| {
-                                        if rpc.is_some() {
-                                            Some("ffn=RPC,exps=RPC".to_string())
-                                        } else {
-                                            None
-                                        }
-                                    });
-                                engine.load_model_into_slot(
-                                    &path,
-                                    rpc.as_deref(),
-                                    split.as_deref(),
-                                    override_ot.as_deref(),
-                                )
-                            }
+                            move || engine.load_model_into_slot(&path, None, None, None)
                         })
                         .await;
                         // Release on every outcome, including failure, so a failed load can
@@ -13279,7 +13266,6 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
                 "/api/inference/approvals/:id/decide",
                 post(handle_approval_decide),
             )
-            .route("/api/inference/metrics", get(handle_inference_metrics))
             .route("/api/inference/engines", get(handle_inference_engines))
             .route(
                 "/api/mcp/servers",
@@ -16621,6 +16607,8 @@ mod tests {
         assert!(parse_cli(args(&["doctor", "--json"])).is_err());
         assert!(parse_cli(args(&["doctor", "--network-target"])).is_err());
         assert!(parse_cli(args(&["doctor", "--nope"])).is_err());
+        assert!(parse_cli(args(&["serve", "--port"])).is_err());
+        assert!(parse_cli(args(&["serve", "--port", "not-a-port"])).is_err());
     }
 
     #[test]
