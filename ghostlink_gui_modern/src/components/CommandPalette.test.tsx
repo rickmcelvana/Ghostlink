@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, act } from '@testing-library/react';
+import { render, screen, fireEvent, act, waitFor } from '@testing-library/react';
 import { CommandPalette } from './CommandPalette';
 import { useAppStore } from '../store';
 
@@ -107,6 +107,26 @@ describe('CommandPalette', () => {
     // Press Shift+Tab on the input - should remain on or loop to focusable inside dialog
     fireEvent.keyDown(window, { key: 'Tab', shiftKey: true });
     expect(document.activeElement).toBe(searchInput);
+  });
+
+  it('renders close button with accessibility attributes and closes modal on click', async () => {
+    render(<CommandPalette />);
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent('open-command-palette'));
+    });
+
+    const closeBtn = screen.getByRole('button', { name: 'Close command palette' });
+    expect(closeBtn).toBeInTheDocument();
+    expect(closeBtn).toHaveAttribute('title', 'Close command palette (Esc)');
+
+    act(() => {
+      fireEvent.click(closeBtn);
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByRole('combobox', { name: 'Search commands' })).not.toBeInTheDocument();
+    });
   });
 
   it('triggers custom events and tab navigation on command selection', () => {

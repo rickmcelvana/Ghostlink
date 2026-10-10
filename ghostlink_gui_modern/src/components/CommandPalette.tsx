@@ -14,6 +14,7 @@ import {
   FolderGit2,
   CornerDownLeft,
   Activity,
+  X,
   type LucideIcon,
 } from 'lucide-react';
 import { useAppStore } from '../store';
@@ -357,7 +358,18 @@ export const CommandPalette: React.FC = () => {
                 aria-activedescendant={filtered[highlight] ? `command-${filtered[highlight].id}` : undefined}
                 className="w-full bg-transparent border-none text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-0"
               />
-              <kbd className="text-[10px] text-slate-500 bg-slate-950 px-1.5 py-0.5 rounded border border-slate-700">Esc</kbd>
+              <div className="flex items-center gap-1.5 shrink-0">
+                <kbd className="text-[10px] text-slate-500 bg-slate-950 px-1.5 py-0.5 rounded border border-slate-700 hidden sm:inline-block">Esc</kbd>
+                <button
+                  type="button"
+                  onClick={() => setOpen(false)}
+                  className="p-1 text-slate-400 hover:text-slate-200 hover:bg-slate-800 rounded-lg transition focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none"
+                  aria-label="Close command palette"
+                  title="Close command palette (Esc)"
+                >
+                  <X size={16} aria-hidden="true" />
+                </button>
+              </div>
             </div>
             <div className="sr-only" role="status" aria-live="polite">
               {filtered.length === 0
