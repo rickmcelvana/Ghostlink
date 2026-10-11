@@ -6,6 +6,29 @@ All notable changes to Ghostlink Studio are documented here.
 
 ## [Unreleased]
 
+### Added
+- **Heterogeneous, hardware-aware task agents.** The task agent runtime can now see the cluster it runs on and reason about where work belongs. Four capabilities, all of which degrade to the previous single-node behaviour when no cluster is attached:
+
+  - **Cluster topology in the system prompt.** `cluster_bridge::query_cluster_nodes` reads `ghostlink-core`'s `ClusterState` and `format_cluster_prompt` renders it as a prompt prefix, so the model sees node names, accelerators, free VRAM and streaming layers before it plans. Empty cluster yields an empty string, leaving the prompt byte-identical to before.
+  - **Placement decisions.** `choose_node_for_task` picks a node from the task's goal and acceptance criteria (vision→NPU, heavy→most free VRAM, light→CPU), the choice is emitted as a `placement_decided` SSE event, and it lands in the `ReviewPacket` as `placement` plus `accelerator_usage`. The `rationale` field names the branch that matched, so the packet cannot claim a reason the chooser did not use.
+  - **Auto-fix loop.** A failing verification now gets the model exactly one more attempt *before* the packet reaches a human, bounded by `MAX_AUTO_FIX_ATTEMPTS` and by the remaining step budget. The step loop was converted from `for _step in 1..=max_steps` to a `while run.step_count < max_steps` wrapped in a labelled outer loop, so re-entering it cannot restart the budget. Every command the retry issues still passes the `Judge`, and the staging tree is still the only thing it can write to.
+  - **MCP Read tools in the agent toolset.** Projects listing `mcp_read` get the connected servers' `Read`-class tools as OpenAI-format function definitions, dispatched through `mcp_bridge::execute_mcp_tool`. Gated twice: the project policy, and the capability class re-checked at dispatch.
+
+- **Context compaction is now visible.** `ContextSummary` carries what was dropped when the transcript outgrew the budget — turn count, the reason, and the files touched (recovered from `write_file` tool-call arguments, not inferred). Absent from the packet when nothing was compacted.
+
+- **SSE hardening for `/api/tasks/:id/events`.** `Last-Event-ID` resume replays only what followed the client's last id; `?limit=N` (default 100) bounds the replay; and a `connection_status` heartbeat every 30s makes a silently-dropped connection detectable — `EventSource.onerror` never fires when a middlebox stops forwarding without breaking the socket.
+
+### Fixed
+- **`mcp_bridge` did not compile.** `list_mcp_tools_for_agent` called `registry.list_all_schemas()`, which does not exist on `McpRegistry` — schemas are per-server (`tool_schemas_for_server`) and the connected flag lives on `list_all_servers`. Adding `mod mcp_bridge;` broke the whole `ghost-link` binary with `E0599`. Both modules were also unreferenced by any `mod` declaration, so the breakage was latent: it would have surfaced the moment anyone wired them in.
+
+- **`choose_node_for_task` returned `None` on a CPU-only cluster.** The heavy-coding branch did `return active.iter().filter(|n| n.compute_capability != "cpu").max_by(...)`, so with every node classified `cpu` the filter was empty and the function returned `None` — exactly the single-node deployment the module claims to support. It now falls through to the default node.
+
+- **MCP tool names were ambiguous.** `parse_mcp_tool_name` split on the first `_`, so `mcp_sequential_thinking_think` resolved to server `sequential`, tool `thinking_think` — a call that can never succeed, since both server and tool names contain underscores. Names are now `mcp_{server}::{tool}`, split on `::`.
+
+- **An MCP tool that could not run was invisible in the ReviewPacket.** The no-registry branch pushed an error message back to the model but recorded no risk, so a packet could read as though the agent had searched when it could not. It now records a risk.
+
+- **`Judge` git allowlist widened** to `status | diff | log | show | branch | stash`. `show`, `branch` and `stash` are read-only operations an agent legitimately needs; destructive forms (`reset --hard`, `push --force`, `push -f`) remain denied by the explicit deny rules.
+
 ### Fixed
 - **Tool schemas no longer cost ~3,800 prompt tokens on every request.** `build_tool_instructions` inlined every enabled tool's complete JSON input schema into the prompt prefix, and that prefix is prepended to *every* turn (`format!("{tool_instructions}Question: {user_message}")`). Measured by proxying real request bodies: a five-word question produced a **17,149-character** user message and **3,814 prompt tokens**, of which ~3,700 were the tool catalog — about 13 seconds of prefill at the measured rate before the model read the question.
 

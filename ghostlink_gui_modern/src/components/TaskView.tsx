@@ -74,12 +74,36 @@ export const TaskView: React.FC<TaskViewProps> = ({ task, api, onRefresh }) => {
       setSseConnected(false);
     };
 
+    // Heartbeat. The backend sends a named `connection_status` event every 30s,
+    // which is the only way to notice a silently-dropped connection: `onerror`
+    // fires only when the socket actually breaks, and a middlebox that stops
+    // forwarding never breaks it. Track the last heartbeat and let the polling
+    // fallback take over if it goes stale.
+    let lastBeat = Date.now();
+    // Guarded because a minimal EventSource stand-in (as used in tests) may
+    // only implement the `on*` properties, not the full EventTarget API.
+    if (typeof es.addEventListener === 'function') {
+      es.addEventListener('connection_status', () => {
+        lastBeat = Date.now();
+        setSseConnected(true);
+      });
+    }
+    const beatWatch = window.setInterval(() => {
+      // 90s with no heartbeat while the task is still running means the stream
+      // is dead even though `onerror` never fired.
+      if (task.status === 'running' && Date.now() - lastBeat > 90_000) {
+        setSseConnected(false);
+      }
+    }, 15_000);
+
     es.onmessage = (e) => {
       try {
         const ev: TaskEvent = JSON.parse(e.data);
         addTaskEvent(ev);
+        // `placement_decided` and `auto_fix_triggered` change what the header
+        // shows (assigned node, "auto-fixing"), so they refresh too.
         if (
-          ["needs_review", "accepted", "rejected", "cancelled", "blocked", "review_ready", "error"].includes(
+          ["needs_review", "accepted", "rejected", "cancelled", "blocked", "review_ready", "error", "placement_decided", "auto_fix_triggered"].includes(
             ev.kind
           ) &&
           onRefresh
@@ -92,8 +116,9 @@ export const TaskView: React.FC<TaskViewProps> = ({ task, api, onRefresh }) => {
     };
     return () => {
       es.close();
+      window.clearInterval(beatWatch);
     };
-  }, [task.id, apiKey, api, addTaskEvent, onRefresh]);
+  }, [task.id, apiKey, api, addTaskEvent, onRefresh, task.status]);
 
   const handleSpawn = async () => {
     setSpawning(true);

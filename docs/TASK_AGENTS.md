@@ -75,23 +75,37 @@ implied — the same standard the rest of this repo's docs hold to:
   (`ContextGovernor`): the system prompt and task goal are pinned and the most
   recent turns are kept, with older turns dropped oldest-first and the
   compaction surfaced as a `risks[]` entry plus a `context_compacted` event.
-  What is still missing: summarization/compaction into a memory blob (dropped
-  turns are simply gone), and the budget is not yet configurable per project —
-  it uses `ContextGovernor::default()`.
-- **Verification is one-shot, not a loop.** The plan runs once at the end of a
-  run. A failing result is reported to the reviewer and blocks `accept`, but the
-  agent is not automatically handed the failure and asked to fix it — that
-  requires `request_changes`. Detection also only covers Cargo / npm / pytest;
-  other ecosystems need an explicit plan (not yet exposed via the API).
-- **No retrieval or code intelligence.** The loop has four tools
-  (`read_file`, `write_file`, `run_command`, `spawn_subagent`) and no symbol
-  search, file outline, or embedding-based retrieval. The `mcp-rag` crate and
-  the MCP tool registry are not bridged into the agent loop.
-- **No git integration.** Tasks are not isolated on a branch or worktree, and
-  there is no commit step; `git diff` is not available to the agent (the
-  `Judge` allows only `git status`/`diff`/`log`, and its output is
-  unstructured for the model).
-- **Single-shot rather than iterative.** A run produces one `ReviewPacket`;
-  there is no automatic "run tests, read the failure, fix, re-run" cycle
-  beyond whatever the model does within its step budget.
+  What compaction dropped is also carried in the packet's `context_summary`
+  (turn count and the files touched, recovered from `write_file` tool-call
+  arguments — not inferred, so it cannot name a file never written). What is
+  still missing: an LLM-generated summary of the dropped turns, and a
+  per-project budget — it uses `ContextGovernor::default()`.
+- **Single-node by default.** With no cluster attached the runtime behaves
+  exactly as before: no cluster prompt, no placement decision, no
+  `placement_decided` event, and the `placement` / `accelerator_usage` /
+  `context_summary` fields absent from the `ReviewPacket` rather than null.
+- **Verification gets one automatic retry.** The plan runs once at the end of a
+  run. If it failed and changes were proposed, the failure is fed back to the
+  model for exactly one more attempt (`MAX_AUTO_FIX_ATTEMPTS = 1`), bounded by
+  the remaining step budget — the retry consumes steps from the same total, so
+  it cannot loop. If that still fails, the result is reported to the reviewer
+  and blocks `accept`, which requires `request_changes` for anything further.
+  Detection only covers Cargo / npm / pytest; other ecosystems need an explicit
+  plan (not yet exposed via the API).
+- **MCP Read tools are available on request.** A project listing `mcp_read` in
+  `allowed_tools` gets the connected MCP servers' `Read`-class tools
+  (`rag.search`, `memory.memory_search`, `git`-class reads, ...) as OpenAI-format
+  function definitions. They are gated twice — by the project policy and by the
+  capability class re-checked at dispatch — and Write/Exec tools are never
+  exposed to the loop. Without `mcp_read` the toolset is the four built-ins
+  (`read_file`, `write_file`, `run_command`, `spawn_subagent`) plus the MCP
+  tools being absent entirely.
+- **Git reads are allowed; commits are not.** Tasks are not isolated on a branch
+  or worktree, and there is no commit step. The `Judge` allows
+  `git status`/`diff`/`log`/`show`/`branch`/`stash`; `git diff` output reaches
+  the model as unstructured text (a structured `git_diff_structured` tool is
+  planned, not implemented).
+- **One automatic fix cycle, then human review.** A run produces one
+  `ReviewPacket`; beyond the single auto-fix attempt there is no further
+  "run tests, read the failure, fix, re-run" cycle.
 - **Fan-out depth is capped at 1** (`max_depth=1`, `max_children=4`).
