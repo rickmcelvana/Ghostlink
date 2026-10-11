@@ -13033,7 +13033,7 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
         started_at: Instant::now(),
         backend_url,
         local_node_id: profile.node_resources.id.clone(),
-        cluster,
+        cluster: Arc::clone(&cluster),
         inference_backend,
         native_engine_client,
         ollama_client,
@@ -13047,7 +13047,12 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             task_runtime::TaskRuntimeStore::new(
                 std::env::var("GHOSTLINK_DATA_DIR").unwrap_or_else(|_| ".ghostlink/data".into()),
             )
-            .expect("failed to initialize task runtime store"),
+            .expect("failed to initialize task runtime store")
+            // Single-node when the cluster has no peers: `with_cluster`
+            // attaches state that `active_nodes()` then reports as empty, so
+            // every cluster feature degrades to its previous behaviour.
+            .with_cluster(Arc::clone(&cluster))
+            .with_mcp_registry(Arc::clone(&mcp_registry)),
         ),
         model_lifecycle_lock: Arc::new(tokio::sync::RwLock::new(())),
         plugin_registry: backend_plugin::BackendPluginRegistry::from_env(),
@@ -15437,11 +15442,13 @@ mod backend_plugin;
 mod backend_registry;
 mod bootstrap;
 mod capability;
+mod cluster_bridge;
 mod context_window;
 mod grounding;
 mod host_metrics;
 mod inference_engine;
 mod mcp;
+mod mcp_bridge;
 mod native_engine;
 mod ollama;
 mod otel;
@@ -15751,6 +15758,10 @@ mod tests {
             metrics.set_streaming_layers(0, 24);
         });
 
+        let test_mcp_registry = Arc::new(mcp::McpRegistry::new(mcp::McpConfigManager::new(
+            std::env::temp_dir().join("ghostlink-test-mcp-servers.toml"),
+        )));
+
         Arc::new(Mutex::new(BackendState {
             models: vec![],
             current_model: "tinyllama".to_string(),
@@ -15762,7 +15773,7 @@ mod tests {
             inference_metrics: host_metrics::InferenceMetrics::default(),
             started_at: Instant::now(),
             backend_url: "http://127.0.0.1:8003".to_string(),
-            cluster,
+            cluster: Arc::clone(&cluster),
             local_node_id: "test-node".to_string(),
             inference_backend: InferenceEngine::Vllm,
             native_engine_client: native_engine::NativeEngineClient::new(),
@@ -15770,9 +15781,7 @@ mod tests {
             vllm_client: vllm::VllmClient::new("http://127.0.0.1:8000".to_string(), None),
             ollama_available: Arc::new(tokio::sync::Mutex::new(false)),
             settings: RuntimeSettings::default(),
-            mcp_registry: Arc::new(mcp::McpRegistry::new(mcp::McpConfigManager::new(
-                std::env::temp_dir().join("ghostlink-test-mcp-servers.toml"),
-            ))),
+            mcp_registry: test_mcp_registry.clone(),
             pending_tool_calls: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             download_progress: HashMap::new(),
             task_store: Arc::new(
@@ -15780,7 +15789,9 @@ mod tests {
                     std::env::var("GHOSTLINK_DATA_DIR")
                         .unwrap_or_else(|_| ".ghostlink/data".into()),
                 )
-                .expect("failed to initialize task runtime store"),
+                .expect("failed to initialize task runtime store")
+                .with_cluster(Arc::clone(&cluster))
+                .with_mcp_registry(test_mcp_registry.clone()),
             ),
             model_lifecycle_lock: Arc::new(tokio::sync::RwLock::new(())),
             enable_tls_active: false,

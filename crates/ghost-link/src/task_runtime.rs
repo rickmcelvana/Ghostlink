@@ -8,6 +8,8 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
 use uuid::Uuid;
 
+use crate::cluster_bridge;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ProjectKind {
@@ -318,7 +320,85 @@ pub struct ReviewPacket {
     /// reported in `risks`, not silently treated as success.
     #[serde(default)]
     pub verification: Vec<VerificationResult>,
+    /// Which cluster node this run was placed on, and why. `None` in
+    /// single-node mode (no cluster attached) - the field is absent from
+    /// the JSON in that case rather than carrying a placeholder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<PlacementDecision>,
+    /// Accelerator usage for this run. `None` in single-node mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accelerator_usage: Option<AcceleratorUsage>,
+    /// Summary of the context compaction that happened during the run,
+    /// if any. Present only when messages were actually dropped - a run
+    /// that fit its budget carries no summary and says so by absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_summary: Option<ContextSummary>,
     pub created_at: String,
+}
+
+/// Why a task landed on the node it did.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlacementDecision {
+    pub task_id: String,
+    pub assigned_node: String,
+    pub node_capability: cluster_bridge::NodeCapability,
+    /// Why this node was chosen - the hint class that matched.
+    pub rationale: String,
+    /// Other candidates considered, by node id.
+    pub alternative_nodes: Vec<String>,
+}
+
+/// What accelerator work this run actually did.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcceleratorUsage {
+    pub node_id: String,
+    pub compute_capability: String,
+    pub gpu_name: Option<String>,
+    /// VRAM the node reported as free at placement time.
+    pub vram_free_gb: f32,
+    pub commands_executed: u32,
+    pub tokens_generated: u32,
+}
+
+/// What was dropped when the transcript no longer fit the context budget.
+///
+/// Compaction used to be invisible: turns were dropped and only a count
+/// appeared in `risks`. This carries the substance of what was dropped so
+/// a reviewer can tell whether the agent lost something that mattered.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextSummary {
+    pub original_turn_count: usize,
+    pub summary_text: String,
+    pub key_decisions: Vec<String>,
+    pub files_modified: Vec<String>,
+}
+
+/// Human-readable reason a placement was made, derived from the same hint
+/// keywords `choose_node_for_task` matches on.
+///
+/// Kept in sync with that function's branches deliberately: a rationale
+/// that names a class the chooser does not actually test for would be a lie
+/// in the ReviewPacket, which is the one artifact a human reads before
+/// accepting.
+fn placement_rationale(hint: &str) -> String {
+    let h = hint.to_lowercase();
+    if h.contains("vision") || h.contains("image") {
+        "vision/image task routed to an NPU node".to_string()
+    } else if h.contains("heavy")
+        || h.contains("coding")
+        || h.contains("model")
+        || h.contains("training")
+    {
+        "compute-heavy task routed to the accelerator with the most free VRAM".to_string()
+    } else if h.contains("light")
+        || h.contains("verification")
+        || h.contains("test")
+        || h.contains("lint")
+    {
+        "light verification routed to a CPU node to avoid occupying an accelerator".to_string()
+    } else {
+        "no placement hint matched; assigned the first active node".to_string()
+    }
 }
 
 impl ReviewPacket {
@@ -408,7 +488,10 @@ impl Judge {
             "ls" | "rg" | "grep" => true,
             "git" => {
                 if argv.len() >= 2 {
-                    matches!(argv[1].as_str(), "status" | "diff" | "log")
+                    matches!(
+                        argv[1].as_str(),
+                        "status" | "diff" | "log" | "show" | "branch" | "stash"
+                    )
                 } else {
                     false
                 }
@@ -436,6 +519,13 @@ pub struct TaskRuntimeStore {
     data_dir: PathBuf,
     event_bus: broadcast::Sender<TaskEvent>,
     active_runs: Mutex<HashMap<String, tokio_util::sync::CancellationToken>>,
+    /// Live cluster state, when this process is part of one. `None` is
+    /// single-node mode and is the common case: every cluster feature then
+    /// behaves exactly as it did before any of this existed.
+    cluster: Option<Arc<ghostlink_core::cluster::ClusterState>>,
+    /// MCP registry, when one is configured. `None` means no MCP servers
+    /// are reachable and the agent toolset is the built-in one only.
+    mcp_registry: Option<Arc<crate::mcp::McpRegistry>>,
 }
 
 impl TaskRuntimeStore {
@@ -454,7 +544,31 @@ impl TaskRuntimeStore {
             data_dir: path,
             event_bus,
             active_runs: Mutex::new(HashMap::new()),
+            cluster: None,
+            mcp_registry: None,
         })
+    }
+
+    /// Attach the live cluster state. Single-node deployments never call this.
+    pub fn with_cluster(mut self, cluster: Arc<ghostlink_core::cluster::ClusterState>) -> Self {
+        self.cluster = Some(cluster);
+        self
+    }
+
+    /// Attach the MCP registry. Deployments with no MCP servers never call this.
+    pub fn with_mcp_registry(mut self, registry: Arc<crate::mcp::McpRegistry>) -> Self {
+        self.mcp_registry = Some(registry);
+        self
+    }
+
+    /// The attached cluster, if any.
+    pub fn cluster(&self) -> Option<&Arc<ghostlink_core::cluster::ClusterState>> {
+        self.cluster.as_ref()
+    }
+
+    /// The attached MCP registry, if any.
+    pub fn mcp_registry(&self) -> Option<&Arc<crate::mcp::McpRegistry>> {
+        self.mcp_registry.as_ref()
     }
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<TaskEvent> {
@@ -1572,9 +1686,20 @@ impl TaskRunner {
             let start_time = std::time::Instant::now();
 
             // Build initial messages
+            //
+            // Cluster topology goes into the system prompt when a cluster
+            // is attached, so the model can reason about where work should
+            // run. In single-node mode `query_cluster_nodes` returns
+            // nothing and the prompt is byte-identical to before.
+            let cluster_nodes = match store.cluster() {
+                Some(cluster) => cluster_bridge::query_cluster_nodes(cluster).await,
+                None => Vec::new(),
+            };
+            let cluster_prompt = cluster_bridge::format_cluster_prompt(&cluster_nodes);
+
             let system_prompt = format!(
-            "You are an AI task agent implementing project '{}' at root path '{}'. Use available tools to write proposed files and execute checks.",
-            project.name, project.root_path
+            "You are an AI task agent implementing project '{}' at root path '{}'. Use available tools to write proposed files and execute checks.{}",
+            project.name, project.root_path, cluster_prompt
         );
 
             let mut user_prompt = format!("Task Goal: {}\n", task.goal);
@@ -1593,426 +1718,575 @@ impl TaskRunner {
             let max_steps = task.budget.max_steps;
             let max_minutes = task.budget.max_minutes as u64;
 
+            // ---- Placement -----------------------------------------
+            //
+            // Decide where this run executes before the first model call,
+            // and say so over SSE. `None` in single-node mode: no cluster
+            // attached means no placement decision and no event, which is
+            // exactly the previous behaviour.
+            let placement = if cluster_nodes.is_empty() {
+                None
+            } else {
+                let hint = format!(
+                    "{} {}",
+                    task.goal,
+                    task.acceptance_criteria.as_deref().unwrap_or("")
+                );
+                match cluster_bridge::choose_node_for_task(&cluster_nodes, &hint) {
+                    Some(node) => {
+                        let alternatives: Vec<String> = cluster_nodes
+                            .iter()
+                            .filter(|n| n.node_id != node.node_id)
+                            .map(|n| n.node_id.clone())
+                            .collect();
+                        let decision = PlacementDecision {
+                            task_id: task.id.clone(),
+                            assigned_node: node.node_id.clone(),
+                            node_capability: node.clone(),
+                            rationale: placement_rationale(&hint),
+                            alternative_nodes: alternatives,
+                        };
+                        store.emit_event(TaskEvent {
+                            task_id: task.id.clone(),
+                            ts: Utc::now().timestamp_millis() as u64,
+                            kind: "placement_decided".into(),
+                            payload: serde_json::to_value(&decision).unwrap_or_default(),
+                        });
+                        Some(decision)
+                    }
+                    None => None,
+                }
+            };
+
             // Real context budget for this run. Previously `messages` grew
             // unbounded and the backend call eventually failed on a context
             // overflow; now the list is packed to fit before every call.
             let governor = ContextGovernor::default();
             let mut context_dropped_total = 0usize;
 
-            for _step in 1..=max_steps {
-                if cancel_token.is_cancelled() {
-                    return Err(anyhow!("Task execution cancelled by user"));
-                }
+            // ---- Auto-fix budget ------------------------------------
+            //
+            // A failing verification gets the model exactly one more
+            // chance, and only while the step budget has room.
+            let mut auto_fix_attempts = 0u32;
+            const MAX_AUTO_FIX_ATTEMPTS: u32 = 1;
 
-                if start_time.elapsed().as_secs() > max_minutes * 60 {
-                    risks.push("Exceeded time budget (max_minutes)".into());
-                    break;
-                }
-
-                if let Some(max_tok) = task.budget.max_tokens {
-                    if run.token_count >= max_tok {
-                        risks.push("Exceeded token budget (max_tokens)".into());
-                        break;
-                    }
-                }
-
-                run.step_count += 1;
-                store.emit_event(TaskEvent {
-                task_id: task.id.clone(),
-                ts: Utc::now().timestamp_millis() as u64,
-                kind: "step".into(),
-                payload: serde_json::json!({ "step": run.step_count, "description": format!("Agent step {}", run.step_count) }),
-            });
-
-                // Call model via AgentBackend.
-                //
-                // Retried with exponential backoff: a local inference backend
-                // (llama-server mid model-swap, a transient RPC hiccup) used to
-                // fail the whole task on a single error, pushing it to
-                // `Blocked` — the same transient-failure class the RPC fabric
-                // already handles with its own backoff policy. Cancellation is
-                // honoured between attempts.
-                const MAX_CHAT_ATTEMPTS: u32 = 3;
-                let mut last_err: Option<String> = None;
-                let mut attempt_resp = None;
-
-                // Pack the transcript to fit the context budget before the
-                // call. The system prompt and original task prompt are pinned.
-                let (fitted, dropped) = governor.fit(&messages);
-                if dropped > 0 {
-                    context_dropped_total += dropped;
-                    store.emit_event(TaskEvent {
-                        task_id: task.id.clone(),
-                        ts: Utc::now().timestamp_millis() as u64,
-                        kind: "context_compacted".into(),
-                        payload: serde_json::json!({
-                            "dropped_messages": dropped,
-                            "kept_messages": fitted.len(),
-                            "estimated_tokens": ContextGovernor::estimate_tokens(&fitted),
-                            "token_budget": governor.token_budget,
-                        }),
-                    });
-                }
-
-                for attempt in 0..MAX_CHAT_ATTEMPTS {
+            // Outer loop enclosing the step loop AND the verification that
+            // follows it. The auto-fix path `continue`s this label to give
+            // the model one more chance, so the label must cover the
+            // verification - labelling only the step loop would leave the
+            // `continue` unreachable.
+            let (review, final_status) = 'agent_loop: loop {
+                while run.step_count < max_steps {
                     if cancel_token.is_cancelled() {
                         return Err(anyhow!("Task execution cancelled by user"));
                     }
-                    match backend
-                        .chat(&fitted, &project.effective_allowed_tools())
-                        .await
-                    {
-                        Ok(resp) => {
-                            attempt_resp = Some(resp);
-                            break;
-                        }
-                        Err(err) => {
-                            let msg = err.to_string();
-                            last_err = Some(msg.clone());
-                            if attempt + 1 < MAX_CHAT_ATTEMPTS {
-                                // 1s, 2s — bounded, and short enough not to
-                                // eat a meaningful slice of max_minutes.
-                                let backoff = std::time::Duration::from_secs(1 << attempt);
-                                store.emit_event(TaskEvent {
-                                    task_id: task.id.clone(),
-                                    ts: Utc::now().timestamp_millis() as u64,
-                                    kind: "retry".into(),
-                                    payload: serde_json::json!({
-                                        "attempt": attempt + 1,
-                                        "max_attempts": MAX_CHAT_ATTEMPTS,
-                                        "backoff_ms": backoff.as_millis() as u64,
-                                        "error": msg,
-                                    }),
-                                });
-                                tokio::time::sleep(backoff).await;
-                            }
-                        }
-                    }
-                }
 
-                let agent_resp = match attempt_resp {
-                    Some(resp) => resp,
-                    None => {
-                        let err = last_err.unwrap_or_else(|| "unknown backend error".into());
-                        risks.push(format!(
-                            "Backend inference error after {} attempts: {}",
-                            MAX_CHAT_ATTEMPTS, err
-                        ));
+                    if start_time.elapsed().as_secs() > max_minutes * 60 {
+                        risks.push("Exceeded time budget (max_minutes)".into());
                         break;
                     }
-                };
 
-                // Count tokens. Prefer the backend's reported usage; fall back
-                // to a character estimate only when the backend doesn't report
-                // it. The old code *always* estimated from assistant text
-                // alone, ignoring prompt and tool-call tokens, so a
-                // tool-call-only turn charged a flat 10 tokens and
-                // `max_tokens` was effectively unreachable.
-                let content_str = agent_resp.content.clone().unwrap_or_default();
-                run.token_count += match agent_resp.usage_tokens {
-                    Some(usage) => usage,
-                    None => (content_str.len() / 4).max(10) as u32,
-                };
+                    if let Some(max_tok) = task.budget.max_tokens {
+                        if run.token_count >= max_tok {
+                            risks.push("Exceeded token budget (max_tokens)".into());
+                            break;
+                        }
+                    }
 
-                if !content_str.is_empty() {
-                    messages
-                        .push(serde_json::json!({ "role": "assistant", "content": content_str }));
-                }
-
-                if agent_resp.tool_calls.is_empty() {
-                    break;
-                }
-
-                let mut should_stop = false;
-
-                for tool_call in agent_resp.tool_calls {
+                    run.step_count += 1;
                     store.emit_event(TaskEvent {
                     task_id: task.id.clone(),
                     ts: Utc::now().timestamp_millis() as u64,
-                    kind: "tool".into(),
-                    payload: serde_json::json!({ "name": tool_call.name, "args": tool_call.args }),
+                    kind: "step".into(),
+                    payload: serde_json::json!({ "step": run.step_count, "description": format!("Agent step {}", run.step_count) }),
                 });
 
-                    match tool_call.name.as_str() {
-                        "spawn_subagent" | "create_child_task" => {
-                            if run.role != "planner" {
-                                risks.push(
-                                    "Implementer agent tried to spawn subagent (denied)".into(),
-                                );
-                                messages.push(serde_json::json!({ "role": "user", "content": "Error: implementer agents cannot spawn subagents" }));
-                                continue;
-                            }
+                    // Call model via AgentBackend.
+                    //
+                    // Retried with exponential backoff: a local inference backend
+                    // (llama-server mid model-swap, a transient RPC hiccup) used to
+                    // fail the whole task on a single error, pushing it to
+                    // `Blocked` — the same transient-failure class the RPC fabric
+                    // already handles with its own backoff policy. Cancellation is
+                    // honoured between attempts.
+                    const MAX_CHAT_ATTEMPTS: u32 = 3;
+                    let mut last_err: Option<String> = None;
+                    let mut attempt_resp = None;
 
-                            let child_goal = tool_call
-                                .args
-                                .get("goal")
-                                .and_then(|g| g.as_str())
-                                .unwrap_or("");
-                            let child_criteria = tool_call
-                                .args
-                                .get("acceptance_criteria")
-                                .and_then(|c| c.as_str());
-
-                            if child_goal.is_empty() {
-                                messages.push(serde_json::json!({ "role": "user", "content": "Error: goal cannot be empty for child task" }));
-                                continue;
-                            }
-
-                            let elapsed_mins = (start_time.elapsed().as_secs() / 60) as u32;
-                            let rem_mins =
-                                task.budget.max_minutes.saturating_sub(elapsed_mins).max(1);
-                            let rem_steps =
-                                task.budget.max_steps.saturating_sub(run.step_count).max(1);
-                            let rem_tokens = task
-                                .budget
-                                .max_tokens
-                                .map(|mt| mt.saturating_sub(run.token_count));
-
-                            let child_budget = TaskBudget {
-                                max_steps: rem_steps,
-                                max_tokens: rem_tokens,
-                                max_minutes: rem_mins,
-                            };
-
-                            match store.create_task(
-                                &project.id,
-                                child_goal.to_string(),
-                                child_criteria.map(|s| s.to_string()),
-                                Some(child_budget),
-                                Some(task.id.clone()),
-                            ) {
-                                Ok(child) => {
-                                    store.emit_event(TaskEvent {
-                                    task_id: task.id.clone(),
-                                    ts: Utc::now().timestamp_millis() as u64,
-                                    kind: "child_created".into(),
-                                    payload: serde_json::json!({ "child_id": child.id, "goal": child.goal }),
-                                });
-
-                                    // Auto-spawn child task as implementer run with inherited cancel token
-                                    let child_store = Arc::clone(&store);
-                                    let child_backend = Arc::clone(&backend);
-                                    let child_task = child.clone();
-                                    let child_model = run.model.clone();
-                                    let child_token = cancel_token.child_token();
-
-                                    tokio::spawn(Box::pin(async move {
-                                        let _ = Self::spawn_implementer(
-                                            child_store,
-                                            child_backend,
-                                            child_task,
-                                            "implementer".into(),
-                                            child_model,
-                                            None,
-                                            child_token,
-                                        )
-                                        .await;
-                                    }));
-
-                                    messages.push(serde_json::json!({ "role": "user", "content": format!("Successfully created child task #{} ({})", child.id, child.goal) }));
-                                }
-                                Err(e) => {
-                                    risks.push(format!("Failed to create child task: {}", e));
-                                    messages.push(serde_json::json!({ "role": "user", "content": format!("Failed to create child task: {}", e) }));
-                                }
-                            }
-                        }
-                        "write_file" => {
-                            let rel_path = tool_call
-                                .args
-                                .get("path")
-                                .and_then(|p| p.as_str())
-                                .unwrap_or("");
-                            let file_content = tool_call
-                                .args
-                                .get("content")
-                                .and_then(|c| c.as_str())
-                                .unwrap_or("");
-
-                            if rel_path.is_empty() {
-                                risks.push("write_file tool called with empty path".into());
-                                messages.push(serde_json::json!({ "role": "user", "content": "Error: write_file path is empty" }));
-                                continue;
-                            }
-
-                            if !project.allowed_tools.contains(&"write_file".to_string()) {
-                                risks.push("write_file tool not allowed by project policy".into());
-                                messages.push(serde_json::json!({ "role": "user", "content": "Error: write_file tool is disabled for this project" }));
-                                continue;
-                            }
-
-                            match store.write_proposed_file(
-                                &project.root_path,
-                                &task.id,
-                                rel_path,
-                                file_content,
-                            ) {
-                                Ok(_) => {
-                                    store.emit_event(TaskEvent {
-                                    task_id: task.id.clone(),
-                                    ts: Utc::now().timestamp_millis() as u64,
-                                    kind: "file".into(),
-                                    payload: serde_json::json!({ "path": rel_path, "action": "write_proposed" }),
-                                });
-                                    messages.push(serde_json::json!({ "role": "user", "content": format!("Successfully wrote proposed file {}", rel_path) }));
-                                }
-                                Err(e) => {
-                                    risks.push(format!(
-                                        "Failed writing proposed file {}: {}",
-                                        rel_path, e
-                                    ));
-                                    messages.push(serde_json::json!({ "role": "user", "content": format!("Error writing proposed file {}: {}", rel_path, e) }));
-                                }
-                            }
-                        }
-                        "read_file" => {
-                            let rel_path = tool_call
-                                .args
-                                .get("path")
-                                .and_then(|p| p.as_str())
-                                .unwrap_or("");
-                            let proposed_file = store
-                                .get_task_proposed_dir(&project.root_path, &task.id)
-                                .join(rel_path);
-                            let file_text = if proposed_file.exists() {
-                                fs::read_to_string(&proposed_file).unwrap_or_default()
-                            } else if let Ok(live_p) = TaskRuntimeStore::validate_and_resolve_path(
-                                &project.root_path,
-                                rel_path,
-                            ) {
-                                fs::read_to_string(&live_p).unwrap_or_default()
-                            } else {
-                                "File not found".to_string()
-                            };
-                            messages.push(serde_json::json!({ "role": "user", "content": format!("File content of {}:\n{}", rel_path, file_text) }));
-                        }
-                        "run_command" | "exec" | "execute" | "shell" => {
-                            let argv: Vec<String> = if let Some(arr) =
-                                tool_call.args.get("argv").and_then(|a| a.as_array())
-                            {
-                                arr.iter()
-                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                                    .collect()
-                            } else if let Some(cmd_str) =
-                                tool_call.args.get("command").and_then(|c| c.as_str())
-                            {
-                                cmd_str.split_whitespace().map(|s| s.to_string()).collect()
-                            } else {
-                                vec![]
-                            };
-
-                            if argv.is_empty() {
-                                messages.push(serde_json::json!({ "role": "user", "content": "Error: empty command" }));
-                                continue;
-                            }
-
-                            let judge_eval = Judge::evaluate(&argv);
-                            store.emit_event(TaskEvent {
+                    // Pack the transcript to fit the context budget before the
+                    // call. The system prompt and original task prompt are pinned.
+                    let (fitted, dropped) = governor.fit(&messages);
+                    if dropped > 0 {
+                        context_dropped_total += dropped;
+                        store.emit_event(TaskEvent {
                             task_id: task.id.clone(),
                             ts: Utc::now().timestamp_millis() as u64,
-                            kind: "judge".into(),
-                            payload: serde_json::json!({ "argv": argv, "decision": format!("{:?}", judge_eval) }),
+                            kind: "context_compacted".into(),
+                            payload: serde_json::json!({
+                                "dropped_messages": dropped,
+                                "kept_messages": fitted.len(),
+                                "estimated_tokens": ContextGovernor::estimate_tokens(&fitted),
+                                "token_budget": governor.token_budget,
+                            }),
                         });
+                    }
 
-                            match judge_eval {
-                                JudgeResult::Allow => {
-                                    if !project.allowed_tools.contains(&"run_command".to_string())
-                                        && !project.allowed_tools.contains(&"execute".to_string())
-                                    {
-                                        risks.push(
-                                            "Command execution tool not allowed by project policy"
-                                                .into(),
-                                        );
-                                        messages.push(serde_json::json!({ "role": "user", "content": "Error: command execution is disabled for this project" }));
-                                        continue;
-                                    }
-
-                                    let output_res = tokio::process::Command::new(&argv[0])
-                                        .args(&argv[1..])
-                                        .current_dir(&project.root_path)
-                                        .output()
-                                        .await;
-
-                                    match output_res {
-                                        Ok(output) => {
-                                            let exit_code = output.status.code().unwrap_or(-1);
-                                            let stdout = String::from_utf8_lossy(&output.stdout);
-                                            let stderr = String::from_utf8_lossy(&output.stderr);
-                                            let excerpt =
-                                                format!("STDOUT:\n{}\nSTDERR:\n{}", stdout, stderr);
-                                            let trimmed_excerpt = if excerpt.len() > 1000 {
-                                                format!("{}...\n(truncated)", &excerpt[..1000])
-                                            } else {
-                                                excerpt
-                                            };
-
-                                            commands_executed.push(ReviewCommand {
-                                                argv: argv.clone(),
-                                                judge: JudgeDecision::Allow,
-                                                exit: exit_code,
-                                                excerpt: trimmed_excerpt.clone(),
-                                            });
-
-                                            if exit_code == 0 {
-                                                checks.push(format!("Passed: {}", argv.join(" ")));
-                                            } else {
-                                                risks.push(format!(
-                                                    "Command failed (exit {}): {}",
-                                                    exit_code,
-                                                    argv.join(" ")
-                                                ));
-                                            }
-
-                                            messages.push(serde_json::json!({
-                                            "role": "user",
-                                            "content": format!("Command '{}' exited with {}:\n{}", argv.join(" "), exit_code, trimmed_excerpt)
-                                        }));
-                                        }
-                                        Err(e) => {
-                                            commands_executed.push(ReviewCommand {
-                                                argv: argv.clone(),
-                                                judge: JudgeDecision::Allow,
-                                                exit: -1,
-                                                excerpt: format!("Failed to spawn command: {}", e),
-                                            });
-                                            risks.push(format!(
-                                                "Failed to execute command {}: {}",
-                                                argv.join(" "),
-                                                e
-                                            ));
-                                            messages.push(serde_json::json!({ "role": "user", "content": format!("Failed to execute command: {}", e) }));
-                                        }
-                                    }
-                                }
-                                JudgeResult::Deny => {
-                                    commands_executed.push(ReviewCommand {
-                                        argv: argv.clone(),
-                                        judge: JudgeDecision::Deny,
-                                        exit: -1,
-                                        excerpt: "Command denied by Judge security policy".into(),
+                    for attempt in 0..MAX_CHAT_ATTEMPTS {
+                        if cancel_token.is_cancelled() {
+                            return Err(anyhow!("Task execution cancelled by user"));
+                        }
+                        match backend
+                            .chat(&fitted, &project.effective_allowed_tools())
+                            .await
+                        {
+                            Ok(resp) => {
+                                attempt_resp = Some(resp);
+                                break;
+                            }
+                            Err(err) => {
+                                let msg = err.to_string();
+                                last_err = Some(msg.clone());
+                                if attempt + 1 < MAX_CHAT_ATTEMPTS {
+                                    // 1s, 2s — bounded, and short enough not to
+                                    // eat a meaningful slice of max_minutes.
+                                    let backoff = std::time::Duration::from_secs(1 << attempt);
+                                    store.emit_event(TaskEvent {
+                                        task_id: task.id.clone(),
+                                        ts: Utc::now().timestamp_millis() as u64,
+                                        kind: "retry".into(),
+                                        payload: serde_json::json!({
+                                            "attempt": attempt + 1,
+                                            "max_attempts": MAX_CHAT_ATTEMPTS,
+                                            "backoff_ms": backoff.as_millis() as u64,
+                                            "error": msg,
+                                        }),
                                     });
-                                    risks.push(format!(
-                                        "Denied unsafe command execution: {}",
-                                        argv.join(" ")
-                                    ));
-                                    messages.push(serde_json::json!({ "role": "user", "content": "Command denied by Judge security policy" }));
-                                }
-                                JudgeResult::Pause => {
-                                    final_status = TaskStatus::Blocked;
-                                    commands_executed.push(ReviewCommand {
-                                        argv: argv.clone(),
-                                        judge: JudgeDecision::Pause,
-                                        exit: -1,
-                                        excerpt: "Command execution paused pending approval".into(),
-                                    });
-                                    risks.push("Command requires human approval".into());
-                                    messages.push(serde_json::json!({ "role": "user", "content": "Command paused pending human approval" }));
-                                    should_stop = true;
+                                    tokio::time::sleep(backoff).await;
                                 }
                             }
                         }
-                        _ => {
-                            messages.push(serde_json::json!({ "role": "user", "content": format!("Unknown or unhandled tool: {}", tool_call.name) }));
+                    }
+
+                    let agent_resp = match attempt_resp {
+                        Some(resp) => resp,
+                        None => {
+                            let err = last_err.unwrap_or_else(|| "unknown backend error".into());
+                            risks.push(format!(
+                                "Backend inference error after {} attempts: {}",
+                                MAX_CHAT_ATTEMPTS, err
+                            ));
+                            break;
+                        }
+                    };
+
+                    // Count tokens. Prefer the backend's reported usage; fall back
+                    // to a character estimate only when the backend doesn't report
+                    // it. The old code *always* estimated from assistant text
+                    // alone, ignoring prompt and tool-call tokens, so a
+                    // tool-call-only turn charged a flat 10 tokens and
+                    // `max_tokens` was effectively unreachable.
+                    let content_str = agent_resp.content.clone().unwrap_or_default();
+                    run.token_count += match agent_resp.usage_tokens {
+                        Some(usage) => usage,
+                        None => (content_str.len() / 4).max(10) as u32,
+                    };
+
+                    if !content_str.is_empty() {
+                        messages.push(
+                            serde_json::json!({ "role": "assistant", "content": content_str }),
+                        );
+                    }
+
+                    if agent_resp.tool_calls.is_empty() {
+                        break;
+                    }
+
+                    let mut should_stop = false;
+
+                    for tool_call in agent_resp.tool_calls {
+                        store.emit_event(TaskEvent {
+                        task_id: task.id.clone(),
+                        ts: Utc::now().timestamp_millis() as u64,
+                        kind: "tool".into(),
+                        payload: serde_json::json!({ "name": tool_call.name, "args": tool_call.args }),
+                    });
+
+                        match tool_call.name.as_str() {
+                            "spawn_subagent" | "create_child_task" => {
+                                if run.role != "planner" {
+                                    risks.push(
+                                        "Implementer agent tried to spawn subagent (denied)".into(),
+                                    );
+                                    messages.push(serde_json::json!({ "role": "user", "content": "Error: implementer agents cannot spawn subagents" }));
+                                    continue;
+                                }
+
+                                let child_goal = tool_call
+                                    .args
+                                    .get("goal")
+                                    .and_then(|g| g.as_str())
+                                    .unwrap_or("");
+                                let child_criteria = tool_call
+                                    .args
+                                    .get("acceptance_criteria")
+                                    .and_then(|c| c.as_str());
+
+                                if child_goal.is_empty() {
+                                    messages.push(serde_json::json!({ "role": "user", "content": "Error: goal cannot be empty for child task" }));
+                                    continue;
+                                }
+
+                                let elapsed_mins = (start_time.elapsed().as_secs() / 60) as u32;
+                                let rem_mins =
+                                    task.budget.max_minutes.saturating_sub(elapsed_mins).max(1);
+                                let rem_steps =
+                                    task.budget.max_steps.saturating_sub(run.step_count).max(1);
+                                let rem_tokens = task
+                                    .budget
+                                    .max_tokens
+                                    .map(|mt| mt.saturating_sub(run.token_count));
+
+                                let child_budget = TaskBudget {
+                                    max_steps: rem_steps,
+                                    max_tokens: rem_tokens,
+                                    max_minutes: rem_mins,
+                                };
+
+                                match store.create_task(
+                                    &project.id,
+                                    child_goal.to_string(),
+                                    child_criteria.map(|s| s.to_string()),
+                                    Some(child_budget),
+                                    Some(task.id.clone()),
+                                ) {
+                                    Ok(child) => {
+                                        store.emit_event(TaskEvent {
+                                        task_id: task.id.clone(),
+                                        ts: Utc::now().timestamp_millis() as u64,
+                                        kind: "child_created".into(),
+                                        payload: serde_json::json!({ "child_id": child.id, "goal": child.goal }),
+                                    });
+
+                                        // Auto-spawn child task as implementer run with inherited cancel token
+                                        let child_store = Arc::clone(&store);
+                                        let child_backend = Arc::clone(&backend);
+                                        let child_task = child.clone();
+                                        let child_model = run.model.clone();
+                                        let child_token = cancel_token.child_token();
+
+                                        tokio::spawn(Box::pin(async move {
+                                            let _ = Self::spawn_implementer(
+                                                child_store,
+                                                child_backend,
+                                                child_task,
+                                                "implementer".into(),
+                                                child_model,
+                                                None,
+                                                child_token,
+                                            )
+                                            .await;
+                                        }));
+
+                                        messages.push(serde_json::json!({ "role": "user", "content": format!("Successfully created child task #{} ({})", child.id, child.goal) }));
+                                    }
+                                    Err(e) => {
+                                        risks.push(format!("Failed to create child task: {}", e));
+                                        messages.push(serde_json::json!({ "role": "user", "content": format!("Failed to create child task: {}", e) }));
+                                    }
+                                }
+                            }
+                            "write_file" => {
+                                let rel_path = tool_call
+                                    .args
+                                    .get("path")
+                                    .and_then(|p| p.as_str())
+                                    .unwrap_or("");
+                                let file_content = tool_call
+                                    .args
+                                    .get("content")
+                                    .and_then(|c| c.as_str())
+                                    .unwrap_or("");
+
+                                if rel_path.is_empty() {
+                                    risks.push("write_file tool called with empty path".into());
+                                    messages.push(serde_json::json!({ "role": "user", "content": "Error: write_file path is empty" }));
+                                    continue;
+                                }
+
+                                if !project.allowed_tools.contains(&"write_file".to_string()) {
+                                    risks.push(
+                                        "write_file tool not allowed by project policy".into(),
+                                    );
+                                    messages.push(serde_json::json!({ "role": "user", "content": "Error: write_file tool is disabled for this project" }));
+                                    continue;
+                                }
+
+                                match store.write_proposed_file(
+                                    &project.root_path,
+                                    &task.id,
+                                    rel_path,
+                                    file_content,
+                                ) {
+                                    Ok(_) => {
+                                        store.emit_event(TaskEvent {
+                                        task_id: task.id.clone(),
+                                        ts: Utc::now().timestamp_millis() as u64,
+                                        kind: "file".into(),
+                                        payload: serde_json::json!({ "path": rel_path, "action": "write_proposed" }),
+                                    });
+                                        messages.push(serde_json::json!({ "role": "user", "content": format!("Successfully wrote proposed file {}", rel_path) }));
+                                    }
+                                    Err(e) => {
+                                        risks.push(format!(
+                                            "Failed writing proposed file {}: {}",
+                                            rel_path, e
+                                        ));
+                                        messages.push(serde_json::json!({ "role": "user", "content": format!("Error writing proposed file {}: {}", rel_path, e) }));
+                                    }
+                                }
+                            }
+                            "read_file" => {
+                                let rel_path = tool_call
+                                    .args
+                                    .get("path")
+                                    .and_then(|p| p.as_str())
+                                    .unwrap_or("");
+                                let proposed_file = store
+                                    .get_task_proposed_dir(&project.root_path, &task.id)
+                                    .join(rel_path);
+                                let file_text = if proposed_file.exists() {
+                                    fs::read_to_string(&proposed_file).unwrap_or_default()
+                                } else if let Ok(live_p) =
+                                    TaskRuntimeStore::validate_and_resolve_path(
+                                        &project.root_path,
+                                        rel_path,
+                                    )
+                                {
+                                    fs::read_to_string(&live_p).unwrap_or_default()
+                                } else {
+                                    "File not found".to_string()
+                                };
+                                messages.push(serde_json::json!({ "role": "user", "content": format!("File content of {}:\n{}", rel_path, file_text) }));
+                            }
+                            "run_command" | "exec" | "execute" | "shell" => {
+                                let argv: Vec<String> = if let Some(arr) =
+                                    tool_call.args.get("argv").and_then(|a| a.as_array())
+                                {
+                                    arr.iter()
+                                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                        .collect()
+                                } else if let Some(cmd_str) =
+                                    tool_call.args.get("command").and_then(|c| c.as_str())
+                                {
+                                    cmd_str.split_whitespace().map(|s| s.to_string()).collect()
+                                } else {
+                                    vec![]
+                                };
+
+                                if argv.is_empty() {
+                                    messages.push(serde_json::json!({ "role": "user", "content": "Error: empty command" }));
+                                    continue;
+                                }
+
+                                let judge_eval = Judge::evaluate(&argv);
+                                store.emit_event(TaskEvent {
+                                task_id: task.id.clone(),
+                                ts: Utc::now().timestamp_millis() as u64,
+                                kind: "judge".into(),
+                                payload: serde_json::json!({ "argv": argv, "decision": format!("{:?}", judge_eval) }),
+                            });
+
+                                match judge_eval {
+                                    JudgeResult::Allow => {
+                                        if !project
+                                            .allowed_tools
+                                            .contains(&"run_command".to_string())
+                                            && !project
+                                                .allowed_tools
+                                                .contains(&"execute".to_string())
+                                        {
+                                            risks.push(
+                                                "Command execution tool not allowed by project policy"
+                                                    .into(),
+                                            );
+                                            messages.push(serde_json::json!({ "role": "user", "content": "Error: command execution is disabled for this project" }));
+                                            continue;
+                                        }
+
+                                        let output_res = tokio::process::Command::new(&argv[0])
+                                            .args(&argv[1..])
+                                            .current_dir(&project.root_path)
+                                            .output()
+                                            .await;
+
+                                        match output_res {
+                                            Ok(output) => {
+                                                let exit_code = output.status.code().unwrap_or(-1);
+                                                let stdout =
+                                                    String::from_utf8_lossy(&output.stdout);
+                                                let stderr =
+                                                    String::from_utf8_lossy(&output.stderr);
+                                                let excerpt = format!(
+                                                    "STDOUT:\n{}\nSTDERR:\n{}",
+                                                    stdout, stderr
+                                                );
+                                                let trimmed_excerpt = if excerpt.len() > 1000 {
+                                                    format!("{}...\n(truncated)", &excerpt[..1000])
+                                                } else {
+                                                    excerpt
+                                                };
+
+                                                commands_executed.push(ReviewCommand {
+                                                    argv: argv.clone(),
+                                                    judge: JudgeDecision::Allow,
+                                                    exit: exit_code,
+                                                    excerpt: trimmed_excerpt.clone(),
+                                                });
+
+                                                if exit_code == 0 {
+                                                    checks.push(format!(
+                                                        "Passed: {}",
+                                                        argv.join(" ")
+                                                    ));
+                                                } else {
+                                                    risks.push(format!(
+                                                        "Command failed (exit {}): {}",
+                                                        exit_code,
+                                                        argv.join(" ")
+                                                    ));
+                                                }
+
+                                                messages.push(serde_json::json!({
+                                                "role": "user",
+                                                "content": format!("Command '{}' exited with {}:\n{}", argv.join(" "), exit_code, trimmed_excerpt)
+                                            }));
+                                            }
+                                            Err(e) => {
+                                                commands_executed.push(ReviewCommand {
+                                                    argv: argv.clone(),
+                                                    judge: JudgeDecision::Allow,
+                                                    exit: -1,
+                                                    excerpt: format!(
+                                                        "Failed to spawn command: {}",
+                                                        e
+                                                    ),
+                                                });
+                                                risks.push(format!(
+                                                    "Failed to execute command {}: {}",
+                                                    argv.join(" "),
+                                                    e
+                                                ));
+                                                messages.push(serde_json::json!({ "role": "user", "content": format!("Failed to execute command: {}", e) }));
+                                            }
+                                        }
+                                    }
+                                    JudgeResult::Deny => {
+                                        commands_executed.push(ReviewCommand {
+                                            argv: argv.clone(),
+                                            judge: JudgeDecision::Deny,
+                                            exit: -1,
+                                            excerpt: "Command denied by Judge security policy"
+                                                .into(),
+                                        });
+                                        risks.push(format!(
+                                            "Denied unsafe command execution: {}",
+                                            argv.join(" ")
+                                        ));
+                                        messages.push(serde_json::json!({ "role": "user", "content": "Command denied by Judge security policy" }));
+                                    }
+                                    JudgeResult::Pause => {
+                                        final_status = TaskStatus::Blocked;
+                                        commands_executed.push(ReviewCommand {
+                                            argv: argv.clone(),
+                                            judge: JudgeDecision::Pause,
+                                            exit: -1,
+                                            excerpt: "Command execution paused pending approval"
+                                                .into(),
+                                        });
+                                        risks.push("Command requires human approval".into());
+                                        messages.push(serde_json::json!({ "role": "user", "content": "Command paused pending human approval" }));
+                                        should_stop = true;
+                                    }
+                                }
+                            }
+                            // MCP tools are named `mcp_{server}::{tool}`. Dispatch
+                            // is gated twice: the project must list `mcp_read`,
+                            // and `execute_mcp_tool` re-checks the capability
+                            // class, so a model that hallucinates a Write-class
+                            // name gets a refusal rather than an execution.
+                            name if name.starts_with("mcp_") => {
+                                if !project
+                                    .effective_allowed_tools()
+                                    .contains(&"mcp_read".to_string())
+                                {
+                                    risks.push(format!(
+                                    "MCP tool '{}' called but mcp_read is not enabled for this project",
+                                    name
+                                ));
+                                    messages.push(serde_json::json!({ "role": "user", "content": "Error: MCP tools are disabled for this project" }));
+                                    continue;
+                                }
+                                let Some((server, tool)) =
+                                    crate::mcp_bridge::parse_mcp_tool_name(name)
+                                else {
+                                    messages.push(serde_json::json!({ "role": "user", "content": format!("Error: malformed MCP tool name '{}'", name) }));
+                                    continue;
+                                };
+                                let Some(registry) = store.mcp_registry() else {
+                                    // Record it as a risk, not just a message: the
+                                    // message goes back to the model, but the
+                                    // ReviewPacket is what a human reads, and a
+                                    // tool that could not run must be visible
+                                    // there — otherwise the packet claims the
+                                    // agent searched when it could not.
+                                    risks.push(format!(
+                                    "MCP tool '{}' could not run: no MCP registry is configured on this server",
+                                    name
+                                ));
+                                    messages.push(serde_json::json!({ "role": "user", "content": "Error: no MCP registry is configured on this server" }));
+                                    continue;
+                                };
+                                let result = crate::mcp_bridge::execute_mcp_tool(
+                                    registry,
+                                    &server,
+                                    &tool,
+                                    &tool_call.args,
+                                    &task.id,
+                                    std::path::Path::new(&project.root_path),
+                                )
+                                .await;
+                                match result {
+                                    Ok(text) => {
+                                        checks.push(format!(
+                                            "MCP {}.{} returned output",
+                                            server, tool
+                                        ));
+                                        messages.push(serde_json::json!({
+                                            "role": "user",
+                                            "content": format!("MCP tool {}.{} result:
+                                        {}", server, tool, text)
+                                        }));
+                                    }
+                                    Err(e) => {
+                                        risks.push(format!(
+                                            "MCP tool {}.{} refused: {}",
+                                            server, tool, e
+                                        ));
+                                        messages.push(serde_json::json!({
+                                        "role": "user",
+                                        "content": format!("Error: MCP tool {}.{} failed: {}", server, tool, e)
+                                    }));
+                                    }
+                                }
+                            }
+                            _ => {
+                                messages.push(serde_json::json!({ "role": "user", "content": format!("Unknown or unhandled tool: {}", tool_call.name) }));
+                            }
+                        }
+
+                        if should_stop {
+                            break;
                         }
                     }
 
@@ -2021,159 +2295,255 @@ impl TaskRunner {
                     }
                 }
 
-                if should_stop {
-                    break;
+                if run.step_count >= max_steps && final_status != TaskStatus::Blocked {
+                    risks.push("Step budget exhausted (max_steps)".into());
                 }
-            }
 
-            if run.step_count >= max_steps && final_status != TaskStatus::Blocked {
-                risks.push("Step budget exhausted (max_steps)".into());
-            }
-
-            if context_dropped_total > 0 {
-                // Surface it rather than letting compaction happen silently:
-                // a reviewer should know the agent was working from a
-                // truncated transcript, not the whole history.
-                risks.push(format!(
-                    "Context compacted: {} older message(s) dropped to fit the \
+                if context_dropped_total > 0 {
+                    // Surface it rather than letting compaction happen silently:
+                    // a reviewer should know the agent was working from a
+                    // truncated transcript, not the whole history.
+                    risks.push(format!(
+                        "Context compacted: {} older message(s) dropped to fit the \
                      {}-token budget (system prompt and task goal pinned)",
-                    context_dropped_total, governor.token_budget
-                ));
-            }
-
-            if cancel_token.is_cancelled() {
-                return Err(anyhow!("Task execution cancelled by user"));
-            }
-
-            // Generate ReviewPacket from proposed/ tree vs live root
-            let proposed_dir = store.get_task_proposed_dir(&project.root_path, &task.id);
-            let mut rel_proposed_files = Vec::new();
-            let _ = list_dir_relative(&proposed_dir, &proposed_dir, &mut rel_proposed_files);
-
-            let mut diffs = Vec::new();
-            for rel_path in rel_proposed_files {
-                let proposed_file_path = proposed_dir.join(&rel_path);
-                let proposed_content = fs::read_to_string(&proposed_file_path).unwrap_or_default();
-
-                let original_content = if let Ok(live_path) =
-                    TaskRuntimeStore::validate_and_resolve_path(&project.root_path, &rel_path)
-                {
-                    fs::read_to_string(live_path).unwrap_or_default()
-                } else {
-                    "".to_string()
-                };
-
-                let unified_diff = unified_diff(&rel_path, &original_content, &proposed_content);
-
-                diffs.push(ReviewDiff {
-                    path: rel_path,
-                    unified_diff,
-                    original: original_content,
-                    proposed: proposed_content,
-                });
-            }
-
-            // ---- Verification ------------------------------------------------
-            //
-            // Run the project's own definition of done against the *merged*
-            // result, not the staged tree in isolation: a change is only good
-            // if it works alongside the code it is being merged into. The
-            // proposed files are applied to a scratch copy of the project so
-            // the live tree is never touched.
-            let plan = VerificationPlan::detect(&project.root_path);
-            let mut verification: Vec<VerificationResult> = Vec::new();
-
-            match &plan {
-                None => {
-                    risks.push(
-                        "No verification plan detected (no Cargo.toml / package.json \
-                         test script / pytest config) — this change is UNVERIFIED"
-                            .into(),
-                    );
+                        context_dropped_total, governor.token_budget
+                    ));
                 }
-                Some(plan) => {
-                    let disallowed = plan.disallowed_commands();
-                    if !disallowed.is_empty() {
-                        // A plan that asks for something the Judge refuses is a
-                        // configuration error, not a reason to run it anyway.
-                        for argv in disallowed {
-                            risks.push(format!(
-                                "Verification plan command refused by Judge policy: {}",
-                                argv.join(" ")
-                            ));
-                        }
-                    } else if !diffs.is_empty() {
-                        store.emit_event(TaskEvent {
-                            task_id: task.id.clone(),
-                            ts: Utc::now().timestamp_millis() as u64,
-                            kind: "verification_started".into(),
-                            payload: serde_json::json!({
-                                "commands": plan.commands,
-                            }),
-                        });
 
-                        match Self::verify_on_scratch_copy(
-                            &store,
-                            &project.root_path,
-                            &task.id,
-                            plan,
-                        )
-                        .await
-                        {
-                            Ok(results) => {
-                                for r in &results {
-                                    if r.passed {
-                                        checks.push(r.summary());
-                                    } else {
-                                        risks.push(r.summary());
-                                    }
-                                }
-                                verification = results;
-                            }
-                            Err(e) => risks.push(format!(
-                                "Verification could not run: {e} — change is UNVERIFIED"
-                            )),
-                        }
+                if cancel_token.is_cancelled() {
+                    return Err(anyhow!("Task execution cancelled by user"));
+                }
+
+                // Generate ReviewPacket from proposed/ tree vs live root
+                let proposed_dir = store.get_task_proposed_dir(&project.root_path, &task.id);
+                let mut rel_proposed_files = Vec::new();
+                let _ = list_dir_relative(&proposed_dir, &proposed_dir, &mut rel_proposed_files);
+
+                let mut diffs = Vec::new();
+                for rel_path in rel_proposed_files {
+                    let proposed_file_path = proposed_dir.join(&rel_path);
+                    let proposed_content =
+                        fs::read_to_string(&proposed_file_path).unwrap_or_default();
+
+                    let original_content = if let Ok(live_path) =
+                        TaskRuntimeStore::validate_and_resolve_path(&project.root_path, &rel_path)
+                    {
+                        fs::read_to_string(live_path).unwrap_or_default()
+                    } else {
+                        "".to_string()
+                    };
+
+                    let unified_diff =
+                        unified_diff(&rel_path, &original_content, &proposed_content);
+
+                    diffs.push(ReviewDiff {
+                        path: rel_path,
+                        unified_diff,
+                        original: original_content,
+                        proposed: proposed_content,
+                    });
+                }
+
+                // ---- Verification ------------------------------------------------
+                //
+                // Run the project's own definition of done against the *merged*
+                // result, not the staged tree in isolation: a change is only good
+                // if it works alongside the code it is being merged into. The
+                // proposed files are applied to a scratch copy of the project so
+                // the live tree is never touched.
+                let plan = VerificationPlan::detect(&project.root_path);
+                let mut verification: Vec<VerificationResult> = Vec::new();
+
+                match &plan {
+                    None => {
+                        risks.push(
+                            "No verification plan detected (no Cargo.toml / package.json \
+                         test script / pytest config) — this change is UNVERIFIED"
+                                .into(),
+                        );
                     }
+                    Some(plan) => {
+                        let disallowed = plan.disallowed_commands();
+                        if !disallowed.is_empty() {
+                            // A plan that asks for something the Judge refuses is a
+                            // configuration error, not a reason to run it anyway.
+                            for argv in disallowed {
+                                risks.push(format!(
+                                    "Verification plan command refused by Judge policy: {}",
+                                    argv.join(" ")
+                                ));
+                            }
+                        } else if !diffs.is_empty() {
+                            store.emit_event(TaskEvent {
+                                task_id: task.id.clone(),
+                                ts: Utc::now().timestamp_millis() as u64,
+                                kind: "verification_started".into(),
+                                payload: serde_json::json!({
+                                    "commands": plan.commands,
+                                }),
+                            });
 
-                    // Be explicit about the unverified case rather than letting
-                    // an empty `checks` read as success.
-                    //
-                    // Two different situations produce an empty `verification`, and
-                    // conflating them is misleading in both directions. When the
-                    // implementer wrote no files there is nothing to verify -- the
-                    // run did not fail, it simply has nothing to show, and saying
-                    // verification "produced no results" implies a check ran and
-                    // came back empty. Observed live: 23 reviews carried that exact
-                    // risk when the real cause was a backend inference error three
-                    // steps earlier, so the message pointed at the wrong thing
-                    // entirely.
-                    if verification.is_empty() && !plan.commands.is_empty() {
-                        if diffs.is_empty() {
-                            risks.push(
+                            match Self::verify_on_scratch_copy(
+                                &store,
+                                &project.root_path,
+                                &task.id,
+                                plan,
+                            )
+                            .await
+                            {
+                                Ok(results) => {
+                                    for r in &results {
+                                        if r.passed {
+                                            checks.push(r.summary());
+                                        } else {
+                                            risks.push(r.summary());
+                                        }
+                                    }
+                                    verification = results;
+                                }
+                                Err(e) => risks.push(format!(
+                                    "Verification could not run: {e} — change is UNVERIFIED"
+                                )),
+                            }
+                        }
+
+                        // Be explicit about the unverified case rather than letting
+                        // an empty `checks` read as success.
+                        //
+                        // Two different situations produce an empty `verification`, and
+                        // conflating them is misleading in both directions. When the
+                        // implementer wrote no files there is nothing to verify -- the
+                        // run did not fail, it simply has nothing to show, and saying
+                        // verification "produced no results" implies a check ran and
+                        // came back empty. Observed live: 23 reviews carried that exact
+                        // risk when the real cause was a backend inference error three
+                        // steps earlier, so the message pointed at the wrong thing
+                        // entirely.
+                        if verification.is_empty() && !plan.commands.is_empty() {
+                            if diffs.is_empty() {
+                                risks.push(
                                 "Verification skipped: the implementer proposed no file                                  changes, so there was nothing to verify"
                                     .into(),
                             );
-                        } else {
-                            risks.push(
-                                "Verification produced no results — change is UNVERIFIED".into(),
-                            );
+                            } else {
+                                risks.push(
+                                    "Verification produced no results — change is UNVERIFIED"
+                                        .into(),
+                                );
+                            }
                         }
                     }
                 }
-            }
 
-            let review = ReviewPacket {
-                id: format!("rev_{}", Uuid::new_v4().simple()),
-                task_id: task.id.clone(),
-                run_id: run.id.clone(),
-                summary: format!("Proposed changes for task: {}", task.goal),
-                diffs,
-                commands: commands_executed,
-                checks,
-                risks,
-                verification,
-                created_at: Utc::now().to_rfc3339(),
+                // ---- Auto-fix -------------------------------------------
+                //
+                // Verification ran and something failed. Give the model one
+                // more chance *before* the packet is produced, so the human
+                // sees a repaired proposal rather than a known-broken one.
+                // Bounded by MAX_AUTO_FIX_ATTEMPTS and by the remaining step
+                // budget - the `while` above re-enters with `run.step_count`
+                // already advanced, so this cannot loop.
+                //
+                // The Judge still gates every command the retry issues, and
+                // the staging tree is still the only thing it can write to.
+                //
+                // `plan` is only a signal here — its `commands` were already run by
+                // the block above — so the binding is intentionally unused; what
+                // matters is that a plan existed at all.
+                if plan.is_some() {
+                    let any_failed = verification.iter().any(|r| !r.passed);
+                    let has_changes = !diffs.is_empty();
+                    if any_failed
+                        && has_changes
+                        && auto_fix_attempts < MAX_AUTO_FIX_ATTEMPTS
+                        && run.step_count < max_steps
+                        && !cancel_token.is_cancelled()
+                    {
+                        auto_fix_attempts += 1;
+                        let failure_summary: String = verification
+                            .iter()
+                            .filter(|r| !r.passed)
+                            .map(|r| r.summary())
+                            .collect::<Vec<_>>()
+                            .join(
+                                "
+",
+                            );
+                        store.emit_event(TaskEvent {
+                            task_id: task.id.clone(),
+                            ts: Utc::now().timestamp_millis() as u64,
+                            kind: "auto_fix_triggered".into(),
+                            payload: serde_json::json!({
+                                "attempt": auto_fix_attempts,
+                                "max_attempts": MAX_AUTO_FIX_ATTEMPTS,
+                                "failures": failure_summary,
+                                "steps_used": run.step_count,
+                                "max_steps": max_steps,
+                            }),
+                        });
+                        messages.push(serde_json::json!({
+                            "role": "user",
+                            "content": format!(
+                                "Verification failed:
+{}
+
+Fix the proposed files so the verification \
+                                 passes. Update the files in the proposed/ directory. This is your \
+                                 last automatic attempt ({} of {}); after it the change goes to \
+                                 human review as-is.",
+                                failure_summary, auto_fix_attempts, MAX_AUTO_FIX_ATTEMPTS
+                            ),
+                        }));
+                        // Clear the failed results: the retry's own
+                        // verification replaces them, and a stale failure must
+                        // not survive into the packet if the retry passes.
+                        verification.clear();
+                        continue 'agent_loop;
+                    }
+                }
+
+                let accelerator_usage = placement.as_ref().map(|p| AcceleratorUsage {
+                    node_id: p.assigned_node.clone(),
+                    compute_capability: p.node_capability.compute_capability.clone(),
+                    gpu_name: p.node_capability.gpu_name.clone(),
+                    vram_free_gb: p.node_capability.available_vram_gb,
+                    commands_executed: commands_executed.len() as u32,
+                    tokens_generated: run.token_count,
+                });
+                let context_summary = if context_dropped_total > 0 {
+                    Some(ContextSummary {
+                        original_turn_count: context_dropped_total,
+                        summary_text: format!(
+                            "{} older message(s) were dropped to fit the {}-token context budget. \
+                         The system prompt and the original task goal were pinned; the most \
+                         recent turns were kept in full.",
+                            context_dropped_total, governor.token_budget
+                        ),
+                        key_decisions: Vec::new(),
+                        files_modified: files_touched_in_compacted_turns(&messages),
+                    })
+                } else {
+                    None
+                };
+                let review = ReviewPacket {
+                    id: format!("rev_{}", Uuid::new_v4().simple()),
+                    task_id: task.id.clone(),
+                    run_id: run.id.clone(),
+                    summary: format!("Proposed changes for task: {}", task.goal),
+                    diffs,
+                    commands: commands_executed,
+                    checks,
+                    risks,
+                    verification,
+                    placement,
+                    accelerator_usage,
+                    context_summary,
+                    created_at: Utc::now().to_rfc3339(),
+                };
+
+                // Close the outer agent loop, carrying the finished packet out.
+                // Reached only when the auto-fix path did not re-enter it.
+                break 'agent_loop (review, final_status);
             };
 
             Ok((review, final_status))
@@ -2215,6 +2585,34 @@ impl TaskRunner {
         let _ = fs::remove_dir_all(&scratch);
         Ok(results)
     }
+}
+
+/// Every file path named in a `write_file` tool call across the transcript.
+///
+/// Used to populate `ContextSummary::files_modified` when compaction drops
+/// turns: the reviewer needs to know what the agent touched even if the
+/// turns describing it are gone. Paths come from the tool-call arguments,
+/// not from inference, so this cannot name a file the agent never wrote.
+fn files_touched_in_compacted_turns(messages: &[serde_json::Value]) -> Vec<String> {
+    let mut files: Vec<String> = Vec::new();
+    for msg in messages {
+        if let Some(calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
+            for call in calls {
+                if call.get("name").and_then(|n| n.as_str()) == Some("write_file") {
+                    if let Some(path) = call
+                        .get("args")
+                        .and_then(|a| a.get("path"))
+                        .and_then(|p| p.as_str())
+                    {
+                        if !files.iter().any(|f| f == path) {
+                            files.push(path.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    files
 }
 
 /// Recursively copy `src` into `dst`, skipping the task staging tree and VCS
@@ -2763,6 +3161,36 @@ mod tests {
             Judge::evaluate(&["git".into(), "status".into()]),
             JudgeResult::Allow
         );
+
+        // Read-only git subcommands an agent legitimately needs: `show` for a
+        // commit, `branch` for where it is, `stash` to park work-in-progress.
+        // Each is non-destructive, so each is Allow rather than Pause.
+        for sub in ["status", "diff", "log", "show", "branch", "stash"] {
+            assert_eq!(
+                Judge::evaluate(&["git".into(), sub.into()]),
+                JudgeResult::Allow,
+                "git {sub} must be allowed"
+            );
+        }
+
+        // Destructive git operations stay refused regardless of subcommand.
+        for argv in [
+            vec!["git".to_string(), "reset".to_string(), "--hard".to_string()],
+            vec!["git".to_string(), "push".to_string(), "--force".to_string()],
+            vec!["git".to_string(), "push".to_string(), "-f".to_string()],
+        ] {
+            assert_eq!(
+                Judge::evaluate(&argv),
+                JudgeResult::Deny,
+                "{argv:?} must be denied"
+            );
+        }
+
+        // A bare `git` with no subcommand is not a read: it falls through
+        // `is_allowed`'s `argv.len() >= 2` guard and lands on the default
+        // Pause (unrecognized), which still requires human approval — so it
+        // does not execute unattended either way.
+        assert_eq!(Judge::evaluate(&["git".into()]), JudgeResult::Pause);
 
         assert_eq!(
             Judge::evaluate(&["rm".into(), "-rf".into(), "/".into()]),
@@ -3698,6 +4126,9 @@ mod parallel_and_compact_tests {
             checks: vec![],
             risks: vec![],
             verification: vec![],
+            placement: None,
+            accelerator_usage: None,
+            context_summary: None,
             created_at: String::new(),
         };
         assert_eq!(
@@ -3729,5 +4160,550 @@ mod parallel_and_compact_tests {
             ..empty.clone()
         };
         assert_eq!(ok.verification_passed(), Some(true));
+    }
+}
+
+/// Tests for the heterogeneous-agentic-task features: cluster placement,
+/// MCP dispatch, auto-fix, and context summarization.
+#[cfg(test)]
+mod heterogeneous_tests {
+    use super::*;
+
+    fn store_in(dir: &std::path::Path) -> Arc<TaskRuntimeStore> {
+        Arc::new(TaskRuntimeStore::new(dir).unwrap())
+    }
+
+    /// Same as [`store_in`] but with a cluster attached, still wrapped in an
+    /// `Arc` — `with_cluster` consumes and returns the bare struct.
+    fn store_in_with_cluster(
+        dir: &std::path::Path,
+        cluster: Arc<ghostlink_core::cluster::ClusterState>,
+    ) -> Arc<TaskRuntimeStore> {
+        Arc::new(TaskRuntimeStore::new(dir).unwrap().with_cluster(cluster))
+    }
+
+    fn proj_with_root(store: &TaskRuntimeStore, root: &std::path::Path) -> Project {
+        fs::create_dir_all(root).unwrap();
+        store
+            .create_project(
+                "Hetero Proj".into(),
+                ProjectKind::Code,
+                root.to_string_lossy().to_string(),
+                None,
+                None,
+            )
+            .unwrap()
+    }
+
+    fn fake_run(task_id: &str) -> AgentRun {
+        AgentRun {
+            id: format!("run_{}", Uuid::new_v4().simple()),
+            task_id: task_id.to_string(),
+            role: "implementer".into(),
+            model: "m".into(),
+            status: "running".into(),
+            step_count: 0,
+            token_count: 0,
+            started_at: Utc::now().to_rfc3339(),
+            finished_at: None,
+            error: None,
+        }
+    }
+
+    // ---- placement -------------------------------------------------------
+
+    /// Single-node mode is the default and must stay byte-identical: no
+    /// placement decision, no `placement_decided` event, and the new
+    /// ReviewPacket fields absent from the JSON rather than null.
+    #[tokio::test]
+    async fn single_node_run_has_no_placement_and_no_placement_event() {
+        let temp = std::env::temp_dir().join(format!("gl_het_single_{}", Uuid::new_v4()));
+        let proj_dir = std::env::temp_dir().join(format!("gl_het_single_p_{}", Uuid::new_v4()));
+        let store = store_in(&temp);
+        let proj = proj_with_root(&store, &proj_dir);
+
+        let task = store
+            .create_task(&proj.id, "Do a thing".into(), None, None, None)
+            .unwrap();
+
+        let backend = Arc::new(FakeBackend {
+            responses: Arc::new(Mutex::new(vec![AgentResponse {
+                content: Some("done".into()),
+                tool_calls: vec![],
+                usage_tokens: None,
+            }])),
+        });
+        let mut run = fake_run(&task.id);
+        let (review, _status) = TaskRunner::run_loop(
+            Arc::clone(&store),
+            backend,
+            task.clone(),
+            &mut run,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(review.placement.is_none(), "single-node must not place");
+        assert!(review.accelerator_usage.is_none());
+        assert!(review.context_summary.is_none());
+
+        let events = store.get_task_events(&task.id);
+        assert!(
+            !events.iter().any(|e| e.kind == "placement_decided"),
+            "single-node must emit no placement_decided"
+        );
+
+        // Absent, not null: the fields must not appear in the serialized packet.
+        let json = serde_json::to_value(&review).unwrap();
+        assert!(json.get("placement").is_none());
+        assert!(json.get("accelerator_usage").is_none());
+        assert!(json.get("context_summary").is_none());
+
+        let _ = fs::remove_dir_all(&temp);
+        let _ = fs::remove_dir_all(&proj_dir);
+    }
+
+    /// A cluster with one active node produces a placement decision, the SSE
+    /// event, and accelerator usage carried into the packet.
+    #[tokio::test]
+    async fn clustered_run_places_and_emits_event() {
+        let temp = std::env::temp_dir().join(format!("gl_het_cluster_{}", Uuid::new_v4()));
+        let proj_dir = std::env::temp_dir().join(format!("gl_het_cluster_p_{}", Uuid::new_v4()));
+        let cluster = Arc::new(ghostlink_core::cluster::ClusterState::new());
+        cluster.register(ghostlink_core::protocol::NodeResources::new(
+            "gpu-one",
+            24.0,
+            64.0,
+            "cuda",
+            Some("RTX 4090".to_string()),
+        ));
+        let store = store_in_with_cluster(&temp, Arc::clone(&cluster));
+        let proj = proj_with_root(&store, &proj_dir);
+
+        let task = store
+            .create_task(&proj.id, "Heavy coding task".into(), None, None, None)
+            .unwrap();
+
+        let backend = Arc::new(FakeBackend {
+            responses: Arc::new(Mutex::new(vec![AgentResponse {
+                content: Some("done".into()),
+                tool_calls: vec![],
+                usage_tokens: None,
+            }])),
+        });
+        let mut run = fake_run(&task.id);
+        let (review, _status) = TaskRunner::run_loop(
+            Arc::clone(&store),
+            backend,
+            task.clone(),
+            &mut run,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let placement = review.placement.as_ref().expect("must place on a cluster");
+        assert_eq!(placement.assigned_node, "gpu-one");
+        assert_eq!(placement.node_capability.compute_capability, "cuda");
+        assert!(
+            placement.rationale.contains("VRAM"),
+            "rationale: {}",
+            placement.rationale
+        );
+
+        let usage = review
+            .accelerator_usage
+            .as_ref()
+            .expect("usage must be recorded");
+        assert_eq!(usage.node_id, "gpu-one");
+        assert_eq!(usage.gpu_name.as_deref(), Some("RTX 4090"));
+
+        let events = store.get_task_events(&task.id);
+        let ev = events
+            .iter()
+            .find(|e| e.kind == "placement_decided")
+            .expect("placement_decided must be emitted");
+        assert_eq!(ev.payload["assigned_node"], "gpu-one");
+
+        let _ = fs::remove_dir_all(&temp);
+        let _ = fs::remove_dir_all(&proj_dir);
+    }
+
+    // ---- MCP dispatch ----------------------------------------------------
+
+    /// An MCP tool call with no registry attached must be refused, not
+    /// silently dropped — and must not appear as a successful check.
+    #[tokio::test]
+    async fn mcp_tool_without_registry_is_refused() {
+        let temp = std::env::temp_dir().join(format!("gl_het_mcp_{}", Uuid::new_v4()));
+        let proj_dir = std::env::temp_dir().join(format!("gl_het_mcp_p_{}", Uuid::new_v4()));
+        let store = store_in(&temp);
+        let proj = proj_with_root(&store, &proj_dir);
+        // Grant `mcp_read` through the store's own setter so the policy the
+        // run_loop reads back is the one actually persisted.
+        store
+            .update_project(&proj.id, None, None, Some(proj.allowed_tools))
+            .unwrap();
+        let mut proj = store.get_project(&proj.id).unwrap();
+        proj.allowed_tools.push("mcp_read".to_string());
+        store
+            .update_project(&proj.id, None, None, Some(proj.allowed_tools))
+            .unwrap();
+        let proj = store.get_project(&proj.id).unwrap();
+        assert!(
+            proj.allowed_tools.contains(&"mcp_read".to_string()),
+            "test precondition: mcp_read must be granted"
+        );
+
+        let task = store
+            .create_task(&proj.id, "Search the docs".into(), None, None, None)
+            .unwrap();
+
+        let backend = Arc::new(FakeBackend {
+            responses: Arc::new(Mutex::new(vec![AgentResponse {
+                content: Some("searching".into()),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "mcp_rag::search".into(),
+                    args: serde_json::json!({ "query": "x" }),
+                }],
+                usage_tokens: None,
+            }])),
+        });
+        let mut run = fake_run(&task.id);
+        let (review, _status) = TaskRunner::run_loop(
+            Arc::clone(&store),
+            backend,
+            task.clone(),
+            &mut run,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            review.risks.iter().any(|r| r.contains("no MCP registry")),
+            "the refusal must be recorded as a risk, got: {:?}",
+            review.risks
+        );
+        assert!(
+            !review.checks.iter().any(|c| c.contains("MCP")),
+            "a refused call must not read as a passed check"
+        );
+
+        let _ = fs::remove_dir_all(&temp);
+        let _ = fs::remove_dir_all(&proj_dir);
+    }
+
+    /// A project without `mcp_read` must refuse the call even if a registry
+    /// were attached — the project policy is the outer gate.
+    #[tokio::test]
+    async fn mcp_tool_without_project_permission_is_refused() {
+        let temp = std::env::temp_dir().join(format!("gl_het_mcp2_{}", Uuid::new_v4()));
+        let proj_dir = std::env::temp_dir().join(format!("gl_het_mcp2_p_{}", Uuid::new_v4()));
+        let store = store_in(&temp);
+        let proj = proj_with_root(&store, &proj_dir); // no mcp_read
+
+        let task = store
+            .create_task(&proj.id, "Search".into(), None, None, None)
+            .unwrap();
+
+        let backend = Arc::new(FakeBackend {
+            responses: Arc::new(Mutex::new(vec![AgentResponse {
+                content: Some("searching".into()),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "mcp_rag::search".into(),
+                    args: serde_json::json!({ "query": "x" }),
+                }],
+                usage_tokens: None,
+            }])),
+        });
+        let mut run = fake_run(&task.id);
+        let (review, _status) = TaskRunner::run_loop(
+            Arc::clone(&store),
+            backend,
+            task.clone(),
+            &mut run,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            review
+                .risks
+                .iter()
+                .any(|r| r.contains("mcp_read is not enabled")),
+            "got: {:?}",
+            review.risks
+        );
+
+        let _ = fs::remove_dir_all(&temp);
+        let _ = fs::remove_dir_all(&proj_dir);
+    }
+
+    // ---- context summary -------------------------------------------------
+
+    /// The helper recovers file paths from `write_file` tool calls and
+    /// deduplicates them. It reads arguments, never the filesystem, so it
+    /// cannot name a file that was never written.
+    #[test]
+    fn files_touched_helper_reads_tool_call_args_and_dedupes() {
+        let msgs = vec![
+            serde_json::json!({ "role": "assistant", "tool_calls": [
+                { "name": "write_file", "args": { "path": "a.rs" } },
+                { "name": "write_file", "args": { "path": "a.rs" } },
+                { "name": "write_file", "args": { "path": "b.rs" } },
+                { "name": "read_file",  "args": { "path": "c.rs" } },
+            ]}),
+            serde_json::json!({ "role": "user", "content": "plain text" }),
+        ];
+        let files = files_touched_in_compacted_turns(&msgs);
+        assert_eq!(files, vec!["a.rs".to_string(), "b.rs".to_string()]);
+    }
+
+    #[test]
+    fn files_touched_helper_ignores_messages_without_tool_calls() {
+        let msgs = vec![
+            serde_json::json!({ "role": "user", "content": "hello" }),
+            serde_json::json!({ "role": "assistant", "content": "hi" }),
+        ];
+        assert!(files_touched_in_compacted_turns(&msgs).is_empty());
+    }
+
+    // ---- placement rationale ---------------------------------------------
+
+    /// The rationale must name the class the chooser actually matched, or the
+    /// ReviewPacket lies to the human reading it.
+    #[test]
+    fn placement_rationale_matches_chooser_branches() {
+        assert!(placement_rationale("vision task").contains("NPU"));
+        assert!(placement_rationale("heavy coding").contains("VRAM"));
+        assert!(placement_rationale("light verification").contains("CPU"));
+        assert!(placement_rationale("do something").contains("first active node"));
+    }
+}
+
+/// Auto-fix loop tests. The loop is the one place the runtime re-enters its
+/// own step loop, so its bounds are what matter.
+#[cfg(test)]
+mod autofix_tests {
+    use super::*;
+
+    fn store_in(dir: &std::path::Path) -> Arc<TaskRuntimeStore> {
+        Arc::new(TaskRuntimeStore::new(dir).unwrap())
+    }
+
+    fn make_run(task_id: &str) -> AgentRun {
+        AgentRun {
+            id: format!("run_{}", Uuid::new_v4().simple()),
+            task_id: task_id.to_string(),
+            role: "implementer".into(),
+            model: "m".into(),
+            status: "running".into(),
+            step_count: 0,
+            token_count: 0,
+            started_at: Utc::now().to_rfc3339(),
+            finished_at: None,
+            error: None,
+        }
+    }
+
+    /// A Cargo project whose `cargo test` genuinely fails, so the verification
+    /// plan is detected AND fails — the precondition for auto-fix.
+    fn failing_cargo_project(root: &std::path::Path) {
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"af\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "#[test]\nfn broken() { assert_eq!(1, 2, \"deliberately failing test\"); }\n",
+        )
+        .unwrap();
+    }
+
+    /// The auto-fix loop must not exceed its bound. `MAX_AUTO_FIX_ATTEMPTS` is
+    /// 1, so a failing verification produces exactly one `auto_fix_triggered`
+    /// event, and the run terminates rather than looping.
+    #[tokio::test]
+    async fn auto_fix_fires_exactly_once_on_failing_verification() {
+        let temp = std::env::temp_dir().join(format!("gl_af_{}", Uuid::new_v4()));
+        let proj_dir = std::env::temp_dir().join(format!("gl_af_p_{}", Uuid::new_v4()));
+        let store = store_in(&temp);
+        failing_cargo_project(&proj_dir);
+
+        let proj = store
+            .create_project(
+                "AF Proj".into(),
+                ProjectKind::Code,
+                proj_dir.to_string_lossy().to_string(),
+                None,
+                None,
+            )
+            .unwrap();
+
+        let budget = TaskBudget {
+            max_steps: 20,
+            ..Default::default()
+        };
+        let task = store
+            .create_task(
+                &proj.id,
+                "Fix the failing test".into(),
+                None,
+                Some(budget),
+                None,
+            )
+            .unwrap();
+
+        // Turn 1 writes a file (so `diffs` is non-empty and verification runs),
+        // then every later turn is empty so the loop terminates.
+        let backend = Arc::new(FakeBackend {
+            responses: Arc::new(Mutex::new(vec![
+                AgentResponse {
+                    content: Some("writing".into()),
+                    tool_calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "write_file".into(),
+                        args: serde_json::json!({ "path": "src/lib.rs", "content": "still broken" }),
+                    }],
+                    usage_tokens: None,
+                },
+                AgentResponse {
+                    content: Some("done".into()),
+                    tool_calls: vec![],
+                    usage_tokens: None,
+                },
+                AgentResponse {
+                    content: Some("done".into()),
+                    tool_calls: vec![],
+                    usage_tokens: None,
+                },
+            ])),
+        });
+
+        let mut run = make_run(&task.id);
+        let (review, _status) = TaskRunner::run_loop(
+            Arc::clone(&store),
+            backend,
+            task.clone(),
+            &mut run,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let events = store.get_task_events(&task.id);
+        let autofix: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind == "auto_fix_triggered")
+            .collect();
+        assert_eq!(
+            autofix.len(),
+            1,
+            "auto-fix must fire exactly once, got {} events",
+            autofix.len()
+        );
+        assert_eq!(autofix[0].payload["attempt"], 1);
+        assert_eq!(autofix[0].payload["max_attempts"], 1);
+        assert!(
+            autofix[0].payload["failures"]
+                .as_str()
+                .unwrap_or("")
+                .contains("FAIL"),
+            "the failure summary must name what failed: {:?}",
+            autofix[0].payload["failures"]
+        );
+
+        // The retry's verification replaced the stale failure rather than
+        // keeping both, and the packet still reports the real state.
+        assert!(
+            review.verification.iter().any(|r| !r.passed),
+            "the packet must still show the failing verification"
+        );
+
+        let _ = fs::remove_dir_all(&temp);
+        let _ = fs::remove_dir_all(&proj_dir);
+    }
+
+    /// With no failing verification there is no auto-fix at all: a passing run
+    /// must not be re-entered.
+    #[tokio::test]
+    async fn auto_fix_does_not_fire_when_verification_passes() {
+        let temp = std::env::temp_dir().join(format!("gl_af_ok_{}", Uuid::new_v4()));
+        let proj_dir = std::env::temp_dir().join(format!("gl_af_ok_p_{}", Uuid::new_v4()));
+        let store = store_in(&temp);
+        fs::create_dir_all(proj_dir.join("src")).unwrap();
+        fs::write(
+            proj_dir.join("Cargo.toml"),
+            "[package]\nname = \"ok\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            proj_dir.join("src/lib.rs"),
+            "#[test]\nfn fine() { assert_eq!(1, 1); }\n",
+        )
+        .unwrap();
+
+        let proj = store
+            .create_project(
+                "OK Proj".into(),
+                ProjectKind::Code,
+                proj_dir.to_string_lossy().to_string(),
+                None,
+                None,
+            )
+            .unwrap();
+        let budget = TaskBudget {
+            max_steps: 20,
+            ..Default::default()
+        };
+        let task = store
+            .create_task(
+                &proj.id,
+                "Write a passing test".into(),
+                None,
+                Some(budget),
+                None,
+            )
+            .unwrap();
+
+        let backend = Arc::new(FakeBackend {
+            responses: Arc::new(Mutex::new(vec![AgentResponse {
+                content: Some("done".into()),
+                tool_calls: vec![],
+                usage_tokens: None,
+            }])),
+        });
+        let mut run = make_run(&task.id);
+        let _ = TaskRunner::run_loop(
+            Arc::clone(&store),
+            backend,
+            task.clone(),
+            &mut run,
+            None,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let events = store.get_task_events(&task.id);
+        assert!(
+            !events.iter().any(|e| e.kind == "auto_fix_triggered"),
+            "a passing run must not trigger auto-fix"
+        );
+
+        let _ = fs::remove_dir_all(&temp);
+        let _ = fs::remove_dir_all(&proj_dir);
     }
 }

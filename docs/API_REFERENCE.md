@@ -310,5 +310,27 @@ Studio Task Agents enable durable project management, autonomous implementer age
 - **`POST /api/tasks/:id/spawn`**: Spawn implementer agent run (`{ role: "implementer", model?, brief? }`).
 - **`POST /api/tasks/:id/cancel`**: Cancel active task run.
 - **`GET /api/tasks/:id/events`**: Stream live task events via SSE (`text/event-stream`).
+
+  Accepts `?limit=N` (default 100) to cap replayed history, and honours the
+  `Last-Event-ID` request header to resume after the client's last seen id
+  rather than replaying from the beginning. Emits a `connection_status`
+  heartbeat every 30s so a silently-dropped connection is detectable.
+
+  Event kinds include `run_started`, `step`, `tool`, `judge`, `file`,
+  `retry`, `context_compacted`, `verification_started`, `placement_decided`,
+  `auto_fix_triggered`, `child_created`, `review_ready`, `cancelled`, `error`.
+
+  `placement_decided` fires only when the server has a cluster attached; in
+  single-node mode it never appears, and neither do the `placement` /
+  `accelerator_usage` / `context_summary` fields on the `ReviewPacket`.
+
 - **`GET /api/tasks/:id/review`**: Get task `ReviewPacket`.
+
+  Beyond `diffs` / `commands` / `checks` / `risks` / `verification`, the packet
+  carries `placement` (which node ran the task and why),
+  `accelerator_usage` (commands and tokens on that node), and
+  `context_summary` (what compaction dropped). All three are omitted from the
+  JSON when not applicable, so `undefined` means "not applicable" — never a
+  null placeholder.
+
 - **`POST /api/reviews/:id/decide`**: Submit human review decision (`{ decision: "accept"|"request_changes"|"reject", note? }`).

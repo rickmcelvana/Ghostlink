@@ -1,7 +1,7 @@
 import { resolveApiBase } from '../config';
 import React, { useState } from 'react';
 import { DiffEditor } from '@monaco-editor/react';
-import { Check, X, RefreshCw, AlertTriangle, Terminal, Shield, FileText } from 'lucide-react';
+import { Check, X, RefreshCw, AlertTriangle, Terminal, Shield, FileText, Cpu, Layers } from 'lucide-react';
 import { ReviewPacket, ReviewDiff, VerificationResult, GhostlinkAPI } from '../api';
 import { useAppStore } from '../store';
 
@@ -287,6 +287,53 @@ export const ReviewPane: React.FC<ReviewPaneProps> = ({ packet, api: propApi, on
               </div>
             )}
           </div>
+
+          {/* Placement and accelerator usage. Only rendered when the backend
+              actually ran on a cluster -- `placement` is absent (not null) in
+              single-node mode, so this section simply does not appear there
+              rather than claiming an unknown node. */}
+          {packet.placement && (
+            <div className="p-4 border-b border-slate-800">
+              <h3 className="text-xs font-semibold uppercase text-slate-400 mb-2 flex items-center gap-1.5">
+                <Cpu size={14} aria-hidden="true" /> Placement
+              </h3>
+              <p className="text-xs text-slate-300">
+                <span className="font-mono text-indigo-300">{packet.placement.assigned_node}</span>
+                {' — '}
+                {packet.placement.node_capability.compute_capability.toUpperCase()}
+                {packet.placement.node_capability.gpu_name
+                  ? ` (${packet.placement.node_capability.gpu_name})`
+                  : ''}
+                , {packet.placement.node_capability.available_vram_gb.toFixed(1)}GB VRAM free
+              </p>
+              <p className="text-xs text-slate-500 mt-1">{packet.placement.rationale}</p>
+              {packet.accelerator_usage && (
+                <p className="text-xs text-slate-500 mt-1">
+                  {packet.accelerator_usage.commands_executed} command(s),{' '}
+                  {packet.accelerator_usage.tokens_generated} token(s) generated on this node.
+                </p>
+              )}
+            </div>
+          )}
+
+          {/* Context compaction. Present only when turns were actually
+              dropped; its absence is the signal that nothing was lost. */}
+          {packet.context_summary && (
+            <div className="p-4 border-b border-slate-800">
+              <h3 className="text-xs font-semibold uppercase text-slate-400 mb-2 flex items-center gap-1.5">
+                <Layers size={14} aria-hidden="true" /> Context Compacted
+              </h3>
+              <p className="text-xs text-amber-300/90">{packet.context_summary.summary_text}</p>
+              {packet.context_summary.files_modified.length > 0 && (
+                <p className="text-xs text-slate-500 mt-1">
+                  Files touched before compaction:{' '}
+                  <span className="font-mono">
+                    {packet.context_summary.files_modified.join(', ')}
+                  </span>
+                </p>
+              )}
+            </div>
+          )}
 
           {/* Checks */}
           {packet.checks && packet.checks.length > 0 && (

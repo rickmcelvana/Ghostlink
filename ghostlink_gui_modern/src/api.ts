@@ -81,7 +81,59 @@ export interface ReviewPacket {
    * as green.
    */
   verification?: VerificationResult[];
+  /**
+   * Which cluster node this run was placed on, and why. Absent in single-node
+   * mode -- the backend omits the field rather than sending null, so `undefined`
+   * here means "no cluster", never "cluster but unplaced".
+   */
+  placement?: PlacementDecision;
+  /**
+   * What accelerator work the run actually did. Absent in single-node mode.
+   */
+  accelerator_usage?: AcceleratorUsage;
+  /**
+   * What was dropped when the transcript no longer fit the context budget.
+   * Absent when nothing was compacted.
+   */
+  context_summary?: ContextSummary;
   created_at: string;
+}
+
+export interface PlacementDecision {
+  task_id: string;
+  assigned_node: string;
+  node_capability: NodeCapability;
+  rationale: string;
+  alternative_nodes: string[];
+}
+
+export interface NodeCapability {
+  node_id: string;
+  name: string;
+  status: string;
+  vram_gb: number;
+  system_memory_gb: number;
+  compute_capability: string;
+  gpu_name?: string;
+  available_vram_gb: number;
+  avg_latency_us: number;
+  streaming_layers?: [number, number];
+}
+
+export interface AcceleratorUsage {
+  node_id: string;
+  compute_capability: string;
+  gpu_name?: string;
+  vram_free_gb: number;
+  commands_executed: number;
+  tokens_generated: number;
+}
+
+export interface ContextSummary {
+  original_turn_count: number;
+  summary_text: string;
+  key_decisions: string[];
+  files_modified: string[];
 }
 
 export interface TaskEvent {

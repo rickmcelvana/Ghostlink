@@ -7,7 +7,7 @@ use crate::BackendState;
 use crate::InferenceEngine;
 use anyhow::Result;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::sse::{Event, Sse},
     response::IntoResponse,
@@ -108,6 +108,27 @@ pub fn build_tool_definitions(allowed_tools: &[String]) -> Vec<Value> {
     tools
 }
 
+/// Append the live MCP Read-class tools to a tool list.
+///
+/// Split from `build_tool_definitions` because that function is synchronous and
+/// pure (and unit-tested as such) while listing MCP tools needs the registry
+/// and an async round trip. The caller is `RealAgentBackend::chat`, which has
+/// both. A project that does not list `mcp_read` never reaches here, so the
+/// toolset is unchanged for every existing project.
+///
+/// Only `CapabilityClass::Read` tools are ever added; `mcp_bridge` enforces
+/// that, and it is re-enforced at dispatch time in the runtime.
+pub async fn extend_with_mcp_tools(
+    tools: &mut Vec<Value>,
+    allowed_tools: &[String],
+    registry: &crate::mcp::McpRegistry,
+) {
+    if !allowed_tools.contains(&"mcp_read".to_string()) {
+        return;
+    }
+    tools.extend(crate::mcp_bridge::list_mcp_tools_for_agent(registry).await);
+}
+
 pub fn parse_fallback_tool_calls(text: &str) -> Vec<ToolCall> {
     let mut tool_calls = Vec::new();
 
@@ -156,6 +177,7 @@ impl AgentBackend for RealAgentBackend {
             settings,
             plugin_registry,
             inference_backend,
+            mcp_registry,
         ) = {
             let guard = self.state.lock().unwrap();
             (
@@ -166,10 +188,15 @@ impl AgentBackend for RealAgentBackend {
                 guard.settings.clone(),
                 guard.plugin_registry.clone(),
                 guard.inference_backend,
+                Arc::clone(&guard.mcp_registry),
             )
         };
 
-        let tool_defs = build_tool_definitions(allowed_tools);
+        let mut tool_defs = build_tool_definitions(allowed_tools);
+        // MCP Read tools are appended here rather than inside
+        // `build_tool_definitions` because listing them needs the registry and
+        // an async round trip, neither of which that pure function has.
+        extend_with_mcp_tools(&mut tool_defs, allowed_tools, &mcp_registry).await;
         let tools_option = if !tool_defs.is_empty() {
             Some(tool_defs)
         } else {
@@ -776,12 +803,58 @@ async fn handle_decide_review(
     }
 }
 
+/// Parameters accepted by the task events SSE endpoint.
+///
+/// `access_token` is accepted but never read here: the browser `EventSource`
+/// API cannot set headers, so the GUI authenticates the stream by query
+/// string, and it is `auth_middleware` in `main.rs` that consumes it. The
+/// field exists so axum's `Query` extractor accepts the parameter instead of
+/// rejecting the request as malformed.
+#[derive(Deserialize)]
+struct SseParams {
+    #[allow(dead_code)]
+    access_token: Option<String>,
+    /// Cap on replayed history. Without it a task with thousands of events
+    /// makes every reconnect re-send all of them.
+    #[serde(default = "default_sse_limit")]
+    limit: usize,
+}
+
+fn default_sse_limit() -> usize {
+    100
+}
+
 async fn handle_get_task_events(
     State(state): State<Arc<std::sync::Mutex<BackendState>>>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    Query(params): Query<SseParams>,
 ) -> impl IntoResponse {
     let store = Arc::clone(&state.lock().unwrap().task_store);
-    let historical_events = store.get_task_events(&id);
+    let mut historical_events = store.get_task_events(&id);
+
+    // `Last-Event-ID` resume. Event ids are `{task_id}_{ts}`, so a client that
+    // reconnects after a drop sends the last id it saw and we replay only what
+    // followed it. Without this a reconnect re-sends the whole history, and a
+    // GUI that re-renders every event shows the run from the start again.
+    //
+    // `EventSource` cannot set request headers, so the GUI cannot send this
+    // header at all — it reconnects and re-receives the bounded replay below.
+    // The `limit` cap is what keeps that cheap.
+    if let Some(last_id) = headers.get("last-event-id").and_then(|v| v.to_str().ok()) {
+        if let Some(pos) = last_id.rfind('_') {
+            if let Ok(after_ts) = last_id[pos + 1..].parse::<u64>() {
+                historical_events.retain(|e| e.ts > after_ts);
+            }
+        }
+    }
+
+    // Bound the replay. The newest `limit` events are the useful ones.
+    if historical_events.len() > params.limit {
+        let drop_n = historical_events.len() - params.limit;
+        historical_events.drain(..drop_n);
+    }
+
     let rx = store.subscribe_events();
 
     let (tx, rx_stream) =
@@ -800,17 +873,38 @@ async fn handle_get_task_events(
             }
         }
 
+        // Heartbeat. A dead TCP connection is invisible to the GUI otherwise:
+        // `EventSource` fires `onerror` only when the socket actually breaks,
+        // which a silently dropped middlebox never does. One event every 30s
+        // gives the client something to time out against.
+        let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(30));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick completes immediately; consume it so the first
+        // heartbeat is 30s out, not instant.
+        heartbeat.tick().await;
+
         // Stream live tail events from broadcast
         let mut bcast_stream = tokio_stream::wrappers::BroadcastStream::new(rx);
-        while let Some(msg) = bcast_stream.next().await {
-            if let Ok(event) = msg {
-                if event.task_id == id {
-                    if let Ok(json) = serde_json::to_string(&event) {
-                        let sse_ev = Event::default()
-                            .id(format!("{}_{}", event.task_id, event.ts))
-                            .data(json);
-                        if tx.send(Ok(sse_ev)).await.is_err() {
-                            return;
+        loop {
+            tokio::select! {
+                _ = heartbeat.tick() => {
+                    let hb = Event::default()
+                        .event("connection_status")
+                        .data("{\"status\":\"connected\"}");
+                    if tx.send(Ok(hb)).await.is_err() {
+                        return;
+                    }
+                }
+                msg = bcast_stream.next() => {
+                    let Some(Ok(event)) = msg else { continue };
+                    if event.task_id == id {
+                        if let Ok(json) = serde_json::to_string(&event) {
+                            let sse_ev = Event::default()
+                                .id(format!("{}_{}", event.task_id, event.ts))
+                                .data(json);
+                            if tx.send(Ok(sse_ev)).await.is_err() {
+                                return;
+                            }
                         }
                     }
                 }
