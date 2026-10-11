@@ -214,7 +214,8 @@ impl LoadBalancer {
             std::borrow::Cow::Borrowed(layers)
         } else {
             let mut all_layers = layers.to_vec();
-            all_layers.sort_by_key(|l| l.index);
+            // OPTIMIZATION: Unstable sorting avoids scratch buffer allocations and stability tracking overhead.
+            all_layers.sort_unstable_by_key(|l| l.index);
             std::borrow::Cow::Owned(all_layers)
         };
         let total_layer_count = sorted_layers.len();

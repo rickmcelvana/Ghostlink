@@ -282,7 +282,7 @@ pub fn chunk_assignments_for_workers(
 
     let mut chunked = Vec::with_capacity(assignments.len() * 2);
 
-    for assignment in assignments {
+    for mut assignment in assignments {
         if assignment.num_layers <= chunk_size {
             chunked.push(assignment);
             continue;
@@ -294,8 +294,15 @@ pub fn chunk_assignments_for_workers(
         while start_layer < assignment.end_layer {
             let end_layer = (start_layer + chunk_size).min(assignment.end_layer);
             let num_layers = end_layer - start_layer;
+            // OPTIMIZATION: Move owned node_id via std::mem::take on the final chunk
+            // instead of unconditionally cloning the heap string across all chunks.
+            let node_id = if end_layer == assignment.end_layer {
+                std::mem::take(&mut assignment.node_id)
+            } else {
+                assignment.node_id.clone()
+            };
             chunked.push(LayerAssignment::new(
-                assignment.node_id.clone(),
+                node_id,
                 start_layer,
                 end_layer,
                 avg_vram * num_layers as f32,

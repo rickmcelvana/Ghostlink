@@ -343,10 +343,15 @@ impl NetworkHealthMonitor {
             .recent_checks
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        checks
-            .values()
-            .flat_map(|checks| checks.iter().cloned())
-            .collect()
+
+        // OPTIMIZATION: Pre-allocate vector capacity to avoid dynamic heap reallocations
+        // when flattening health check results across node ring buffers.
+        let total_capacity: usize = checks.values().map(|c| c.len()).sum();
+        let mut results = Vec::with_capacity(total_capacity);
+        for node_checks in checks.values() {
+            results.extend(node_checks.iter().cloned());
+        }
+        results
     }
 
     /// Get the number of nodes whose latest health sample is healthy.
