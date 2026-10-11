@@ -1,5 +1,9 @@
 # Palette's Journal
 
+## 2026-10-02 - `aria-current` and High-Contrast Focus Rings on Sidebar Selection Lists
+**Learning:** Selection items in sidebar list views (such as Project and Task selection item buttons) that communicate active state purely through background colors (e.g., `bg-indigo-600/20`) fail to convey selection state to screen reader users and lack visual keyboard focus indication for keyboard navigators.
+**Action:** Always annotate active list item selection buttons with `aria-current={isActive ? 'true' : undefined}`, descriptive `title` tooltips, and explicit `focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:outline-none` focus rings.
+
 ## 2026-10-02 - Specific Action-State Tracking on Multi-Choice Decision Toolbars
 **Learning:** In review panes or decision toolbars with multiple choices (e.g., Accept, Request Changes, Reject), using a single boolean `isSubmitting` hides which specific action is processing. Tracking specific `activeAction` state enables rendering action-specific `aria-busy`, spinning icon animations, and dynamic `aria-label` / `title` tooltips (e.g., 'Accepting proposed changes...' vs 'Accept proposed changes') so screen reader users and mouse hoverers receive real-time contextual feedback.
 **Action:** Track targeted decision action names (`'accept' | 'request_changes' | 'reject'`) during async operations to dynamically reflect active `aria-label`, `aria-busy`, and visual loading spinners on decision buttons.
