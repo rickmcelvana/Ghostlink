@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from "react";
+import { deriveFollowUps, type Suggestion } from "../lib/suggestions";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
@@ -863,6 +864,33 @@ export const ChatTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
   const streamingMsg = streamingId ? messages.find((m) => m.id === streamingId) : undefined;
   const awaitingFirstToken = loading && !!streamingMsg && streamingMsg.content === "";
 
+  // Follow-ups key off the most recent *assistant* turn. A user message can
+  // never be the last element while a reply is pending, and `loading` gates the
+  // render anyway, but filtering by role here keeps the derivation honest about
+  // which turn it is reading.
+  //
+  // Ambient task/review context is deliberately not passed: this component
+  // does not own that state (it lives in `TaskChatMessageCard`), and guessing
+  // at it would produce a chip that claims a review is pending when none is.
+  // The per-turn signals below are all this component genuinely has.
+  const followUps: Suggestion[] = useMemo(() => {
+    const lastAssistant = [...messages]
+      .reverse()
+      .find((m) => m.role === "assistant" && !m.isDivider);
+    if (!lastAssistant) return [];
+    return deriveFollowUps(
+      {
+        tools_run: lastAssistant.toolsRun,
+        recalled_memories: lastAssistant.recalledMemories,
+        recalled_documents: lastAssistant.recalledDocuments,
+        action_claim_corrected: lastAssistant.actionClaimCorrected,
+        truncated: lastAssistant.truncatedBefore,
+        summarized_history: lastAssistant.summarizedHistory,
+      },
+      { model: currentModel === "none" ? undefined : currentModel }
+    );
+  }, [messages, currentModel]);
+
   const activeNodesCount = metrics?.active_nodes ?? 1;
   const hardwareAttribution = useMemo(() => {
     if (placementPlan?.distributed_active && placementPlan?.tensor_splits?.length > 1) {
@@ -1503,6 +1531,34 @@ export const ChatTab: React.FC<{ api: GhostlinkAPI }> = ({ api }) => {
               )}
 
               <div ref={messagesEndRef} />
+
+              {/* Contextual follow-ups. Derived purely from the last turn's own
+                  signals -- no extra request, no model call. Hidden while a
+                  reply is streaming (there is no completed turn to follow up on
+                  yet) and when the last turn earns no follow-ups. */}
+              {!loading && followUps.length > 0 && (
+                <div
+                  className="flex flex-wrap gap-2 pt-3 max-w-4xl mx-auto"
+                  role="group"
+                  aria-label="Suggested follow-ups"
+                >
+                  {followUps.map((s) => (
+                    <button
+                      key={s.id}
+                      type="button"
+                      onClick={() => {
+                        setInput(s.text);
+                        textareaRef.current?.focus();
+                      }}
+                      aria-label={s.label}
+                      title={s.label}
+                      className="px-3 py-1.5 bg-slate-900/60 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 rounded-xl transition text-xs text-slate-300 hover:text-white focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none text-left"
+                    >
+                      {s.text}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
           )}
         </div>
