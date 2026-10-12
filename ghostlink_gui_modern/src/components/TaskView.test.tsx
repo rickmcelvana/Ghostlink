@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen, fireEvent, act } from '@testing-library/react';
 import { TaskView } from './TaskView';
 import { useAppStore } from '../store';
 import { Task } from '../api';
@@ -80,6 +80,31 @@ describe('TaskView', () => {
     expect(spawnBtn).toBeInTheDocument();
     expect(spawnBtn).toHaveAttribute('aria-busy', 'false');
     expect(spawnBtn).toHaveAttribute('title', 'Spawn an implementer agent run for this task');
+  });
+
+  it('submits form on enter press or button click, disables brief input during spawn, and calls spawnTask with brief text', async () => {
+    const idleTask: Task = { ...sampleTask, status: 'created' };
+    let resolveSpawn: (val: any) => void = () => {};
+    const spawnPromise = new Promise((resolve) => {
+      resolveSpawn = resolve;
+    });
+    mockApi.spawnTask.mockImplementation(() => spawnPromise);
+
+    render(<TaskView task={idleTask} api={mockApi} />);
+
+    const briefInput = screen.getByLabelText('Custom task brief');
+    fireEvent.change(briefInput, { target: { value: 'Fix bug in auth' } });
+
+    const spawnBtn = screen.getByRole('button', { name: 'Spawn Implementer Run' });
+    fireEvent.click(spawnBtn);
+
+    expect(mockApi.spawnTask).toHaveBeenCalledWith('task_1', { brief: 'Fix bug in auth' });
+    expect(briefInput).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Spawning implementer run...' })).toBeDisabled();
+
+    await act(async () => {
+      resolveSpawn({});
+    });
   });
 
   it('renders cancel button with proper accessibility attributes when task is running', () => {
