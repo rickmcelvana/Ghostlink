@@ -204,7 +204,7 @@ impl BackendRegistry {
                     device_name: "AMD Radeon 860M".to_string(),
                     vram_gb: Some(14.2),
                     compute_capability: std::env::var("HSA_OVERRIDE_GFX_VERSION")
-                        .unwrap_or_else(|_| "gfx906".to_string()),
+                        .unwrap_or_else(|_| "gfx1152".to_string()),
                     driver_version: "ROCm 6.1+".to_string(),
                     available: true,
                 });
@@ -265,7 +265,7 @@ impl BackendRegistry {
                     }
                 })
             })
-            .unwrap_or_else(|| "gfx906".to_string()); // Default to gfx906 (AMD Radeon 860M)
+            .unwrap_or_else(|| "gfx1152".to_string()); // Default to gfx1152 (AMD Radeon 860M, RDNA 3.5)
 
         // Get ROCm version
         let driver_version = Command::new("rocm-smi")

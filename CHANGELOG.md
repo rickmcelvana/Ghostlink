@@ -6,6 +6,9 @@ All notable changes to Ghostlink Studio are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- **ROCm `HSA_OVERRIDE_GFX_VERSION` defaulted to the wrong GPU target.** The runtime backend-switcher and backend registry defaulted the ROCm microarchitecture to `gfx906` (RDNA2 / Navi) while the surrounding code targets the Radeon 860M iGPU in the Ryzen AI 7 350 — which is `gfx1152` (RDNA 3.5, "Krackan Point"). The mismatch made HIP select the wrong target and fail on the first kernel launch, so the ROCm path could not run on this hardware. Corrected the default (and its detection fallbacks and test fixtures) to `gfx1152`; the value remains overridable via the real `HSA_OVERRIDE_GFX_VERSION` environment variable for hosts that report a different target.
+
 ### Added
 - **Heterogeneous, hardware-aware task agents.** The task agent runtime can now see the cluster it runs on and reason about where work belongs. Four capabilities, all of which degrade to the previous single-node behaviour when no cluster is attached:
 

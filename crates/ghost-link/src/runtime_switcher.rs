@@ -27,7 +27,16 @@ impl Default for SwitchingConfig {
 
         // ROCm environment
         let mut rocm_env = HashMap::new();
-        rocm_env.insert("HSA_OVERRIDE_GFX_VERSION".to_string(), "gfx906".to_string());
+        // gfx1152 = RDNA 3.5 "Krackan Point" — the Radeon 860M iGPU in the
+        // Ryzen AI 7 350 this fabric targets. The previous default, gfx906, is
+        // a RDNA2/Navi target for a different GPU; leaving it made HIP pick the
+        // wrong microarchitecture and fail on the first kernel launch. Callers
+        // can still override via the real HSA_OVERRIDE_GFX_VERSION if the host
+        // reports a different target.
+        rocm_env.insert(
+            "HSA_OVERRIDE_GFX_VERSION".to_string(),
+            "gfx1152".to_string(),
+        );
         rocm_env.insert("HIP_PLATFORM".to_string(), "amd".to_string());
         rocm_env.insert("OLLAMA_NUM_THREAD".to_string(), "16".to_string());
         rocm_env.insert("OLLAMA_GPU_MEMORY".to_string(), "3276".to_string());
@@ -402,7 +411,7 @@ mod tests {
         let rocm_env = manager.get_backend_env(&ComputeBackend::Rocm);
         assert!(rocm_env.is_some());
         let env = rocm_env.unwrap();
-        assert_eq!(env.get("HSA_OVERRIDE_GFX_VERSION").unwrap(), "gfx906");
+        assert_eq!(env.get("HSA_OVERRIDE_GFX_VERSION").unwrap(), "gfx1152");
         assert_eq!(env.get("HIP_PLATFORM").unwrap(), "amd");
     }
 
