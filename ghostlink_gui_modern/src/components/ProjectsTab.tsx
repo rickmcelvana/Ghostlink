@@ -43,7 +43,7 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({ api }) => {
     } catch (err: any) {
       addToast({ type: 'error', message: err.message || 'Failed to fetch projects' });
     }
-  }, [api, setProjects, activeProject, setActiveProject, addToast]);
+  }, [activeApi, setProjects, activeProject, setActiveProject, addToast]);
 
   const fetchTasks = useCallback(async () => {
     if (!activeProject) return;
@@ -55,7 +55,7 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({ api }) => {
     } catch {
       /* ignore */
     }
-  }, [api, activeProject, setTasks, setUnreadNeedsReviewCount]);
+  }, [activeApi, activeProject, setTasks, setUnreadNeedsReviewCount]);
 
   useEffect(() => {
     fetchProjects();
@@ -125,7 +125,7 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({ api }) => {
             onClick={() => setShowNewProjModal(true)}
             aria-label="New Project"
             title="Create a new project"
-            className="p-1 rounded bg-indigo-600 hover:bg-indigo-500 text-white text-xs flex items-center gap-1 font-bold"
+            className="p-1 rounded bg-indigo-600 hover:bg-indigo-500 text-white text-xs flex items-center gap-1 font-bold focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:outline-none"
           >
             <Plus size={14} aria-hidden="true" /> New
           </button>
@@ -143,7 +143,9 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({ api }) => {
                   setActiveProject(p);
                   setActiveTask(null);
                 }}
-                className={`w-full text-left p-2.5 rounded-lg text-xs transition flex flex-col gap-0.5 ${
+                aria-current={activeProject?.id === p.id ? 'true' : undefined}
+                title={`Select project ${p.name}`}
+                className={`w-full text-left p-2.5 rounded-lg text-xs transition flex flex-col gap-0.5 focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:outline-none ${
                   activeProject?.id === p.id ? 'bg-indigo-600/20 text-indigo-300 border border-indigo-500/30' : 'text-slate-300 hover:bg-slate-800'
                 }`}
               >
@@ -166,7 +168,7 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({ api }) => {
                 onClick={() => setShowNewTaskModal(true)}
                 aria-label="New Task"
                 title="Create a new task for this project"
-                className="p-1 rounded bg-indigo-600 hover:bg-indigo-500 text-white text-xs flex items-center gap-1 font-bold"
+                className="p-1 rounded bg-indigo-600 hover:bg-indigo-500 text-white text-xs flex items-center gap-1 font-bold focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:outline-none"
               >
                 <Plus size={14} aria-hidden="true" /> Task
               </button>
@@ -180,7 +182,9 @@ export const ProjectsTab: React.FC<ProjectsTabProps> = ({ api }) => {
                   <button
                     key={t.id}
                     onClick={() => setActiveTask(t)}
-                    className={`w-full text-left p-3 rounded-lg text-xs transition flex flex-col gap-1.5 ${
+                    aria-current={activeTask?.id === t.id ? 'true' : undefined}
+                    title={`Select task #${t.id.slice(0, 8)}: ${t.goal}`}
+                    className={`w-full text-left p-3 rounded-lg text-xs transition flex flex-col gap-1.5 focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:outline-none ${
                       t.parent_id ? 'ml-3 border-l-2 border-indigo-500/50 pl-2.5' : ''
                     } ${activeTask?.id === t.id ? 'bg-indigo-600/20 text-indigo-300 border border-indigo-500/30' : 'text-slate-300 hover:bg-slate-800'}`}
                   >
