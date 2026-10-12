@@ -207,7 +207,7 @@ mod tests {
                 name: "rocm".to_string(),
                 device_name: "AMD Radeon 860M".to_string(),
                 vram_gb: Some(14.2),
-                compute_capability: "gfx906".to_string(),
+                compute_capability: "gfx1152".to_string(),
                 driver_version: "ROCm 6.1".to_string(),
                 status: "active".to_string(),
             }],
