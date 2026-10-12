@@ -12018,11 +12018,25 @@ fn start_openai_api_server(port: u16, host: &str) -> Result<()> {
             // client can flush its token buffer deterministically and learn
             // the truncation state without waiting for a stream-end timeout.
             let done = stream::once(async move {
+                // The non-streaming path returns these on the JSON body; the
+                // streaming path used to send only `truncated`, so the GUI
+                // had no per-turn signal to work from (it could not tell a
+                // tool-backed answer from a plain one, or a corrected
+                // action-claim from a clean reply). All of these are already
+                // computed above for the JSON response -- this just puts them
+                // on the terminal chunk too, so the client can render
+                // follow-up suggestions without a second request.
                 let chunk = serde_json::json!({
                     "done": true,
                     "request_id": format!("req-{}", request_id),
                     "session_id": session_id,
                     "truncated": history_truncated,
+                    "tools_run": tools_run,
+                    "recalled_memories": recall_outcome.memory_hits,
+                    "recalled_documents": recall_outcome.rag_hits,
+                    "action_claim_corrected": claim_audit.unsupported,
+                    "summarized_history": session_summary.is_some(),
+                    "session_title": generated_title,
                 });
                 Ok::<Event, Infallible>(Event::default().data(chunk.to_string()))
             });

@@ -552,6 +552,13 @@ export class GhostlinkAPI {
         const decoder = new TextDecoder();
         let fullText = '';
         let truncated = false;
+        // The terminal SSE chunk carries the same per-turn signal the
+        // non-streaming JSON body returns (tools_run, recall counts, the
+        // action-claim-correction flag, ...). Streaming used to discard all
+        // of it and return only `truncated`, leaving the GUI unable to tell
+        // a tool-backed answer from a plain one. Captured here so
+        // `sendMessage` returns a uniform shape regardless of `stream`.
+        let doneMeta: Record<string, unknown> = {};
         // SSE frames can straddle a network read boundary. Splitting each
         // decoded chunk on '\n' without carrying the remainder forward
         // silently dropped any JSON frame that got cut mid-line, losing
@@ -572,6 +579,12 @@ export class GhostlinkAPI {
             if (typeof data.truncated === 'boolean' && data.truncated) {
               truncated = true;
             }
+            // Terminal chunk: everything except `token`/`done` is per-turn
+            // metadata the GUI renders suggestions and badges from.
+            if (data.done === true) {
+              const { done: _done, token: _token, ...meta } = data;
+              doneMeta = meta;
+            }
           } catch {
             // Ignore incomplete JSON
           }
@@ -591,7 +604,7 @@ export class GhostlinkAPI {
         // Flush any trailing frame that arrived without a final newline.
         if (lineBuffer) handleLine(lineBuffer);
 
-        return { success: true, data: { response: fullText, truncated } };
+        return { success: true, data: { response: fullText, truncated, ...doneMeta } };
       } else {
         // Non-streaming is also the path tool-calling always takes (see
         // useStreaming above) - give it the longer tool-call budget rather
