@@ -208,37 +208,45 @@ export const TaskView: React.FC<TaskViewProps> = ({ task, api, onRefresh }) => {
         {/* Action Controls */}
         <div className="flex items-center gap-3">
           {task.status !== "running" && task.status !== "needs_review" && (
-            <div className="flex items-center gap-2">
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                handleSpawn();
+              }}
+              className="flex items-center gap-2"
+            >
               <input
                 id="custom-task-brief"
                 type="text"
                 placeholder="Optional custom brief..."
                 aria-label="Custom task brief"
                 value={brief}
+                disabled={spawning}
                 onChange={(e) => setBrief(e.target.value)}
-                className="px-3 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-xs text-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                className="px-3 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-xs text-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500 disabled:opacity-50"
               />
               <button
-                onClick={handleSpawn}
+                type="submit"
                 disabled={spawning}
                 aria-busy={spawning}
                 aria-label={spawning ? "Spawning implementer run..." : "Spawn Implementer Run"}
                 title={spawning ? "Spawning implementer run..." : "Spawn an implementer agent run for this task"}
-                className="flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-bold bg-indigo-600 hover:bg-indigo-500 text-white transition disabled:opacity-50"
+                className="flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-bold bg-indigo-600 hover:bg-indigo-500 text-white transition disabled:opacity-50 focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:outline-none"
               >
                 {spawning ? <Loader2 size={14} className="animate-spin" aria-hidden="true" /> : <Play size={14} aria-hidden="true" />}
                 {spawning ? 'Spawning...' : 'Spawn Run'}
               </button>
-            </div>
+            </form>
           )}
           {task.status === "running" && (
             <button
+              type="button"
               onClick={handleCancel}
               disabled={cancelling}
               aria-busy={cancelling}
               aria-label={cancelling ? "Cancelling task..." : "Cancel Task"}
               title={cancelling ? "Cancelling task..." : "Cancel the active task run"}
-              className="flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-bold bg-rose-700 hover:bg-rose-600 text-white transition disabled:opacity-50"
+              className="flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-bold bg-rose-700 hover:bg-rose-600 text-white transition disabled:opacity-50 focus-visible:ring-2 focus-visible:ring-rose-500 focus-visible:outline-none"
             >
               {cancelling ? <Loader2 size={14} className="animate-spin" aria-hidden="true" /> : <Square size={14} aria-hidden="true" />}
               {cancelling ? 'Cancelling...' : 'Cancel'}
